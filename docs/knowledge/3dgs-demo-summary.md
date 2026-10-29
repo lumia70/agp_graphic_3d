@@ -295,15 +295,23 @@ hdc file recv /data/local/tmp/a.jpeg "D:\Source\3DGS\captures\a.jpeg"
 
 ## 7. 遗留 TODO
 
-| 项 | 说明 |
+| 项 | 状态 / 说明 |
 | --- | --- |
-| ~~PLY `f_rest` 转置~~ | 已修（4.2-8），三条加载路径统一转置 |
-| 性能日志去留 | `GS::Sort stats` / `GS::ExecuteFrame cost` 目前常驻，交付前建议降级或删除 |
-| 大场景 LOD | 5M+ 高斯需要分块/流式与预算裁剪 |
-| splat 解析 fuzz | 截断、畸形头、超大声明（SOG 的 ZIP/WebP 同样需要） |
-| 多设备 / GLES | 当前仅 Vulkan 单机验证；GLES 后端未跑通 3DGS 路径 |
-| SOG 其它变体 | 目前只支持 stored ZIP + v2 meta；deflate 条目、v1 meta 会直接报错 |
+| ~~PLY `f_rest` 转置~~ | 已修；注意压缩 VQ 不转置（4.2-8）|
+| ~~性能日志~~ | 已收进 `RENDER_DEV_ENABLED`，需要时把该宏置 1 即可恢复 |
+| ~~glTF 演示死代码~~ | 已删除 |
+| ~~`.hvigor/` 构建缓存~~ | 已加入根 `.gitignore` |
+| ~~SOG 失败原因不明确~~ | 已改为明确报错（版本 / ZIP method / 纹理数量 / bands 范围）|
+| splat 解析 fuzz | 截断、畸形头、超大声明；SOG 的 ZIP 中央目录与 WebP 尺寸、GLB chunk 长度 |
+| 大场景 LOD | 5M+ 高斯需要分块/流式与每帧预算裁剪（当前全量加载 + 全量剔除）|
+| 多设备 / GLES | 当前仅 Vulkan 单机验证；GLES 后端未跑 3DGS 路径，排序线程的调度表现也未验证 |
+| SOG 其它变体 | 只支持 stored ZIP + v2 meta；v1/deflate 现在会明确报错但不支持 |
+| 打包体积 | `fruit_bowl.ply` 169 MB 全量进 HAP，安装慢；可改成默认 SOG 或提供抽稀包 |
+| GPU 数据压缩 | 每高斯 64 B（+48 float SH）；fp16 位置/缩放、打包颜色可进一步降带宽 |
+| 观感 grade | 与 web 参考仍有锐度/饱和度差（USM 0.35 为经验值），可做成可调且默认关 |
+| 切模型首帧 | 首次排序仍同步（~285 ms，含缺页与上传），可改成"先画上一帧顺序" |
 | 资产许可 | `docs/knowledge/3dgs-demo-assets.md` 里来源/许可仍待补齐 |
+| 稳定性检视 / push | 仓库规则要求 GPU/Shader 改动前跑稳定性检视；push 由你负责 |
 
 ---
 
