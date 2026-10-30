@@ -369,7 +369,14 @@ hdc file recv /data/local/tmp/a.jpeg "D:\Source\3DGS\captures\a.jpeg"
 3. **LOD 没有回差 → 级别抖动**
 4. **整块重建太频繁 → 画面反复跳变**
    - 修复：只增不减 + 静止才压缩。
-5. **资产权限**：`hdc file send` 到沙箱目录后文件属主是 root，app（UID 20020208）
+5. **缩放到极端会黑屏**
+   - 现象：pinch 压到很近时画面全黑，缩回去就恢复。
+   - 根因：pinch 允许 `distance` 到 0.1，而 LOD 场景的 near 剔除阈值是 `diag*0.0005 ≈ 1.05`；
+     相机贴近/进入体块内部时近处高斯全被剔除。缩放极远时目标点又会越过 far 平面。
+   - 修复：near 平面改回 0.1（世界单位，没有深度缓冲不需要小 near），
+     `minDistance = max(1, diag*0.002)`，最远限制 `0.75*farPlane`；并在排序里加兜底：
+     剔除结果为 0 但 `count>0` 时回退为全量未排序绘制（投影仍会裁掉屏外）。
+6. **资产权限**：`hdc file send` 到沙箱目录后文件属主是 root，app（UID 20020208）
    读不到；需要 `chown -R 20020208:20020208` + `chmod -R u+rwX,g+rX,o+rX`。
 
 ### 8.4 资产投放
