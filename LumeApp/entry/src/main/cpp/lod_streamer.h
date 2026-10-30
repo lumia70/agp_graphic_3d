@@ -56,6 +56,15 @@ public:
         // The buffer keeps stale entries around while moving (append-only), so it
         // has headroom over the per-frame selection budget.
         capacity_ = budget_ + budget_ / 2u;
+        // Every file that holds the coarsest level is pinned in the cache.
+        {
+            const int baseLevel = scene_.levelCount - 1;
+            for (const auto& leaf : scene_.leaves) {
+                if (baseLevel < leaf.levels && leaf.lods[baseLevel].file >= 0) {
+                    baseFiles_.insert(leaf.lods[baseLevel].file);
+                }
+            }
+        }
         for (int i = 0; i < 2; i++) {
             buffers_[i].resize(capacity_);
         }
@@ -219,6 +228,14 @@ private:
                 } else {
                     EnsureTile(missing, now);
                 }
+                // Publish the tiles that just landed before decoding more: this is
+                // what makes content appear *while* the finger is still moving.
+                if (dirty_) {
+                    BuildView(cam, false);
+                    dirty_ = false;
+                    lastBuiltRequest_ = snapshot;
+                }
+                seen = requestId_;
                 continue;
             }
 
@@ -263,21 +280,12 @@ private:
 
     int32_t NextMissingTileExcluding(const Camera& cam, int32_t exclude)
     {
-        Selection sel;
-        if (previousLevels_.size() != scene_.leaves.size()) {
-            previousLevels_.assign(scene_.leaves.size(), (int8_t)-1);
+        // Screen first, then the wider prefetch band.
+        int32_t file = PickTile(cam, false, exclude);
+        if (file < 0) {
+            file = PickTile(cam, true, exclude);
         }
-        SelectVisible(scene_, cam.view, cam.proj, cam.camPos, budget_, previousLevels_.data(), sel);
-        for (const auto& it : sel.items) {
-            const Slice& slice = scene_.leaves[it.leaf].lods[it.level];
-            if (slice.file < 0 || slice.file == exclude) {
-                continue;
-            }
-            if (!TileReady(slice.file)) {
-                return slice.file;
-            }
-        }
-        return -1;
+        return file;
     }
 
     // Nearest not-yet-decoded coarsest tile (exclude one file), or -1.
@@ -331,25 +339,77 @@ private:
         return EnsureTile(bestFile, ++clock_);
     }
 
-    // First tile of the current selection that is not decoded yet (priority
-    // order: nearest leaf first).
+    // First tile of the current selection that is not decoded yet.
+    // Priority: tiles closest to the view axis first (that is where the user is
+    // looking, and where an empty hole is most obvious), then nearest.
     int32_t NextMissingTile(const Camera& cam)
+    {
+        return NextMissingTileExcluding(cam, -1);
+    }
+
+    // Wider-than-screen prefetch frustum: tiles just outside the view are decoded
+    // before they become visible.
+    void WideProj(const Camera& cam, float* out) const
+    {
+        for (int i = 0; i < 16; i++) {
+            out[i] = cam.proj[i];
+        }
+        constexpr float kMargin = 0.65f;  // 1/0.65 ~ 1.54x wider
+        out[0] *= kMargin;
+        out[5] *= kMargin;
+    }
+
+    int32_t PickTile(const Camera& cam, bool wide, int32_t exclude)
     {
         if (previousLevels_.size() != scene_.leaves.size()) {
             previousLevels_.assign(scene_.leaves.size(), (int8_t)-1);
         }
         Selection sel;
-        SelectVisible(scene_, cam.view, cam.proj, cam.camPos, budget_, previousLevels_.data(), sel);
+        if (wide) {
+            float proj[16];
+            WideProj(cam, proj);
+            SelectVisible(scene_, cam.view, proj, cam.camPos, budget_, previousLevels_.data(), sel);
+        } else {
+            SelectVisible(scene_, cam.view, cam.proj, cam.camPos, budget_, previousLevels_.data(), sel);
+        }
+
+        // View direction (camera looks along -back = -(row 2 of the view matrix)).
+        float dx = -cam.view[2], dy = -cam.view[6], dz = -cam.view[10];
+        const float dlen = std::sqrt(dx * dx + dy * dy + dz * dz);
+        if (dlen > 1e-6f) {
+            dx /= dlen;
+            dy /= dlen;
+            dz /= dlen;
+        }
+
+        int32_t bestFile = -1;
+        float bestScore = 0.0f;
         for (const auto& it : sel.items) {
             const Slice& slice = scene_.leaves[it.leaf].lods[it.level];
-            if (slice.file < 0) {
+            if (slice.file < 0 || slice.file == exclude || TileReady(slice.file)) {
                 continue;
             }
-            if (!TileReady(slice.file)) {
+            const Leaf& leaf = scene_.leaves[it.leaf];
+            const float cx = (leaf.bmin[0] + leaf.bmax[0]) * 0.5f;
+            const float cy = (leaf.bmin[1] + leaf.bmax[1]) * 0.5f;
+            const float cz = (leaf.bmin[2] + leaf.bmax[2]) * 0.5f;
+            float vx = cx - cam.camPos[0], vy = cy - cam.camPos[1], vz = cz - cam.camPos[2];
+            const float vlen = std::sqrt(vx * vx + vy * vy + vz * vz);
+            if (vlen < 1e-3f) {
                 return slice.file;
             }
+            vx /= vlen;
+            vy /= vlen;
+            vz /= vlen;
+            const float along = vx * dx + vy * dy + vz * dz;  // 1 on the view axis
+            // Prefer centred tiles, break ties with distance.
+            const float score = along - 0.001f * vlen;
+            if (bestFile < 0 || score > bestScore) {
+                bestFile = slice.file;
+                bestScore = score;
+            }
         }
-        return -1;
+        return bestFile;
     }
 
     // Decodes a tile into the cache. Thread-safe: the (slow) decode runs outside
@@ -398,6 +458,9 @@ private:
         }
         caches_[file] = entry;
         cacheCount_ += (uint32_t)entry->data.size();
+        if (baseFiles_.count(file) != 0) {
+            pinned_.insert(file);
+        }
         dirty_ = true;
         LOGI("LOD: decoded tile %{public}d (%{public}zu gaussians, %.0f ms)", file, entry->data.size(), ms);
         EvictLocked();
@@ -414,6 +477,11 @@ private:
                 }
             }
             if (oldest == caches_.end()) {
+                return;
+            }
+            if (pinned_.count(oldest->first) != 0) {
+                // Pinned (coarse base) tiles stay: a full turn must always have
+                // something to draw.
                 return;
             }
             cacheCount_ -= (uint32_t)oldest->second->data.size();
@@ -591,6 +659,8 @@ private:
     std::mutex cacheMutex_;
     std::unordered_map<int32_t, CacheEntryPtr> caches_;
     std::unordered_set<int32_t> decoding_;
+    std::unordered_set<int32_t> baseFiles_;
+    std::unordered_set<int32_t> pinned_;
     uint32_t cacheCount_ = 0;
     uint64_t clock_ = 0;
     uint64_t lastBuiltRequest_ = 0;
