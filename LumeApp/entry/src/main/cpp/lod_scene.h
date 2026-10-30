@@ -463,6 +463,11 @@ inline void SelectVisible(const Scene& scene, const float view[16], const float 
         }
     }
 
+    // Assembly order: nearest first, so refinement appears from the foreground
+    // outwards instead of in arbitrary importance blocks.
+    std::sort(out.items.begin(), out.items.end(),
+        [](const Item& a, const Item& b) { return a.dist < b.dist; });
+
     out.total = total;
     for (auto& v : out.perLevelGaussians) {
         v = 0;

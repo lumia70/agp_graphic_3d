@@ -77,6 +77,7 @@ public:
         entryOf_.clear();
         totalWritten_ = 0;
         dirty_ = false;
+        lastUniqueTotal_ = 0;
         previousLevels_.clear();
         lastBuiltRequest_ = 0;
         basePreloaded_ = false;
@@ -497,6 +498,14 @@ private:
         // coarser than the appended mixture, so doing it on every "settle" made
         // the picture visibly degrade when the finger was lifted.
         const bool full = first || (totalWritten_ + appended > capacity_);
+        // Remember the previous assembly so a rebuild that would be much coarser
+        // (fine tiles were evicted) can be rejected instead of flashing.
+        const std::vector<Entry> prevEntries = full ? entries_ : std::vector<Entry> {};
+        const std::unordered_map<uint32_t, uint32_t> prevEntryOf = full ? entryOf_ : std::unordered_map<uint32_t, uint32_t> {};
+        const uint32_t prevTotal = totalWritten_;
+        const int prevWriteIndex = writeIndex_;
+        const uint32_t prevCount = publishCount_;
+        const int prevPublished = publishedBuffer_;
         (void)settled;
         if (full) {
             entries_.clear();
@@ -510,8 +519,9 @@ private:
         const uint32_t uploadStart = full ? 0u : totalWritten_;
         const uint32_t before = totalWritten_;
         const bool progressive = first;
-        const uint32_t publishStep = progressive ? std::max<uint32_t>(budget_ / 8u, 150000u)
-                                                 : (budget_ + 1u);
+        // Publish in moderate steps so refinement grows smoothly (the app uploads
+        // the new tail and re-sorts in the background for each step).
+        const uint32_t publishStep = std::max<uint32_t>(budget_ / 12u, 80000u);
         const uint64_t now = ++clock_;
         uint32_t lastPublished = before;
         uint32_t skippedNoTile = 0;
@@ -563,6 +573,26 @@ private:
             }
         }
 
+        // A rebuild that loses a lot of detail (fine tiles evicted from the cache)
+        // would show a coarse frame; keep the current buffer and retry later.
+        if (full && !first && lastUniqueTotal_ > 0 && totalWritten_ < lastUniqueTotal_ * 8u / 10u) {
+            entries_ = prevEntries;
+            entryOf_ = prevEntryOf;
+            totalWritten_ = prevTotal;
+            writeIndex_ = prevWriteIndex;
+            publishCount_ = prevCount;
+            publishedBuffer_ = prevPublished;
+            LOGI("LOD: rebuild skipped (would shrink %u -> %u)", prevTotal, totalWritten_);
+            return;
+        }
+
+        if (full) {
+            // Remember the unique size of an accepted rebuild: appends later add
+            // duplicates, so comparing against the raw buffer would always look
+            // like a degradation.
+            lastUniqueTotal_ = totalWritten_;
+        }
+
         if (totalWritten_ > lastPublished) {
             Publish(writeIndex_, totalWritten_, uploadStart);
         } else if (full && totalWritten_ == before && before > 0) {
@@ -612,6 +642,7 @@ private:
     std::unordered_map<uint32_t, uint32_t> entryOf_;
     uint32_t totalWritten_ = 0;
     bool dirty_ = false;
+    uint32_t lastUniqueTotal_ = 0;
     int publishedBuffer_ = -1;
     uint32_t publishCount_ = 0;
     uint32_t publishGeneration_ = 0;
