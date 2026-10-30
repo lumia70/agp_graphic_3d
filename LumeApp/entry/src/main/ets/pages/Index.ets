@@ -6,6 +6,7 @@ struct Index {
   private xComponentId: string = 'lumeapp_xcomponent';
   private intervalId: number = -1;
   @State activeModel: string = 'doll.glb';
+  @State firstPerson: boolean = false;
 
   private static readonly MODELS: string[] = ['fruit_bowl.ply', 'fruit_bowl.sog', 'godzilla.splat', 'doll.glb'];
 
@@ -23,7 +24,16 @@ struct Index {
     }
     this.activeModel = name;
     lumeapp.setModel(name);
-    console.info('[LumeApp] switch model to ' + name);
+    // Large LOD scenes default to first-person roaming, single models orbit.
+    this.firstPerson = name === 'syp_uav_0611';
+    lumeapp.setCameraMode(this.firstPerson);
+    console.info('[LumeApp] switch model to ' + name + ', firstPerson=' + this.firstPerson);
+  }
+
+  private toggleMode(): void {
+    this.firstPerson = !this.firstPerson;
+    lumeapp.setCameraMode(this.firstPerson);
+    console.info('[LumeApp] camera mode firstPerson=' + this.firstPerson);
   }
 
   build() {
@@ -49,7 +59,15 @@ struct Index {
         .width('100%')
         .height('100%')
 
-      Row({ space: 6 }) {
+      Column({ space: 8 }) {
+        Button(this.firstPerson ? 'Mode: First-person' : 'Mode: Orbit')
+          .fontSize(12)
+          .height(30)
+          .width(170)
+          .backgroundColor(this.firstPerson ? '#CC1E88E5' : '#66000000')
+          .onClick(() => this.toggleMode())
+
+        Row({ space: 6 }) {
         Button('Bowl PLY')
           .fontSize(11)
           .height(32)
@@ -80,6 +98,7 @@ struct Index {
           .width(72)
           .backgroundColor(this.activeModel === 'syp_uav_0611' ? '#FF6A00' : '#66000000')
           .onClick(() => this.selectModel('syp_uav_0611'))
+        }
       }
       .margin({ bottom: 28 })
     }

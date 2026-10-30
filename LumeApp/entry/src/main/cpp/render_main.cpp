@@ -156,6 +156,15 @@ struct OrbitCamera {
     // Smallest orbit distance: below this the camera would sit inside the
     // geometry and the near cull could hide the whole scene.
     float minDistance = 0.1f;
+    // First-person ("walk") mode for large scenes: the eye IS the target, so a
+    // drag rotates in place and two-finger gestures move through the scene.
+    bool firstPerson = false;
+    float fpMoveScale = 1.0f;  // world units per pixel of two-finger drag
+    float fpBackoff = 0.0f;    // orbit distance restored when leaving first person
+    // Scene pivot used when switching back to orbit (otherwise the target is
+    // derived from the view direction, which can point at the sky).
+    float pivotX = 0.0f, pivotY = 0.0f, pivotZ = 0.0f;
+    bool hasPivot = false;
 
     // Touch state
     float lastX = 0.0f, lastY = 0.0f;
@@ -234,6 +243,20 @@ struct OrbitCamera {
     }
 
     // Pan target along camera right/up so content follows the finger
+    // Walk mode movement: dx strafes, dy dollies along the view direction.
+    void Walk(float dxScreen, float dyScreen, float scale) {
+        targetX += (rightX * dxScreen - backX * dyScreen) * scale;
+        targetY += (rightY * dxScreen - backY * dyScreen) * scale;
+        targetZ += (rightZ * dxScreen - backZ * dyScreen) * scale;
+    }
+
+    // Dolly along the view direction (positive = forward).
+    void Dolly(float forward) {
+        targetX -= backX * forward;
+        targetY -= backY * forward;
+        targetZ -= backZ * forward;
+    }
+
     void Pan(float dxScreen, float dyScreen, float scale) {
         targetX -= (rightX * dxScreen - upX * dyScreen) * scale;
         targetY -= (rightY * dxScreen - upY * dyScreen) * scale;
@@ -828,6 +851,7 @@ static const DemoModelConfig kDemoModels[] = {
 static constexpr int kDemoModelCount = (int)(sizeof(kDemoModels) / sizeof(kDemoModels[0]));
 static int g_modelIndex = 3;  // doll.glb by default (must track kDemoModels order)
 static int g_pendingModelIndex = -1;  // set from ArkTS, applied on the render thread
+static int g_pendingCameraMode = -1;  // -1 = use the model default, 0 = orbit, 1 = first person
 
 // Robust framing statistics. Raw bounds are misleading: a few outlier
 // gaussians (room walls, an environment sphere) can stretch them far beyond
@@ -901,6 +925,46 @@ static SplatFraming ComputeSplatFraming(const SplatData& data)
     f.r80 = radiusAt(0.80f);
     f.r90 = radiusAt(0.90f);
     return f;
+}
+
+// Camera mode: orbit (small scenes, focus at the subject) vs first person
+// (large scenes: rotate in place, walk through). Switching keeps the eye fixed.
+static void SetFirstPerson(bool enabled)
+{
+    if (enabled == g_orbitCam.firstPerson) {
+        return;
+    }
+    float ex, ey, ez;
+    g_orbitCam.GetPosition(ex, ey, ez);
+    if (enabled) {
+        // Move the pivot to the eye so the camera rotates in place.
+        g_orbitCam.targetX = ex;
+        g_orbitCam.targetY = ey;
+        g_orbitCam.targetZ = ez;
+        g_orbitCam.distance = 0.0f;
+    } else if (g_orbitCam.hasPivot) {
+        // Orbit around the scene pivot while keeping the current eye position.
+        g_orbitCam.targetX = g_orbitCam.pivotX;
+        g_orbitCam.targetY = g_orbitCam.pivotY;
+        g_orbitCam.targetZ = g_orbitCam.pivotZ;
+        const float dx = ex - g_orbitCam.pivotX;
+        const float dy = ey - g_orbitCam.pivotY;
+        const float dz = ez - g_orbitCam.pivotZ;
+        float d = std::sqrt(dx * dx + dy * dy + dz * dz);
+        d = std::max(d, g_orbitCam.minDistance);
+        g_orbitCam.distance = d;
+    } else {
+        // Back off along the view direction so the subject is in front again.
+        const float back = g_orbitCam.fpBackoff > 0.0f ? g_orbitCam.fpBackoff
+                                                      : g_orbitCam.insideDistance;
+        g_orbitCam.targetX = ex - g_orbitCam.backX * back;
+        g_orbitCam.targetY = ey - g_orbitCam.backY * back;
+        g_orbitCam.targetZ = ez - g_orbitCam.backZ * back;
+        g_orbitCam.distance = back;
+    }
+    g_orbitCam.firstPerson = enabled;
+    g_orbitCam.LogState(enabled ? "first-person" : "orbit");
+    g_forceRenderFrames = 3;
 }
 
 // ---- LOD scene streaming ----
@@ -977,10 +1041,12 @@ void LoadLodScene(const DemoModelConfig& cfg)
     g_orbitCam.upY = g_orbitCam.backZ * g_orbitCam.rightX - g_orbitCam.backX * g_orbitCam.rightZ;
     g_orbitCam.upZ = g_orbitCam.backX * g_orbitCam.rightY - g_orbitCam.backY * g_orbitCam.rightX;
 
-    g_orbitCam.targetX = scene.camLookAt[0];
-    g_orbitCam.targetY = scene.camLookAt[1];
-    g_orbitCam.targetZ = scene.camLookAt[2];
-    g_orbitCam.distance = len;
+    // First-person pose: the pivot is the eye itself (the view direction is
+    // still towards lookAt). Switching to orbit later backs off by `len`.
+    g_orbitCam.targetX = scene.camPos[0];
+    g_orbitCam.targetY = scene.camPos[1];
+    g_orbitCam.targetZ = scene.camPos[2];
+    g_orbitCam.distance = 0.0f;
 
     float ex = scene.boundsMax[0] - scene.boundsMin[0];
     float ey = scene.boundsMax[1] - scene.boundsMin[1];
@@ -997,6 +1063,16 @@ void LoadLodScene(const DemoModelConfig& cfg)
     g_orbitCam.farDistance = len;
     // Start in the far framing so the first double-tap zooms into the scene.
     g_orbitCam.insideView = false;
+    // Large scenes are navigated in first person; the mode button can switch.
+    g_orbitCam.firstPerson = true;
+    g_orbitCam.fpMoveScale = std::max(0.05f, diag * 0.0008f);
+    // Returning to orbit mode backs off to the reference framing distance and
+    // orbits around the scene's look-at point.
+    g_orbitCam.fpBackoff = len;
+    g_orbitCam.pivotX = scene.camLookAt[0];
+    g_orbitCam.pivotY = scene.camLookAt[1];
+    g_orbitCam.pivotZ = scene.camLookAt[2];
+    g_orbitCam.hasPivot = true;
     g_orbitCam.LogState("lod-initial");
 
     // No CPU splat array: the node waits for the first streamed assembly.
@@ -1022,6 +1098,11 @@ void LoadLodScene(const DemoModelConfig& cfg)
         rngDesc);
     LOGI("LOD RNG created: valid=%{public}d, budget=%{public}u", g_lume.splatRngHandle ? 1 : 0,
         g_lodStreamer.Budget());
+
+    if (g_pendingCameraMode >= 0) {
+        SetFirstPerson(g_pendingCameraMode != 0);
+        g_pendingCameraMode = -1;
+    }
 }
 
 static void ReleaseSplatModel()
@@ -1128,6 +1209,14 @@ void LoadSplatModel()
         g_orbitCam.targetZ = framing.cz;
     }
 
+    g_orbitCam.firstPerson = false;
+    g_orbitCam.fpBackoff = 0.0f;
+    g_orbitCam.hasPivot = false;
+    // Restore the small-scene clip range (the LOD scene widens it for the scene
+    // diagonal, and leaving it wide changes which splats survive the far cull).
+    g_orbitCam.nearPlane = 0.05f;
+    g_orbitCam.farPlane = 2000.0f;
+    g_orbitCam.minDistance = 0.1f;
     g_orbitCam.farDistance = (cfg.farDistance > 0.f) ? cfg.farDistance : subjectRadius * 4.0f;
     g_orbitCam.insideDistance = (cfg.insideDistance > 0.f) ? cfg.insideDistance : subjectRadius * 1.6f;
     if (g_orbitCam.insideDistance < 0.5f) g_orbitCam.insideDistance = 0.5f;
@@ -1159,6 +1248,11 @@ void LoadSplatModel()
         RENDER_NS::IRenderNodeGraphManager::RenderNodeGraphUsageType::RENDER_NODE_GRAPH_STATIC,
         rngDesc);
     LOGI("Gaussian splat RNG created: valid=%{public}d", g_lume.splatRngHandle ? 1 : 0);
+
+    if (g_pendingCameraMode >= 0) {
+        SetFirstPerson(g_pendingCameraMode != 0);
+        g_pendingCameraMode = -1;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1405,16 +1499,20 @@ void DispatchTouchEvent(OH_NativeXComponent* component, void* window)
             float dx = x2 - x1, dy = y2 - y1;
             float dist = sqrtf(dx*dx + dy*dy);
             if (g_orbitCam.lastDist > 1.f) {
-                float ratio = g_orbitCam.lastDist / dist;
-                g_orbitCam.distance *= ratio;
-                if (g_orbitCam.distance < g_orbitCam.minDistance) {
-                    g_orbitCam.distance = g_orbitCam.minDistance;
-                }
-                // Keep the target comfortably inside the far plane, otherwise the
-                // whole scene can end up beyond it at maximum zoom-out.
-                const float maxDistance = g_orbitCam.farPlane * 0.75f;
-                if (g_orbitCam.distance > maxDistance) {
-                    g_orbitCam.distance = maxDistance;
+                if (g_orbitCam.firstPerson) {
+                    // Pinch dollies along the view direction instead of zooming.
+                    g_orbitCam.Dolly((dist - g_orbitCam.lastDist) * g_orbitCam.fpMoveScale);
+                } else {
+                    g_orbitCam.distance *= g_orbitCam.lastDist / dist;
+                    if (g_orbitCam.distance < g_orbitCam.minDistance) {
+                        g_orbitCam.distance = g_orbitCam.minDistance;
+                    }
+                    // Keep the target comfortably inside the far plane, otherwise
+                    // the whole scene can end up beyond it at maximum zoom-out.
+                    const float maxDistance = g_orbitCam.farPlane * 0.75f;
+                    if (g_orbitCam.distance > maxDistance) {
+                        g_orbitCam.distance = maxDistance;
+                    }
                 }
             }
             g_orbitCam.lastDist = dist;
@@ -1424,8 +1522,13 @@ void DispatchTouchEvent(OH_NativeXComponent* component, void* window)
             float my = (y1 + y2) * 0.5f;
             float panDx = mx - g_orbitCam.lastX;
             float panDy = my - g_orbitCam.lastY;
-            float panScale = g_orbitCam.distance * 0.002f;
-            g_orbitCam.Pan(panDx, panDy, panScale);
+            if (g_orbitCam.firstPerson) {
+                // Two-finger drag walks: horizontal strafes, vertical dollies.
+                g_orbitCam.Walk(panDx, panDy, g_orbitCam.fpMoveScale);
+            } else {
+                float panScale = g_orbitCam.distance * 0.002f;
+                g_orbitCam.Pan(panDx, panDy, panScale);
+            }
             g_orbitCam.lastX = mx;
             g_orbitCam.lastY = my;
         } else if (touchEvent.numPoints == 1 && g_orbitCam.dragging) {
@@ -1452,7 +1555,9 @@ void DispatchTouchEvent(OH_NativeXComponent* component, void* window)
             if (touchEvent.type == OH_NATIVEXCOMPONENT_UP &&
                 nowMs - g_orbitCam.lastTapTimeMs < 350.0 &&
                 dx*dx + dy*dy < 1600.0f) {
-                if (g_orbitCam.insideView) {
+                if (g_orbitCam.firstPerson) {
+                    g_orbitCam.lastTapTimeMs = 0.0;
+                } else if (g_orbitCam.insideView) {
                     g_orbitCam.distance = g_orbitCam.farDistance;
                     g_orbitCam.insideView = false;
                     LOGI("Camera: far view (distance %{public}.2f)", g_orbitCam.distance);
@@ -1512,6 +1617,26 @@ static napi_value NapiDrawFrame(napi_env /*env*/, napi_callback_info /*info*/)
     return nullptr;
 }
 
+static napi_value NapiSetCameraMode(napi_env env, napi_callback_info info)
+{
+    size_t argc = 1;
+    napi_value args[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    if (argc < 1 || args[0] == nullptr) {
+        return nullptr;
+    }
+    bool firstPerson = false;
+    napi_get_value_bool(env, args[0], &firstPerson);
+    // Models are loaded on the render thread from a pending request; if one is
+    // in flight the mode is applied right after the new camera is set up.
+    g_pendingCameraMode = firstPerson ? 1 : 0;
+    if (g_pendingModelIndex < 0) {
+        SetFirstPerson(firstPerson);
+        g_pendingCameraMode = -1;
+    }
+    return nullptr;
+}
+
 static napi_value NapiSetModel(napi_env env, napi_callback_info info)
 {
     size_t argc = 1;
@@ -1568,6 +1693,7 @@ static napi_value Init(napi_env env, napi_value exports)
     napi_property_descriptor desc[] = {
         {"drawFrame", nullptr, NapiDrawFrame, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"setModel", nullptr, NapiSetModel, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"setCameraMode", nullptr, NapiSetCameraMode, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"initResourceManager", nullptr, NapiInitResourceManager, nullptr, nullptr, nullptr, napi_default, nullptr},
     };
     napi_define_properties(env, exports, sizeof(desc) / sizeof(desc[0]), desc);

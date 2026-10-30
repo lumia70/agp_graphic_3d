@@ -379,7 +379,23 @@ hdc file recv /data/local/tmp/a.jpeg "D:\Source\3DGS\captures\a.jpeg"
 6. **资产权限**：`hdc file send` 到沙箱目录后文件属主是 root，app（UID 20020208）
    读不到；需要 `chown -R 20020208:20020208` + `chmod -R u+rwX,g+rX,o+rX`。
 
-### 8.4 资产投放
+### 8.4 相机模式：轨道 vs 漫游
+
+小场景适合**轨道**（焦点在物体中心，绕中心旋转/缩放）；大场景适合**第一人称漫游**（就地旋转、
+前进后退）。底部左上的 \Mode\ 按钮切换，切换时眼位保持不变：
+
+| 手势 | 轨道模式 | 第一人称模式 |
+| --- | --- | --- |
+| 单指拖动 | 绕目标旋转 | 就地旋转（目标 = 眼位）|
+| 双指拖动 | 平移（拖动内容）| 横向平移 / 纵向前进后退 |
+| 双指缩放 | 距离缩放 | 沿视线前进/后退 |
+
+- 第一人称本质上就是 \distance = 0\ 的轨道（eye == target），因此旋转/投影/排序全部复用。
+- 切回轨道时以场景的 \lookAt\ 作为枢轴（而不是沿逆视线退，否则会退到天上去）。
+- LOD 场景默认进入第一人称，单模型默认轨道；模式请求在模型加载完成后应用（
+  g_pendingCameraMode），避免在旧相机上生效。
+
+### 8.5 资产投放
 
 ```powershell
 hdc shell "mkdir -p /data/app/el2/100/base/com.example.lumeapp/haps/entry/files/assets/lod"
