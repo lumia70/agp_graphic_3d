@@ -1267,11 +1267,42 @@ void RenderNodeGaussianSplatting::ExecuteFrame(IRenderCommandList& cmdList)
         }
     }
 
-    // ---- 3.6 Early out when nothing is visible ----
-    if (visibleCount_ == 0) {
-        if (frameCount_ < 3) {
-            PLUGIN_LOG_I("GS::ExecuteFrame: no visible gaussians, skipping render pass");
+    // ---- 3.6 Keep the last good order instead of drawing an empty frame ----
+    if (visibleCount_ == 0 && gaussianCount_ > 0) {
+        // Happens for one frame while a freshly rebuilt set is being sorted. The
+        // previous order still references valid gaussians (the set only grows),
+        // so reuse it: an empty frame shows only the clear colour, which reads as
+        // a white/black flash while rotating.
+        if (sortState_ && sortState_->hasApplied && sortState_->appliedCount > 0 &&
+            sortState_->appliedCount <= gaussianCount_) {
+            visibleCount_ = sortState_->appliedCount;
+        } else {
+            visibleCount_ = gaussianCount_;
         }
+        emptyFrameCount_++;
+        if (emptyFrameCount_ <= 5 || (emptyFrameCount_ % 60) == 0) {
+            PLUGIN_LOG_I("GS: empty order reused (%u entries, %u empty frames, gen 0x%x)",
+                visibleCount_, emptyFrameCount_, g_sp.Generation());
+        }
+        // Upload the fallback order for this slot (the sort upload above already
+        // ran with zero entries).
+        void* sortMapped = gpuResMgr.MapBuffer(sortIndexBuffer_[slot].GetHandle());
+        if (sortMapped) {
+            if (sortState_ && sortState_->hasApplied && sortState_->appliedCount == visibleCount_ &&
+                !sortState_->applied.empty()) {
+                std::memcpy(sortMapped, sortState_->applied.data(), visibleCount_ * sizeof(uint32_t));
+            } else {
+                uint32_t* ids = static_cast<uint32_t*>(sortMapped);
+                for (uint32_t i = 0; i < visibleCount_; i++) {
+                    ids[i] = i;
+                }
+            }
+            std::memset((uint8_t*)sortMapped + visibleCount_ * sizeof(uint32_t), 0xFF,
+                (size_t)(gaussianCount_ - visibleCount_) * sizeof(uint32_t));
+            gpuResMgr.UnmapBuffer(sortIndexBuffer_[slot].GetHandle());
+        }
+    }
+    if (visibleCount_ == 0) {
         frameCount_++;
         return;
     }

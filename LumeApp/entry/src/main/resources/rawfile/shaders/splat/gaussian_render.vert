@@ -144,6 +144,15 @@ void main() {
     vec3 scale = g.scaleOpacity.xyz;
     float opacity = g.scaleOpacity.w;
 
+    // Defensive: garbage/non-finite data (e.g. a partially uploaded tail) would
+    // project to a huge quad that can cover the whole screen as a bright flash.
+    if (!(dot(worldPos, worldPos) >= 0.0) || !(scale.x >= 0.0) || !(scale.y >= 0.0) ||
+        !(scale.z >= 0.0) || max(scale.x, max(scale.y, scale.z)) > 1e6) {
+        gl_Position = vec4(0.0, 0.0, -2.0, 1.0);
+        vColor = vec4(0.0); vOffset = vec2(0.0); vOpacity = 0.0;
+        return;
+    }
+
     // Skip transparent
     if (opacity < 1.0 / 255.0) {
         gl_Position = vec4(0.0, 0.0, -2.0, 1.0);
@@ -224,6 +233,13 @@ void main() {
     float vmin = min(1024.0, min(viewport.z, viewport.w));
     float r1 = 2.0 * min(sqrt(2.0 * l1), vmin);
     float r2 = 2.0 * min(sqrt(2.0 * l2), vmin);
+
+    // Defensive: an absurd screen extent also means bad input data.
+    if (!(r1 >= 0.0) || !(r2 >= 0.0) || r1 > 16384.0 || r2 > 16384.0) {
+        gl_Position = vec4(0.0, 0.0, -2.0, 1.0);
+        vColor = vec4(0.0); vOffset = vec2(0.0); vOpacity = 0.0;
+        return;
+    }
 
     // Early-out gaussians smaller than 2px (engine default minPixelSize=2.0)
     if (max(r1, r2) < 2.0) {

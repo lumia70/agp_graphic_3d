@@ -17,6 +17,9 @@
 
 #include <chrono>
 #include <cstring>
+#include <future>
+#include <memory>
+#include <unordered_set>
 #include <condition_variable>
 #include <cstdint>
 #include <mutex>
@@ -61,10 +64,9 @@ public:
         publishedBuffer_ = -1;
         publishUploadStart_ = 0;
         writeIndex_ = -1;
-        entries_.clear();
-        entryOf_.clear();
-        totalWritten_ = 0;
         previousLevels_.clear();
+        lastBuiltRequest_ = 0;
+        publishedForRequest_ = false;
         basePreloaded_ = false;
         stopped_ = false;
         worker_ = std::thread([this] { Loop(); });
@@ -131,6 +133,7 @@ private:
         std::vector<GpuGaussianData> data;
         uint64_t lastUse = 0;
     };
+    using CacheEntryPtr = std::shared_ptr<CacheEntry>;
 
     void Loop()
     {
@@ -155,6 +158,24 @@ private:
             // rotation always has *something* to show while finer tiles decode.
             // This runs before the first camera arrives so it starts immediately.
             if (!basePreloaded_) {
+                const int32_t firstBase = NextBaseTile(-1);
+                if (firstBase >= 0) {
+                    const int32_t secondBase = NextBaseTile(firstBase);
+                    const uint64_t now = ++clock_;
+                    if (secondBase >= 0) {
+                        auto async = std::async(std::launch::async, [this, secondBase, now] {
+                            EnsureTile(secondBase, now);
+                        });
+                        EnsureTile(firstBase, now);
+                        async.wait();
+                    } else {
+                        EnsureTile(firstBase, now);
+                    }
+                    if (publishedBuffer_ < 0 && cam.valid) {
+                        BuildView(cam, false);
+                    }
+                    continue;
+                }
                 if (DecodeNextBaseTile()) {
                     // Show whatever the base layer already covers instead of
                     // waiting for the whole preload (progressive first view).
@@ -178,30 +199,93 @@ private:
             // stops).
             const int32_t missing = NextMissingTile(cam);
             if (missing >= 0) {
-                EnsureTile(missing, ++clock_);
+                // Decode two tiles at once (the second one on a helper thread) to
+                // halve the time until a new area is usable.
+                const uint64_t now = ++clock_;
+                int32_t second = -1;
+                {
+                    const int32_t probe = NextMissingTileExcluding(cam, missing);
+                    second = probe;
+                }
+                if (second >= 0) {
+                    auto async = std::async(std::launch::async, [this, second, now] {
+                        EnsureTile(second, now);
+                    });
+                    EnsureTile(missing, now);
+                    async.wait();
+                } else {
+                    EnsureTile(missing, now);
+                }
                 continue;
             }
 
-            // Everything needed is cached. Assemble once the camera is still.
+            // Everything needed is cached. Assemble only once the camera has been
+            // still for a while: a rebuild swaps buffers, and doing that while a
+            // frame is in flight shows up as a one-frame flash.
             bool settled = false;
             {
-                std::lock_guard<std::mutex> lock(mutex_);
-                settled = (requestId_ == snapshot);
+                std::unique_lock<std::mutex> lock(mutex_);
+                const uint64_t target = requestId_;
+                settled = !cv_.wait_for(lock, std::chrono::milliseconds(450), [this, target] {
+                    return stopped_ || requestId_ != target;
+                });
             }
             if (!settled) {
                 continue;
             }
 
-            const bool compact = totalWritten_ > (budget_ * 11u) / 10u;
-            // Nothing to do unless the camera moved since the last assembly or a
-            // compaction is due (otherwise this loop would spin every 200 ms).
-            if (!compact && snapshot == lastBuiltRequest_) {
+            // Only rebuild when the camera has settled: a rebuild swaps buffers,
+            // and doing that while moving produces visible jumps/flashes.
+            if (snapshot == lastBuiltRequest_) {
                 continue;
             }
-            BuildView(cam, compact);
+            BuildView(cam, false);
             lastBuiltRequest_ = snapshot;
             seen = snapshot;
+            publishedForRequest_ = true;
         }
+    }
+
+    int32_t NextMissingTileExcluding(const Camera& cam, int32_t exclude)
+    {
+        Selection sel;
+        if (previousLevels_.size() != scene_.leaves.size()) {
+            previousLevels_.assign(scene_.leaves.size(), (int8_t)-1);
+        }
+        SelectVisible(scene_, cam.view, cam.proj, cam.camPos, budget_, previousLevels_.data(), sel);
+        for (const auto& it : sel.items) {
+            const Slice& slice = scene_.leaves[it.leaf].lods[it.level];
+            if (slice.file < 0 || slice.file == exclude) {
+                continue;
+            }
+            if (!TileReady(slice.file)) {
+                return slice.file;
+            }
+        }
+        return -1;
+    }
+
+    // Nearest not-yet-decoded coarsest tile (exclude one file), or -1.
+    int32_t NextBaseTile(int32_t exclude)
+    {
+        const int baseLevel = scene_.levelCount - 1;
+        float bestDist = 0.0f;
+        int32_t bestFile = -1;
+        for (const auto& leaf : scene_.leaves) {
+            if (baseLevel >= leaf.levels) {
+                continue;
+            }
+            const int32_t file = leaf.lods[baseLevel].file;
+            if (file < 0 || file == exclude || TileReady(file)) {
+                continue;
+            }
+            const float dist = DistanceToAabb(scene_.camPos, leaf);
+            if (bestFile < 0 || dist < bestDist) {
+                bestFile = file;
+                bestDist = dist;
+            }
+        }
+        return bestFile;
     }
 
     bool DecodeNextBaseTile()
@@ -216,7 +300,7 @@ private:
                 continue;
             }
             const int32_t file = leaf.lods[baseLevel].file;
-            if (file < 0 || caches_.find(file) != caches_.end()) {
+            if (file < 0 || TileReady(file)) {
                 continue;
             }
             const float dist = DistanceToAabb(scene_.camPos, leaf);
@@ -246,73 +330,96 @@ private:
             if (slice.file < 0) {
                 continue;
             }
-            if (caches_.find(slice.file) == caches_.end()) {
+            if (!TileReady(slice.file)) {
                 return slice.file;
             }
         }
         return -1;
     }
 
+    // Decodes a tile into the cache. Thread-safe: the (slow) decode runs outside
+    // the lock and the entry is published afterwards, so several tiles can be
+    // decoded concurrently.
     bool EnsureTile(int32_t file, uint64_t now)
     {
-        auto it = caches_.find(file);
-        if (it != caches_.end()) {
-            it->second.lastUse = now;
-            return true;
+        {
+            std::lock_guard<std::mutex> lock(cacheMutex_);
+            auto it = caches_.find(file);
+            if (it != caches_.end()) {
+                it->second->lastUse = now;
+                return true;
+            }
+            if (decoding_.count(file) != 0) {
+                return false;  // another thread is already decoding it
+            }
+            if (file < 0 || (size_t)file >= scene_.files.size()) {
+                return false;
+            }
+            decoding_.insert(file);
         }
-        if (file < 0 || (size_t)file >= scene_.files.size()) {
-            return false;
-        }
+
         const std::string path = scene_.dir + "/" + scene_.files[file];
         SplatData tile;
         const auto t0 = std::chrono::steady_clock::now();
-        if (!sog::LoadSogFile(path.c_str(), tile, 1.0f, false)) {
-            LOGE("LOD: failed to decode '%{public}s'", path.c_str());
-            return false;
+        const bool ok = sog::LoadSogFile(path.c_str(), tile, 1.0f, false);
+
+        auto entry = std::make_shared<CacheEntry>();
+        if (ok) {
+            entry->data.resize(tile.gaussians.size());
+            if (!tile.gaussians.empty()) {
+                std::memcpy(entry->data.data(), tile.gaussians.data(),
+                    tile.gaussians.size() * sizeof(GpuGaussianData));
+            }
+            entry->lastUse = now;
         }
         const double ms =
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-        auto& entry = caches_[file];
-        entry.data.resize(tile.gaussians.size());
-        if (!tile.gaussians.empty()) {
-            std::memcpy(entry.data.data(), tile.gaussians.data(),
-                tile.gaussians.size() * sizeof(GpuGaussianData));
+
+        std::lock_guard<std::mutex> lock(cacheMutex_);
+        decoding_.erase(file);
+        if (!ok) {
+            LOGE("LOD: failed to decode '%{public}s'", path.c_str());
+            return false;
         }
-        entry.lastUse = now;
-        cacheCount_ += (uint32_t)entry.data.size();
-        LOGI("LOD: decoded tile %{public}d (%{public}zu gaussians, %.0f ms)", file, entry.data.size(), ms);
-        Evict();
+        caches_[file] = entry;
+        cacheCount_ += (uint32_t)entry->data.size();
+        LOGI("LOD: decoded tile %{public}d (%{public}zu gaussians, %.0f ms)", file, entry->data.size(), ms);
+        EvictLocked();
         return true;
     }
 
-    void Evict()
+    void EvictLocked()
     {
         while (cacheCount_ > cacheBudget_ && caches_.size() > 1) {
             auto oldest = caches_.end();
             for (auto it = caches_.begin(); it != caches_.end(); ++it) {
-                if (oldest == caches_.end() || it->second.lastUse < oldest->second.lastUse) {
+                if (oldest == caches_.end() || it->second->lastUse < oldest->second->lastUse) {
                     oldest = it;
                 }
             }
             if (oldest == caches_.end()) {
                 return;
             }
-            cacheCount_ -= (uint32_t)oldest->second.data.size();
+            cacheCount_ -= (uint32_t)oldest->second->data.size();
             caches_.erase(oldest);
         }
     }
 
+    // True when the tile is decoded (or being decoded by another thread).
+    bool TileReady(int32_t file)
+    {
+        std::lock_guard<std::mutex> lock(cacheMutex_);
+        return caches_.find(file) != caches_.end();
+    }
+
     // Fill the write buffer in leaf order (nearest first) and publish prefixes.
+    // Full rebuild of the visible set into the buffer that is NOT published, then
+    // swap. Rebuilds only happen when the camera is at rest, so the GPU is never
+    // handed a buffer that is being written (that caused one-frame flashes).
     void BuildView(const Camera& cam, bool forceCompact = false)
     {
-        // Skip near-identical rebuilds (tiny camera drift): re-assembling means a
-        // full re-upload, which is visible as a flash.
-        if (publishedBuffer_ >= 0 && lastSelection_.size() == 0) {
-            lastSelection_.resize(scene_.leaves.size(), (int8_t)-1);
-        }
+        (void)forceCompact;
         if (previousLevels_.size() != scene_.leaves.size()) {
-            // Sentinel -1 = "no previous level" so the first build uses the
-            // plain distance thresholds.
             previousLevels_.assign(scene_.leaves.size(), (int8_t)-1);
         }
         Selection sel;
@@ -324,117 +431,76 @@ private:
             sel.perLevelGaussians[1], sel.perLevelLeaves[2], sel.perLevelGaussians[2],
             sel.perLevelLeaves[3], sel.perLevelGaussians[3]);
 
-        // Grow-only tile table: (leaf, level) entries already resident stay in the
-        // buffer, and a rebuild only appends the newly selected ones. This keeps
-        // motion smooth (no whole-set swap, no geometry disappearing) and lets the
-        // node upload just the appended tail.
-        // Use the requested level only if its tile is decoded; otherwise fall back
-        // to the coarsest level that is already cached (the base layer preload
-        // guarantees that every leaf has one after start-up). This is what makes
-        // a big rotation show coarse content immediately and refine afterwards.
+        // Prefer the requested level; fall back to the coarsest level that is
+        // already decoded so a leaf is never missing from the picture.
         auto resolveLevel = [&](uint32_t leafIndex, int desired) {
             const Leaf& leaf = scene_.leaves[leafIndex];
             for (int level = desired; level < leaf.levels; level++) {
                 const int32_t file = leaf.lods[level].file;
-                if (file >= 0 && caches_.find(file) != caches_.end()) {
+                if (file >= 0 && TileReady(file)) {
                     return level;
                 }
             }
             return -1;
         };
 
-        uint32_t appended = 0;
-        for (const auto& it : sel.items) {
-            const int level = resolveLevel(it.leaf, it.level);
-            if (level < 0) {
-                continue;
-            }
-            const uint32_t key = (it.leaf * 16u) + (uint32_t)level;
-            if (entryOf_.find(key) == entryOf_.end()) {
-                appended += scene_.leaves[it.leaf].lods[level].count;
-            }
-        }
-        // Full rewrites alternate to the other SSBO, which may still be read by a
-        // frame that is already in flight -> one corrupted frame (seen as a black
-        // flash while rotating). So only rebuild when the camera is settled (the
-        // compaction pass) or for the very first build; while moving we simply
-        // stop appending once the buffer is full and keep drawing the current set.
-        const bool overflowing = (totalWritten_ + appended > capacity_);
-        bool fullRebuild = forceCompact || (publishedBuffer_ < 0);
-        if (fullRebuild) {
-            entries_.clear();
-            entryOf_.clear();
-            totalWritten_ = 0;
-            // A full rebuild rewrites everything: write into the other buffer and
-            // let the node switch SSBOs once the upload completes.
-            writeIndex_ = (publishedBuffer_ < 0) ? 0 : (1 - publishedBuffer_);
-        } else if (writeIndex_ < 0) {
-            writeIndex_ = 0;
-        }
-
-        const uint32_t uploadStart = fullRebuild ? 0u : totalWritten_;
-        const uint32_t before = totalWritten_;
-        const uint64_t now = ++clock_;
-        // The first build publishes prefixes so the scene appears tile by tile;
-        // later appends publish once so there is no mid-motion swap.
+        const int writeIndex = (publishedBuffer_ < 0) ? 0 : (1 - publishedBuffer_);
         const bool progressive = (publishedBuffer_ < 0);
         const uint32_t publishStep = progressive ? std::max<uint32_t>(budget_ / 8u, 150000u)
                                                  : (budget_ + 1u);
-        uint32_t lastPublished = before;
+        const uint64_t now = ++clock_;
+        uint32_t written = 0;
+        uint32_t lastPublished = 0;
+        uint32_t skippedNoTile = 0;
 
         for (const auto& it : sel.items) {
             const int level = resolveLevel(it.leaf, it.level);
             if (level < 0) {
+                skippedNoTile++;
                 continue;
             }
-            const uint32_t key = (it.leaf * 16u) + (uint32_t)level;
-            if (entryOf_.find(key) != entryOf_.end()) {
-                continue;
-            }
-            const Leaf& leaf = scene_.leaves[it.leaf];
-            const Slice& slice = leaf.lods[level];
+            const Slice& slice = scene_.leaves[it.leaf].lods[level];
             if (slice.file < 0) {
                 continue;
             }
             if (!EnsureTile(slice.file, now)) {
                 continue;
             }
-            const auto& src = caches_[slice.file].data;
+            CacheEntryPtr entry;
+            {
+                std::lock_guard<std::mutex> lock(cacheMutex_);
+                auto it = caches_.find(slice.file);
+                if (it == caches_.end()) {
+                    continue;
+                }
+                entry = it->second;
+            }
+            const auto& src = entry->data;
             if (slice.offset + slice.count > src.size()) {
                 LOGE("LOD: slice out of range (file %{public}d offset %{public}u count %{public}u size %{public}zu)",
                     slice.file, slice.offset, slice.count, src.size());
                 continue;
             }
-            if (totalWritten_ + slice.count > capacity_) {
+            if (written + slice.count > capacity_) {
                 break;
             }
-            std::memcpy(&buffers_[writeIndex_][totalWritten_], &src[slice.offset],
+            std::memcpy(&buffers_[writeIndex][written], &src[slice.offset],
                 (size_t)slice.count * sizeof(GpuGaussianData));
-            Entry entry;
-            entry.key = key;
-            entry.count = slice.count;
-            entry.dst = totalWritten_;
-            entries_.push_back(entry);
-            entryOf_[key] = (uint32_t)(entries_.size() - 1);
-            totalWritten_ += slice.count;
-
-            if (totalWritten_ - lastPublished >= publishStep) {
-                Publish(writeIndex_, totalWritten_, uploadStart);
-                lastPublished = totalWritten_;
+            written += slice.count;
+            if (written - lastPublished >= publishStep) {
+                Publish(writeIndex, written, 0);
+                lastPublished = written;
             }
         }
-        if (totalWritten_ > lastPublished) {
-            Publish(writeIndex_, totalWritten_, uploadStart);
-        } else if (fullRebuild) {
-            // Nothing decoded yet: still expose the (empty) rebuild.
-            Publish(writeIndex_, totalWritten_, uploadStart);
+
+        if (written >= lastPublished) {
+            Publish(writeIndex, written, 0);
         }
         for (const auto& it : sel.items) {
             previousLevels_[it.leaf] = (int8_t)it.level;
         }
-        LOGI("LOD: assembly %{public}u gaussians (+%{public}u, uploadStart %{public}u, %s%s)",
-            totalWritten_, totalWritten_ - before, uploadStart, fullRebuild ? "full" : "append",
-            overflowing ? ", buffer full" : "");
+        LOGI("LOD: assembly %{public}u gaussians (no-tile %{public}u, gen 0x%{public}x)", written,
+            skippedNoTile, publishGeneration_);
     }
 
     void Publish(int bufferIndex, uint32_t count, uint32_t uploadStart)
@@ -458,17 +524,8 @@ private:
     Camera pending_;
     uint64_t requestId_ = 0;
 
-    struct Entry {
-        uint32_t key = 0;
-        uint32_t count = 0;
-        uint32_t dst = 0;
-    };
-
     std::vector<GpuGaussianData> buffers_[2];
     int writeIndex_ = -1;
-    std::vector<Entry> entries_;
-    std::unordered_map<uint32_t, uint32_t> entryOf_;
-    uint32_t totalWritten_ = 0;
     uint32_t publishUploadStart_ = 0;
     int publishedBuffer_ = -1;
     uint32_t publishCount_ = 0;
@@ -477,10 +534,13 @@ private:
 
     std::vector<int8_t> previousLevels_;
     std::vector<int8_t> lastSelection_;
-    std::unordered_map<int32_t, CacheEntry> caches_;
+    std::mutex cacheMutex_;
+    std::unordered_map<int32_t, CacheEntryPtr> caches_;
+    std::unordered_set<int32_t> decoding_;
     uint32_t cacheCount_ = 0;
     uint64_t clock_ = 0;
     uint64_t lastBuiltRequest_ = 0;
+    bool publishedForRequest_ = false;
     bool basePreloaded_ = false;
 };
 

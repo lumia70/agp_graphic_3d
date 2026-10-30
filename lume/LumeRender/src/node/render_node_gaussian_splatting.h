@@ -125,6 +125,7 @@ private:
     IPipelineDescriptorSetBinder::Ptr pipelineDescriptorSetBinder_;
 
     uint32_t gaussianCount_ = 0;
+    uint32_t emptyFrameCount_ = 0;
     uint32_t gaussianCapacity_ = 0;
     bool hasShData_ = false;
     // Data generation already uploaded to the GPU (LOD re-assembly).
