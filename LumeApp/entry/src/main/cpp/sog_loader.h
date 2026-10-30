@@ -23,6 +23,7 @@
 #pragma once
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <future>
 #include <cstdint>
@@ -605,6 +606,7 @@ inline bool LoadSogFile(const char* path, SplatData& out, float worldScale = 100
     RgbaImage scaleImg;
     RgbaImage quatImg;
     RgbaImage sh0Img;
+    const auto texBegin = std::chrono::steady_clock::now();
     {
         // The five textures of a tile are independent; decoding them concurrently
         // is the difference between ~0.8 s and ~0.3 s per tile.
@@ -711,6 +713,10 @@ inline bool LoadSogFile(const char* path, SplatData& out, float worldScale = 100
             paletteCount);
     }
 
+    const double texMs = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - texBegin).count();
+    const auto loopBegin = std::chrono::steady_clock::now();
+
     // ---- decode ----
     constexpr float SH_C0 = 0.28209479177387814f;
     out.gaussians.clear();
@@ -802,6 +808,11 @@ inline bool LoadSogFile(const char* path, SplatData& out, float worldScale = 100
         if (dst.py > out.boundsMax[1]) out.boundsMax[1] = dst.py;
         if (dst.pz > out.boundsMax[2]) out.boundsMax[2] = dst.pz;
     }
+
+    const double loopMs = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - loopBegin).count();
+    LOGI("SOG: %{public}u gaussians: textures %{public}.0f ms, decode loop %{public}.0f ms", count,
+        texMs, loopMs);
 
     out.gaussianCount = count;
     LOGI("SOG loaded: %{public}u gaussians, sh=%{public}d, bounds=(%{public}.2f,%{public}.2f,%{public}.2f)-(%{public}.2f,%{public}.2f,%{public}.2f)",

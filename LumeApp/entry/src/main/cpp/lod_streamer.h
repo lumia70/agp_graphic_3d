@@ -87,7 +87,9 @@ public:
         publishLiveCount_ = 0;
         publishLiveHash_ = 0;
         lastLiveHash_ = 0;
-        decodeFile_ = -1;
+        decodes_.clear();
+        lastBuiltHash_ = 0;
+        lastBuildMs_ = 0;
         previousLevels_.clear();
         lastBuiltRequest_ = 0;
         basePreloaded_ = false;
@@ -227,12 +229,16 @@ private:
                 continue;
             }
 
-            // 1) Collect a finished background decode (never blocks the loop).
-            if (decodeFuture_.valid() &&
-                decodeFuture_.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
-                decodeFuture_.get();
-                decodeFile_ = -1;
-                dirty_ = true;
+            // 1) Collect finished background decodes (never blocks the loop).
+            for (size_t d = 0; d < decodes_.size();) {
+                if (decodes_[d].second.wait_for(std::chrono::milliseconds(0)) ==
+                    std::future_status::ready) {
+                    decodes_[d].second.get();
+                    decodes_.erase(decodes_.begin() + (long)d);
+                    dirty_ = true;
+                } else {
+                    d++;
+                }
             }
 
             // 2) Publish immediately when the camera moved or new data landed. This
@@ -246,16 +252,19 @@ private:
             }
             seen = snapshot;
 
-            // 3) Keep one decode in flight for the next missing tile.
-            if (decodeFile_ < 0) {
-                const int32_t missing = NextMissingTile(cam);
-                if (missing >= 0) {
-                    const uint64_t now = ++clock_;
-                    decodeFile_ = missing;
-                    decodeFuture_ = std::async(std::launch::async, [this, missing, now] {
-                        return EnsureTile(missing, now);
-                    });
+            // 3) Keep a few decodes in flight: one tile takes 0.3-0.7 s and a sharp
+            //    centre needs several of them.
+            constexpr size_t kMaxDecodesInFlight = 2;
+            while (decodes_.size() < kMaxDecodesInFlight) {
+                int32_t exclude = decodes_.empty() ? -1 : decodes_.front().first;
+                const int32_t missing = NextMissingTileExcluding(cam, exclude);
+                if (missing < 0) {
+                    break;
                 }
+                const uint64_t now = ++clock_;
+                decodes_.emplace_back(missing, std::async(std::launch::async, [this, missing, now] {
+                    return EnsureTile(missing, now);
+                }));
             }
         }
     }
@@ -444,7 +453,7 @@ private:
             pinned_.insert(file);
         }
         dirty_ = true;
-        LOGI("LOD: decoded tile %{public}d (%{public}zu gaussians, %.0f ms)", file, entry->data.size(), ms);
+        LOGI("LOD: decoded tile %{public}d (%{public}zu gaussians, %{public}.0f ms)", file, entry->data.size(), ms);
         EvictLocked();
         return true;
     }
@@ -488,6 +497,25 @@ private:
         }
         Selection sel;
         SelectVisible(scene_, cam.view, cam.proj, cam.camPos, budget_, previousLevels_.data(), sel);
+
+        // If the selection did not change and no tile arrived, there is nothing to
+        // do. Rebuilding the live list (~1M entries) and republishing on every
+        // camera frame starves the decoder threads.
+        {
+            uint64_t h = 1469598103934665603ull ^ (uint64_t)sel.items.size();
+            for (const auto& it : sel.items) {
+                h = (h ^ ((uint64_t)it.leaf * 16u + (uint64_t)it.level)) * 1099511628211ull;
+            }
+            const uint64_t nowMs = (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            const bool changed = (h != lastBuiltHash_);
+            const bool throttled = !dirty_ && (nowMs - lastBuildMs_ < 150u);
+            if (!changed || throttled) {
+                return;
+            }
+            lastBuiltHash_ = h;
+            lastBuildMs_ = nowMs;
+        }
 
         auto resolveLevel = [&](uint32_t leafIndex, int desired) {
             const Leaf& leaf = scene_.leaves[leafIndex];
@@ -733,8 +761,7 @@ private:
     uint32_t publishLiveCount_ = 0;
     uint64_t publishLiveHash_ = 0;
     uint64_t lastLiveHash_ = 0;
-    std::future<bool> decodeFuture_;
-    int32_t decodeFile_ = -1;
+    std::vector<std::pair<int32_t, std::future<bool>>> decodes_;
     int writeIndex_ = -1;
     std::unordered_map<uint32_t, Entry> leafEntry_;  // leaf -> block
     std::vector<Block> freeBlocks_;
@@ -742,6 +769,8 @@ private:
     std::vector<uint32_t> dirtyRanges_;  // (start, count) pairs
     std::vector<uint32_t> live_;   // pool indices of the drawn set
     uint64_t buildId_ = 0;
+    uint64_t lastBuiltHash_ = 0;
+    uint64_t lastBuildMs_ = 0;
     std::atomic<bool> dirty_ { false };
     int publishedBuffer_ = -1;
     uint32_t publishCount_ = 0;
