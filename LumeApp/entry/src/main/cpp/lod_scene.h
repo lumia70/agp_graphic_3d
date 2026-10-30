@@ -58,6 +58,9 @@ struct Item {
     uint32_t leaf = 0;
     uint8_t level = 0;
     float dist = 0.0f;
+    // Screen importance: leaf radius / distance. Larger = more visible area, so
+    // it gets budget priority for finer levels.
+    float score = 0.0f;
 };
 
 struct Selection {
@@ -385,42 +388,81 @@ inline void SelectVisible(const Scene& scene, const float view[16], const float 
         out.items.push_back(item);
     }
 
+    // Importance = apparent size (bound radius / distance). Budget allocation
+    // works on this order: the most "expensive on screen" leaves get the finest
+    // levels the budget allows, the least important ones are coarsened first.
+    for (auto& it : out.items) {
+        const Leaf& leaf = scene.leaves[it.leaf];
+        const float ex = leaf.bmax[0] - leaf.bmin[0];
+        const float ey = leaf.bmax[1] - leaf.bmin[1];
+        const float ez = leaf.bmax[2] - leaf.bmin[2];
+        const float radius = 0.5f * std::sqrt(ex * ex + ey * ey + ez * ez);
+        it.score = radius / std::max(it.dist, 0.001f);
+    }
     std::sort(out.items.begin(), out.items.end(),
-        [](const Item& a, const Item& b) { return a.dist < b.dist; });
+        [](const Item& a, const Item& b) { return a.score > b.score; });
 
     uint32_t total = 0;
     for (const auto& it : out.items) {
         total += scene.leaves[it.leaf].lods[it.level].count;
     }
+
     if (budget > 0) {
-        // Coarsen from the farthest leaf until the budget fits: try each coarser
-        // level; if none fits, drop the leaf from this frame entirely.
-        for (size_t i = out.items.size(); i-- > 0 && total > budget;) {
-            Item& it = out.items[i];
-            const Leaf& leaf = scene.leaves[it.leaf];
-            total -= leaf.lods[it.level].count;
-            bool placed = false;
-            for (int level = it.level + 1; level < leaf.levels; level++) {
-                const uint32_t count = leaf.lods[level].count;
-                if (total + count <= budget) {
-                    it.level = (uint8_t)level;
-                    total += count;
-                    placed = true;
-                    break;
+        // 1) Over budget: coarsen the least important leaves first; a leaf that
+        //    cannot fit at any level is dropped for this frame.
+        if (total > budget) {
+            for (size_t i = out.items.size(); i-- > 0 && total > budget;) {
+                Item& it = out.items[i];
+                const Leaf& leaf = scene.leaves[it.leaf];
+                total -= leaf.lods[it.level].count;
+                bool placed = false;
+                for (int level = it.level + 1; level < leaf.levels; level++) {
+                    const uint32_t count = leaf.lods[level].count;
+                    if (total + count <= budget) {
+                        it.level = (uint8_t)level;
+                        total += count;
+                        placed = true;
+                        break;
+                    }
+                }
+                if (!placed) {
+                    it.level = 0xFF;
                 }
             }
-            if (!placed) {
-                it.level = 0xFF;
+            out.items.erase(std::remove_if(out.items.begin(), out.items.end(),
+                                [](const Item& it) { return it.level == 0xFF; }),
+                out.items.end());
+        } else {
+            // 2) Under budget: spend the leftover on the most important leaves,
+            //    upgrading them one level at a time while they fit.
+            bool upgraded = true;
+            while (upgraded) {
+                upgraded = false;
+                for (auto& it : out.items) {
+                    if (it.level == 0) {
+                        continue;  // already the finest
+                    }
+                    const Leaf& leaf = scene.leaves[it.leaf];
+                    const uint32_t current = leaf.lods[it.level].count;
+                    const uint32_t finer = leaf.lods[it.level - 1].count;
+                    if (finer <= current) {
+                        continue;
+                    }
+                    const uint32_t delta = finer - current;
+                    if (total + delta <= budget) {
+                        it.level = (uint8_t)(it.level - 1);
+                        total += delta;
+                        upgraded = true;
+                    }
+                }
             }
         }
-        out.items.erase(std::remove_if(out.items.begin(), out.items.end(),
-                            [](const Item& it) { return it.level == 0xFF; }),
-            out.items.end());
         total = 0;
         for (const auto& it : out.items) {
             total += scene.leaves[it.leaf].lods[it.level].count;
         }
     }
+
     out.total = total;
     for (auto& v : out.perLevelGaussians) {
         v = 0;

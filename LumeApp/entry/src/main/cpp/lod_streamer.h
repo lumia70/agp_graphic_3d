@@ -204,77 +204,35 @@ private:
                 continue;
             }
 
-            // Decode work runs while the camera keeps moving: each iteration
-            // prepares at most one missing tile for the *current* selection, then
-            // re-reads the camera. This is what removes the multi-second wait
-            // after a large rotation (tiles are already cached when the camera
-            // stops).
-            const int32_t missing = NextMissingTile(cam);
-            if (missing >= 0) {
-                // Decode two tiles at once (the second one on a helper thread) to
-                // halve the time until a new area is usable.
-                const uint64_t now = ++clock_;
-                int32_t second = -1;
-                {
-                    const int32_t probe = NextMissingTileExcluding(cam, missing);
-                    second = probe;
-                }
-                if (second >= 0) {
-                    auto async = std::async(std::launch::async, [this, second, now] {
-                        EnsureTile(second, now);
-                    });
-                    EnsureTile(missing, now);
-                    async.wait();
-                } else {
-                    EnsureTile(missing, now);
-                }
-                // Publish the tiles that just landed before decoding more: this is
-                // what makes content appear *while* the finger is still moving.
-                if (dirty_) {
-                    BuildView(cam, false);
-                    dirty_ = false;
-                    lastBuiltRequest_ = snapshot;
-                }
-                seen = requestId_;
-                continue;
-            }
-
-            // Everything needed is cached. Assemble only once the camera has been
-            // still for a while: a rebuild swaps buffers, and doing that while a
-            // frame is in flight shows up as a one-frame flash.
-            bool settled = false;
-            {
-                std::unique_lock<std::mutex> lock(mutex_);
-                const uint64_t target = requestId_;
-                settled = !cv_.wait_for(lock, std::chrono::milliseconds(450), [this, target] {
-                    return stopped_ || requestId_ != target;
-                });
-            }
-            if (!settled) {
-                // While the camera keeps moving, append the tiles that just became
-                // available (tail upload, no buffer swap -> no flash). This is what
-                // makes a newly visible area show up without lifting the finger.
-                if (dirty_) {
-                    BuildView(cam, false);
-                    dirty_ = false;
-                    lastBuiltRequest_ = snapshot;
-                }
-                seen = requestId_;
-                continue;
-            }
-
+            // Publish immediately when the camera moved: the assembly only uses
+            // levels that are already cached (the pinned coarse base guarantees
+            // there is something for every leaf), so this is a cheap append and it
+            // is what keeps the centre of the screen from going blank while
+            // rotating.
             const bool cameraChanged = (snapshot != lastBuiltRequest_);
-            if (!dirty_ && !cameraChanged) {
+            if (cameraChanged || dirty_) {
+                BuildView(cam, false);
+                dirty_ = false;
+                lastBuiltRequest_ = snapshot;
+            }
+            seen = snapshot;
+
+            // Then keep decoding the next missing (finer) tiles, two at a time.
+            const int32_t missing = NextMissingTile(cam);
+            if (missing < 0) {
                 continue;
             }
-            // Settled -> full rebuild into the alternate buffer (compacts stale
-            // entries, no tearing because nothing is moving). While moving ->
-            // append only the newly available tiles, which uploads a tail and
-            // never swaps buffers, so it cannot flash.
-            BuildView(cam, settled);
-            lastBuiltRequest_ = snapshot;
-            seen = snapshot;
-            dirty_ = false;
+            const uint64_t now = ++clock_;
+            const int32_t second = NextMissingTileExcluding(cam, missing);
+            if (second >= 0) {
+                auto async = std::async(std::launch::async, [this, second, now] {
+                    EnsureTile(second, now);
+                });
+                EnsureTile(missing, now);
+                async.wait();
+            } else {
+                EnsureTile(missing, now);
+            }
         }
     }
 
@@ -534,9 +492,12 @@ private:
         }
 
         const bool first = (publishedBuffer_ < 0);
-        // Full rewrite when nothing exists yet, when the camera is at rest, or
-        // when appending would overflow the buffer.
-        const bool full = first || settled || (totalWritten_ + appended > capacity_);
+        // Full rewrite only when nothing exists yet or when the accumulated set
+        // no longer fits. A rebuild re-derives the levels from the cache, which is
+        // coarser than the appended mixture, so doing it on every "settle" made
+        // the picture visibly degrade when the finger was lifted.
+        const bool full = first || (totalWritten_ + appended > capacity_);
+        (void)settled;
         if (full) {
             entries_.clear();
             entryOf_.clear();
@@ -611,9 +572,11 @@ private:
         for (const auto& it : sel.items) {
             previousLevels_[it.leaf] = (int8_t)it.level;
         }
-        LOGI("LOD: %{public}s %{public}u gaussians (+%{public}u, no-tile %{public}u, gen 0x%{public}x)",
+        LOGI("LOD: %{public}s %{public}u gaussians (+%{public}u, no-tile %{public}u) "
+             "[L0 %u L1 %u L2 %u L3 %u] gen 0x%{public}x",
             full ? "rebuild" : "append", totalWritten_, totalWritten_ - before, skippedNoTile,
-            publishGeneration_);
+            sel.perLevelGaussians[0], sel.perLevelGaussians[1], sel.perLevelGaussians[2],
+            sel.perLevelGaussians[3], publishGeneration_);
     }
 
     void Publish(int bufferIndex, uint32_t count, uint32_t uploadStart)
