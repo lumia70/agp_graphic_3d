@@ -26,6 +26,7 @@
 
 #include "splat_loader.h"
 #include "sog_loader.h"
+#include "lod_streamer.h"
 #include "gaussian_splat_data.h"
 
 // --- LumeBase ---
@@ -150,6 +151,8 @@ struct OrbitCamera {
     float shDeg23 = 0.0f;   // SH degree 2-3 weight (per-model)
     float distance = 1.2f;  // distance from target
     float targetX = 0.0f, targetY = 0.0f, targetZ = 0.0f;
+    float nearPlane = 0.05f;
+    float farPlane = 2000.0f;
 
     // Touch state
     float lastX = 0.0f, lastY = 0.0f;
@@ -212,7 +215,7 @@ struct OrbitCamera {
     void ComputeProjMatrix(float* out, float aspect) const {
         float fovRad = fovYDeg * 3.14159265f / 180.f;
         float f = 1.f / tanf(fovRad * 0.5f);
-        float zn = 0.05f, zf = 2000.f;
+        float zn = nearPlane, zf = farPlane;
         memset(out, 0, 16 * sizeof(float));
         out[0]  = f / aspect;
         out[5]  = -f;  // Vulkan Y-flip
@@ -262,6 +265,10 @@ struct OrbitCamera {
         g_gaussianCameraData.shScale[1] = shDeg23;
         g_gaussianCameraData.shScale[2] = 0.f;
         g_gaussianCameraData.shScale[3] = 0.f;
+        g_gaussianCameraData.clip[0] = nearPlane;
+        g_gaussianCameraData.clip[1] = farPlane;
+        g_gaussianCameraData.clip[2] = 0.f;
+        g_gaussianCameraData.clip[3] = 0.f;
         g_gaussianCameraReady = true;
     }
 };
@@ -784,6 +791,9 @@ struct DemoModelConfig {
     // <= 0 means "derive from the robust subject radius".
     float insideDistance;
     float farDistance;
+    // Non-null for LOD scenes: directory under <files>/assets/lod holding
+    // default.scene.json + lod-meta.json. `file` is empty for these entries.
+    const char* scene;
 };
 static const DemoModelConfig kDemoModels[] = {
     // Standard 3DGS PLY. The bounds cover a whole room, so the auto-frame lands
@@ -807,7 +817,10 @@ static const DemoModelConfig kDemoModels[] = {
     { "godzilla.splat", 80.0f, 0.0f, 0.0f, false, {}, {}, {}, {}, 0.0f, 0.0f },
     // UWA glTF with vector-quantised SH. The bounds are dominated by the
     // environment shell, so use the framing that matches the reference capture.
-    { "doll.glb", 60.0f, 1.0f, 1.0f, false, {}, {}, {}, {}, 42.0f, 250.0f },
+    { "doll.glb", 60.0f, 1.0f, 1.0f, false, {}, {}, {}, {}, 42.0f, 250.0f, nullptr },
+    // Large scene with per-tile LOD (SOG tiles). Camera and framing come from
+    // default.scene.json, so the entry only names the directory.
+    { "", 60.0f, 0.0f, 0.0f, false, {}, {}, {}, {}, 0.0f, 0.0f, "lod/syp_uav_0611" },
 };
 static constexpr int kDemoModelCount = (int)(sizeof(kDemoModels) / sizeof(kDemoModels[0]));
 static int g_modelIndex = 3;  // doll.glb by default (must track kDemoModels order)
@@ -887,13 +900,136 @@ static SplatFraming ComputeSplatFraming(const SplatData& data)
     return f;
 }
 
+// ---- LOD scene streaming ----
+static lod::Streamer g_lodStreamer;
+static bool g_lodActive = false;
+static float g_lastLodView[16] = {};
+
+static bool FileExists(const std::string& path)
+{
+    struct stat st {};
+    return stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode);
+}
+
+static const char* SceneBaseName(const char* scene)
+{
+    const char* slash = strrchr(scene, '/');
+    return slash ? slash + 1 : scene;
+}
+
+void LoadLodScene(const DemoModelConfig& cfg)
+{
+    // Prefer the scene pushed into the sandbox; fall back to the HAP-bundled
+    // LOD2+LOD3 subset (rawfile/assets/lod_fallback/<name>).
+    std::string dir = g_filesDir + "/assets/" + cfg.scene;
+    if (!FileExists(dir + "/lod-meta.json")) {
+        const std::string fallback =
+            g_filesDir + "/assets/lod_fallback/" + std::string(SceneBaseName(cfg.scene));
+        if (FileExists(fallback + "/lod-meta.json")) {
+            dir = fallback;
+        }
+    }
+    LOGI("LOD scene dir: %{public}s", dir.c_str());
+
+    if (!g_lodStreamer.Start(dir, 0, 0)) {
+        LOGE("LOD scene failed to start");
+        return;
+    }
+    g_lodActive = true;
+
+    const lod::Scene& scene = g_lodStreamer.GetScene();
+    g_orbitCam.fovYDeg = cfg.fovYDeg;
+    g_orbitCam.shDeg1 = cfg.shDeg1;
+    g_orbitCam.shDeg23 = cfg.shDeg23;
+
+    // Camera from the scene metadata: eye = cameraInfo.position, target = lookAt.
+    float bx = scene.camPos[0] - scene.camLookAt[0];
+    float by = scene.camPos[1] - scene.camLookAt[1];
+    float bz = scene.camPos[2] - scene.camLookAt[2];
+    float len = std::sqrt(bx * bx + by * by + bz * bz);
+    if (len < 1e-3f) {
+        bx = 0.0f;
+        by = 0.0f;
+        bz = 1.0f;
+        len = 1.0f;
+    }
+    g_orbitCam.backX = bx / len;
+    g_orbitCam.backY = by / len;
+    g_orbitCam.backZ = bz / len;
+    // right = normalize(up x back), up = back x right
+    float rx = 1.0f * g_orbitCam.backZ - 0.0f * g_orbitCam.backY;
+    float ry = 0.0f * g_orbitCam.backX - 0.0f * g_orbitCam.backZ;
+    float rz = 0.0f * g_orbitCam.backY - 1.0f * g_orbitCam.backX;
+    float rl = std::sqrt(rx * rx + ry * ry + rz * rz);
+    if (rl < 1e-4f) {
+        rx = 1.0f;
+        ry = 0.0f;
+        rz = 0.0f;
+        rl = 1.0f;
+    }
+    g_orbitCam.rightX = rx / rl;
+    g_orbitCam.rightY = ry / rl;
+    g_orbitCam.rightZ = rz / rl;
+    g_orbitCam.upX = g_orbitCam.backY * g_orbitCam.rightZ - g_orbitCam.backZ * g_orbitCam.rightY;
+    g_orbitCam.upY = g_orbitCam.backZ * g_orbitCam.rightX - g_orbitCam.backX * g_orbitCam.rightZ;
+    g_orbitCam.upZ = g_orbitCam.backX * g_orbitCam.rightY - g_orbitCam.backY * g_orbitCam.rightX;
+
+    g_orbitCam.targetX = scene.camLookAt[0];
+    g_orbitCam.targetY = scene.camLookAt[1];
+    g_orbitCam.targetZ = scene.camLookAt[2];
+    g_orbitCam.distance = len;
+
+    float ex = scene.boundsMax[0] - scene.boundsMin[0];
+    float ey = scene.boundsMax[1] - scene.boundsMin[1];
+    float ez = scene.boundsMax[2] - scene.boundsMin[2];
+    const float diag = std::sqrt(ex * ex + ey * ey + ez * ez);
+    g_orbitCam.nearPlane = std::max(0.1f, diag * 0.0005f);
+    g_orbitCam.farPlane = (len + diag) * 2.0f;
+    g_orbitCam.insideDistance = std::max(1.0f, diag * 0.05f);
+    g_orbitCam.farDistance = len;
+    // Start in the far framing so the first double-tap zooms into the scene.
+    g_orbitCam.insideView = false;
+    g_orbitCam.LogState("lod-initial");
+
+    // No CPU splat array: the node waits for the first streamed assembly.
+    g_gaussianSplatData = nullptr;
+    g_gaussianSplatCount = 0;
+    g_gaussianSplatCapacity = g_lodStreamer.Capacity();
+    g_gaussianShData = nullptr;
+    g_gaussianDataReady = false;
+    ++g_gaussianSplatGeneration;
+
+    // RNG for the gaussian splatting node (same as the single-file path)
+    auto& rngMgr = g_lume.renderContext->GetRenderNodeGraphManager();
+    RENDER_NS::RenderNodeGraphDesc rngDesc {};
+    rngDesc.renderNodeGraphName = "GaussianSplatRNG";
+
+    RENDER_NS::RenderNodeDesc nodeDesc {};
+    nodeDesc.typeName = "RenderNodeGaussianSplatting";
+    nodeDesc.nodeName = "GaussianSplatNode";
+    rngDesc.nodes.push_back(BASE_NS::move(nodeDesc));
+
+    g_lume.splatRngHandle = rngMgr.Create(
+        RENDER_NS::IRenderNodeGraphManager::RenderNodeGraphUsageType::RENDER_NODE_GRAPH_STATIC,
+        rngDesc);
+    LOGI("LOD RNG created: valid=%{public}d, budget=%{public}u", g_lume.splatRngHandle ? 1 : 0,
+        g_lodStreamer.Budget());
+}
+
 static void ReleaseSplatModel()
 {
     // Release the RNG first: it owns the RenderNode (and its GPU buffers),
     // which must not outlive the CPU-side splat arrays.
+    if (g_lodActive) {
+        g_lodStreamer.Stop();
+        g_lodActive = false;
+        memset(g_lastLodView, 0, sizeof(g_lastLodView));
+    }
     g_lume.splatRngHandle = {};
     g_gaussianSplatData = nullptr;
     g_gaussianSplatCount = 0;
+    g_gaussianSplatCapacity = 0;
+    ++g_gaussianSplatGeneration;
     g_gaussianShData = nullptr;
     g_gaussianDataReady = false;
     g_lume.splatData = SplatData {};
@@ -905,6 +1041,10 @@ void LoadSplatModel()
     ReleaseSplatModel();
 
     const DemoModelConfig& cfg = kDemoModels[g_modelIndex];
+    if (cfg.scene != nullptr) {
+        LoadLodScene(cfg);
+        return;
+    }
     std::string path = g_filesDir + "/assets/" + cfg.file;
     LOGI("Loading splat model: %{public}s", path.c_str());
 
@@ -992,8 +1132,10 @@ void LoadSplatModel()
         "GaussianSplatGPU must match GpuGaussianData layout");
     g_gaussianSplatData = reinterpret_cast<const GpuGaussianData*>(g_lume.splatData.gaussians.data());
     g_gaussianSplatCount = g_lume.splatData.gaussianCount;
+    g_gaussianSplatCapacity = g_lume.splatData.gaussianCount;
     g_gaussianShData = g_lume.splatData.sh.empty() ? nullptr : g_lume.splatData.sh.data();
     g_gaussianDataReady = true;
+    ++g_gaussianSplatGeneration;
 
     // Create the RNG for the gaussian splatting node
     auto& rngMgr = g_lume.renderContext->GetRenderNodeGraphManager();
@@ -1034,6 +1176,32 @@ void DrawFrame()
     // Update shared camera data for the gaussian splatting RenderNode
     if (g_lume.width > 0 && g_lume.height > 0) {
         g_orbitCam.UpdateSharedCameraData((uint32_t)g_lume.width, (uint32_t)g_lume.height);
+    }
+
+    // LOD scene: feed the streamer when the view changed and pick up newly
+    // assembled data. The worker decodes tiles in the background, so the first
+    // frames render whatever is already available.
+    if (g_lodActive) {
+        if (std::memcmp(g_lastLodView, g_gaussianCameraData.view, sizeof(g_lastLodView)) != 0) {
+            std::memcpy(g_lastLodView, g_gaussianCameraData.view, sizeof(g_lastLodView));
+            g_lodStreamer.UpdateCamera(g_gaussianCameraData.view, g_gaussianCameraData.proj,
+                g_gaussianCameraData.cameraPos);
+        }
+        uint32_t lodGeneration = 0;
+        uint32_t lodCount = 0;
+        uint32_t lodUploadStart = 0;
+        const GpuGaussianData* lodData = nullptr;
+        if (g_lodStreamer.Poll(lodGeneration, &lodData, lodCount, lodUploadStart)) {
+            g_gaussianSplatData = lodData;
+            g_gaussianSplatCount = lodCount;
+            g_gaussianSplatCapacity = g_lodStreamer.Capacity();
+            g_gaussianShData = nullptr;
+            g_gaussianDataReady = true;
+            g_gaussianSplatUploadStart = lodUploadStart;
+            ++g_gaussianSplatGeneration;
+            g_forceRenderFrames = 30;
+            LOGI("LOD: published %{public}u gaussians (gen 0x%{public}x)", lodCount, lodGeneration);
+        }
     }
 
     // TickFrame updates internal time and drives all ECS systems.
@@ -1232,7 +1400,7 @@ void DispatchTouchEvent(OH_NativeXComponent* component, void* window)
                 float ratio = g_orbitCam.lastDist / dist;
                 g_orbitCam.distance *= ratio;
                 if (g_orbitCam.distance < 0.1f) g_orbitCam.distance = 0.1f;
-                if (g_orbitCam.distance > 2000.f) g_orbitCam.distance = 2000.f;
+                if (g_orbitCam.distance > g_orbitCam.farPlane) g_orbitCam.distance = g_orbitCam.farPlane;
             }
             g_orbitCam.lastDist = dist;
 
@@ -1345,6 +1513,9 @@ static napi_value NapiSetModel(napi_env env, napi_callback_info info)
 
     for (int i = 0; i < kDemoModelCount; i++) {
         std::string file = kDemoModels[i].file;
+        if (kDemoModels[i].scene != nullptr) {
+            file = SceneBaseName(kDemoModels[i].scene);
+        }
         // Accept either the full file name ("doll.glb") or the short name ("doll").
         if (name == file || (name.size() >= 3 && file.compare(0, name.size(), name) == 0)) {
             g_pendingModelIndex = i;

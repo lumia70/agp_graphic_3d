@@ -62,7 +62,12 @@ private:
     IRenderNodeContextManager* renderNodeContextMgr_ = nullptr;
 
     // GPU resources
+    // Two alternating gaussian SSBOs: LOD re-assembly uploads into the inactive
+    // one and only then switches, so the GPU is never handed a buffer that is
+    // being overwritten mid-frame (that showed up as flicker while moving).
     RenderHandleReference gaussianBuffer_;
+    RenderHandleReference gaussianBufferAlt_;
+    bool altActive_ = false;
     // Triple-buffered per-frame written buffers: while the GPU executes up to
     // 2 in-flight frames, the CPU writes the next slot — no torn reads.
     static constexpr uint32_t FRAME_SLOTS = 3;
@@ -120,6 +125,10 @@ private:
     IPipelineDescriptorSetBinder::Ptr pipelineDescriptorSetBinder_;
 
     uint32_t gaussianCount_ = 0;
+    uint32_t gaussianCapacity_ = 0;
+    bool hasShData_ = false;
+    // Data generation already uploaded to the GPU (LOD re-assembly).
+    uint32_t uploadedGeneration_ = 0;
     bool needsUpload_ = true;
     bool initialized_ = false;
 

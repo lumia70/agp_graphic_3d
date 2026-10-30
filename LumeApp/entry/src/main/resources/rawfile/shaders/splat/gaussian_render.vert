@@ -171,10 +171,14 @@ void main() {
     // web's per-channel angular color trends; the flipped direction produces
     // an opposite blue trend (phone blue +9% vs web -7% front->side).
     vec3 viewDir = normalize(worldPos - cameraPos.xyz);
-    vec3 color = g.color.rgb + evalSH(gaussianIdx, viewDir);
-    color = max(color, vec3(0.0));
-    // Per-model SH enablement comes from shScale (binding 4): models configured
-    // with degree weights 0 evaluate to plain DC, others add the SH bands.
+    vec3 color = g.color.rgb;
+    // Per-model SH enablement comes from shScale (binding 4). Skipping the lookup
+    // entirely matters: DC-only models then never touch the SH buffer (which may
+    // be a tiny dummy when the model carries no SH data at all).
+    if (shScale.x > 0.0 || shScale.y > 0.0) {
+        color += evalSH(gaussianIdx, viewDir);
+        color = max(color, vec3(0.0));
+    }
 
     // ---- 3D covariance in world space ----
     mat3 R = quatToMat3(g.rotation);

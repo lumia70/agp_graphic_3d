@@ -56,6 +56,10 @@ struct SharedPtrs {
     GaussianCameraData* cameraPtr = nullptr;  // direct pointer to struct (not pointer-to-pointer)
     bool* cameraReadyPtr = nullptr;
     const float** shPtr = nullptr;
+    uint32_t* capacityPtr = nullptr;
+    uint32_t* generationPtr = nullptr;
+    uint32_t* uploadedGenerationPtr = nullptr;
+    uint32_t* uploadStartPtr = nullptr;
     bool resolved = false;
 
     void Resolve() {
@@ -69,6 +73,10 @@ struct SharedPtrs {
             cameraPtr = (GaussianCameraData*)dlsym(h, "g_gaussianCameraData");
             cameraReadyPtr = (bool*)dlsym(h, "g_gaussianCameraReady");
             shPtr = (const float**)dlsym(h, "g_gaussianShData");
+            capacityPtr = (uint32_t*)dlsym(h, "g_gaussianSplatCapacity");
+            generationPtr = (uint32_t*)dlsym(h, "g_gaussianSplatGeneration");
+            uploadedGenerationPtr = (uint32_t*)dlsym(h, "g_gaussianSplatUploadedGeneration");
+            uploadStartPtr = (uint32_t*)dlsym(h, "g_gaussianSplatUploadStart");
         }
         resolved = true;
     }
@@ -78,6 +86,15 @@ struct SharedPtrs {
     bool CameraReady() const { return cameraReadyPtr && *cameraReadyPtr && cameraPtr; }
     const GaussianCameraData& Camera() const { return *cameraPtr; }
     const float* Sh() const { return shPtr ? *shPtr : nullptr; }
+    uint32_t Capacity() const { return capacityPtr ? *capacityPtr : 0u; }
+    uint32_t Generation() const { return generationPtr ? *generationPtr : 0u; }
+    uint32_t UploadStart() const { return uploadStartPtr ? *uploadStartPtr : 0u; }
+    void MarkUploaded(uint32_t generation) const
+    {
+        if (uploadedGenerationPtr) {
+            *uploadedGenerationPtr = generation;
+        }
+    }
 };
 SharedPtrs g_sp;
 
@@ -249,7 +266,8 @@ struct SortTiming {
 // Frustum + size cull and back-to-front bucket sort. Returns the visible count
 // and writes the order into `out` (which must hold `count` entries).
 uint32_t ComputeSort(const float* records, const uint32_t count, SortScratch& s, uint32_t* out,
-    const float* vm, const float* pm, const float viewportHeight, SortTiming* timing)
+    const float* vm, const float* pm, const float viewportHeight, const float nearZ, const float farZ,
+    SortTiming* timing)
 {
     const auto sortBegin = std::chrono::steady_clock::now();
     auto ms = [](std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b) {
@@ -295,7 +313,7 @@ uint32_t ComputeSort(const float* records, const uint32_t count, SortScratch& s,
             const float px = rec[0], py = rec[1], pz = rec[2];
             const float vz = f0*px + f1*py + f2*pz + t2;
             const float z = -vz;  // positive distance in front
-            if (z < 0.05f || z > 2000.f) continue;
+            if (z < nearZ || z > farZ) continue;
             const float ms_ = rec[3];
             const float wr = ms_ * 3.f;
             const float vx = r0*px + r1*py + r2*pz + t0;
@@ -449,6 +467,8 @@ struct RenderNodeGaussianSplatting::SortState {
     float view[16] = {};
     float proj[16] = {};
     float viewportHeight = 0.0f;
+    float nearZ = 0.05f;
+    float farZ = 2000.0f;
 
     // Published result (guarded by mutex)
     std::vector<uint32_t> result;
@@ -492,6 +512,8 @@ void RenderNodeGaussianSplatting::ensureSortThread()
             float view[16] = {};
             float proj[16] = {};
             float viewportHeight = 0.0f;
+            float nearZ = 0.05f;
+            float farZ = 2000.0f;
             uint64_t id = 0;
             {
                 std::unique_lock<std::mutex> lock(state.mutex);
@@ -508,6 +530,8 @@ void RenderNodeGaussianSplatting::ensureSortThread()
                 std::memcpy(view, state.view, sizeof(view));
                 std::memcpy(proj, state.proj, sizeof(proj));
                 viewportHeight = state.viewportHeight;
+                nearZ = state.nearZ;
+                farZ = state.farZ;
                 state.requestPending = false;
             }
 
@@ -519,7 +543,7 @@ void RenderNodeGaussianSplatting::ensureSortThread()
             state.result.resize(count);
             SortTiming timing;
             const uint32_t visible = ComputeSort(records, count, state.scratch, state.result.data(), view,
-                proj, viewportHeight, &timing);
+                proj, viewportHeight, nearZ, farZ, &timing);
 
             {
                 std::lock_guard<std::mutex> lock(state.mutex);
@@ -605,43 +629,65 @@ void RenderNodeGaussianSplatting::InitNode(IRenderNodeContextManager& mgr)
         shParamsBuffer_[s] = gpuResMgr.Create(name, paramDesc);
     }
 
-    // Gaussian SSBO (host-visible, uploaded once when data is ready)
+    // The shader always has binding 3; keep a small dummy when there is no SH
+    // data (it is never sampled because both SH weights are zero).
+    {
+        GpuBufferDesc shDesc {};
+        shDesc.usageFlags = CORE_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+        shDesc.memoryPropertyFlags = CORE_MEMORY_PROPERTY_HOST_VISIBLE_BIT | CORE_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        shDesc.byteSize = 64u;
+        shDesc.engineCreationFlags = CORE_ENGINE_BUFFER_CREATION_DYNAMIC_BARRIERS;
+        shBuffer_ = gpuResMgr.Create("GS_ShDummy", shDesc);
+        hasShData_ = false;
+    }
+
+    // Gaussian SSBO (host-visible). LOD scenes re-assemble their visible set, so
+    // the buffer is sized for the shared capacity (the frame budget) while only
+    // `count` entries are uploaded/drawn.
     if (g_sp.Ready()) {
-        uint32_t cnt = g_sp.Count();
+        const uint32_t cnt = g_sp.Count();
+        const uint32_t capacity = g_sp.Capacity() > cnt ? g_sp.Capacity() : cnt;
         GpuBufferDesc desc {};
         desc.usageFlags = CORE_BUFFER_USAGE_STORAGE_BUFFER_BIT;
         desc.memoryPropertyFlags = CORE_MEMORY_PROPERTY_HOST_VISIBLE_BIT | CORE_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-        desc.byteSize = cnt * sizeof(GpuGaussian);
+        desc.byteSize = capacity * sizeof(GpuGaussian);
         desc.engineCreationFlags = CORE_ENGINE_BUFFER_CREATION_DYNAMIC_BARRIERS;
         gaussianBuffer_ = gpuResMgr.Create("GS_SSBO", desc);
+        gaussianBufferAlt_ = gpuResMgr.Create("GS_SSBO_Alt", desc);
+        altActive_ = false;
         gaussianCount_ = cnt;
+        gaussianCapacity_ = capacity;
         needsUpload_ = true;
 
-        // Sort index buffer (one uint32 per gaussian) — triple buffered
+        // Sort index buffer (one uint32 per capacity entry) — triple buffered
         for (uint32_t s = 0; s < FRAME_SLOTS; s++) {
             GpuBufferDesc sortDesc {};
             sortDesc.usageFlags = CORE_BUFFER_USAGE_STORAGE_BUFFER_BIT;
             sortDesc.memoryPropertyFlags = CORE_MEMORY_PROPERTY_HOST_VISIBLE_BIT | CORE_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-            sortDesc.byteSize = cnt * sizeof(uint32_t);
+            sortDesc.byteSize = capacity * sizeof(uint32_t);
             sortDesc.engineCreationFlags = CORE_ENGINE_BUFFER_CREATION_DYNAMIC_BARRIERS;
             char name[32];
             snprintf(name, sizeof(name), "GS_SortIdx_%u", s);
             sortIndexBuffer_[s] = gpuResMgr.Create(name, sortDesc);
         }
 
-        // SH coefficient buffer (48 floats per gaussian, uploaded once)
-        GpuBufferDesc shDesc {};
-        shDesc.usageFlags = CORE_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-        shDesc.memoryPropertyFlags = CORE_MEMORY_PROPERTY_HOST_VISIBLE_BIT | CORE_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-        shDesc.byteSize = (uint32_t)(cnt * 48ULL * sizeof(float));
-        shDesc.engineCreationFlags = CORE_ENGINE_BUFFER_CREATION_DYNAMIC_BARRIERS;
-        shBuffer_ = gpuResMgr.Create("GS_Sh", shDesc);
+        // SH coefficient buffer (48 floats per gaussian) when the model has SH.
+        if (g_sp.Sh()) {
+            GpuBufferDesc shDesc {};
+            shDesc.usageFlags = CORE_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+            shDesc.memoryPropertyFlags = CORE_MEMORY_PROPERTY_HOST_VISIBLE_BIT | CORE_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+            shDesc.byteSize = (uint32_t)(capacity * 48ULL * sizeof(float));
+            shDesc.engineCreationFlags = CORE_ENGINE_BUFFER_CREATION_DYNAMIC_BARRIERS;
+            shBuffer_ = gpuResMgr.Create("GS_Sh", shDesc);
+            hasShData_ = true;
+        }
 
         if (!sortState_) {
             sortState_ = new SortState();
         }
 
-        PLUGIN_LOG_I("GS: SSBO %u gaussians (%u MB)", cnt, (uint32_t)(cnt * 64ULL / (1024 * 1024)));
+        PLUGIN_LOG_I("GS: SSBO %u/%u gaussians (%u MB), SH=%s", cnt, capacity,
+            (uint32_t)(capacity * 64ULL / (1024 * 1024)), hasShData_ ? "yes" : "no");
     }
 
     // ---- 2. Get shader handle ----
@@ -686,7 +732,8 @@ void RenderNodeGaussianSplatting::InitNode(IRenderNodeContextManager& mgr)
     if (pipelineDescriptorSetBinder_) {
         pipelineDescriptorSetBinder_->BindBuffer(0u, 0u, BindableBuffer { cameraUbo_[0].GetHandle() });
         if (gaussianBuffer_) {
-            pipelineDescriptorSetBinder_->BindBuffer(0u, 1u, BindableBuffer { gaussianBuffer_.GetHandle() });
+            pipelineDescriptorSetBinder_->BindBuffer(0u, 1u,
+                BindableBuffer { (altActive_ ? gaussianBufferAlt_ : gaussianBuffer_).GetHandle() });
         }
         if (sortIndexBuffer_[0]) {
             pipelineDescriptorSetBinder_->BindBuffer(0u, 2u, BindableBuffer { sortIndexBuffer_[0].GetHandle() });
@@ -828,7 +875,8 @@ void RenderNodeGaussianSplatting::PreExecuteFrame()
 
         // Rebind SSBOs
         if (pipelineDescriptorSetBinder_) {
-            pipelineDescriptorSetBinder_->BindBuffer(0u, 1u, BindableBuffer { gaussianBuffer_.GetHandle() });
+            pipelineDescriptorSetBinder_->BindBuffer(0u, 1u,
+                BindableBuffer { (altActive_ ? gaussianBufferAlt_ : gaussianBuffer_).GetHandle() });
             pipelineDescriptorSetBinder_->BindBuffer(0u, 2u, BindableBuffer { sortIndexBuffer_[0].GetHandle() });
         }
     }
@@ -842,7 +890,78 @@ void RenderNodeGaussianSplatting::ExecuteFrame(IRenderCommandList& cmdList)
 #if (RENDER_DEV_ENABLED == 1)
     const auto execBegin = std::chrono::steady_clock::now();
 #endif
-    if (!initialized_ || gaussianCount_ == 0) return;
+    if (!initialized_) return;
+
+    // Data generation changed (model switch / LOD re-assembly): pick up the new
+    // count, grow the buffers if the capacity changed, and re-upload.
+    const uint32_t generation = g_sp.Generation();
+    if (generation != uploadedGeneration_ && g_sp.Ready()) {
+        const uint32_t newCount = g_sp.Count();
+        const uint32_t newCapacity = g_sp.Capacity() > newCount ? g_sp.Capacity() : newCount;
+        if (newCapacity != gaussianCapacity_ || !gaussianBuffer_) {
+            // Recreate the gaussian + sort buffers for the new capacity.
+            auto& gpuResMgr = renderNodeContextMgr_->GetGpuResourceManager();
+            GpuBufferDesc desc {};
+            desc.usageFlags = CORE_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+            desc.memoryPropertyFlags = CORE_MEMORY_PROPERTY_HOST_VISIBLE_BIT | CORE_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+            desc.byteSize = newCapacity * sizeof(GpuGaussian);
+            desc.engineCreationFlags = CORE_ENGINE_BUFFER_CREATION_DYNAMIC_BARRIERS;
+            gaussianBuffer_ = gpuResMgr.Create("GS_SSBO_Dyn", desc);
+            gaussianBufferAlt_ = gpuResMgr.Create("GS_SSBO_DynAlt", desc);
+            altActive_ = false;
+            for (uint32_t s = 0; s < FRAME_SLOTS; s++) {
+                GpuBufferDesc sortDesc {};
+                sortDesc.usageFlags = CORE_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+                sortDesc.memoryPropertyFlags = CORE_MEMORY_PROPERTY_HOST_VISIBLE_BIT | CORE_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+                sortDesc.byteSize = newCapacity * sizeof(uint32_t);
+                sortDesc.engineCreationFlags = CORE_ENGINE_BUFFER_CREATION_DYNAMIC_BARRIERS;
+                char name[32];
+                snprintf(name, sizeof(name), "GS_SortIdx_Dyn_%u", s);
+                sortIndexBuffer_[s] = gpuResMgr.Create(name, sortDesc);
+            }
+            gaussianCapacity_ = newCapacity;
+            if (sortState_) {
+                sortState_->hasApplied = false;
+                sortState_->scratch = SortScratch {};
+            }
+            sortBufferUploaded_ = false;
+            visibleCount_ = 0;
+            PLUGIN_LOG_I("GS: recreated buffers for capacity %u", newCapacity);
+        }
+        const uint32_t uploadStart = g_sp.UploadStart();
+        const bool appendOnly = (uploadStart > 0u) && (uploadStart <= newCount) &&
+                                (newCapacity == gaussianCapacity_) && (bool)gaussianBuffer_;
+        const bool needShBuffer = g_sp.Sh() != nullptr && !hasShData_;
+        if (needShBuffer) {
+            auto& gpuResMgr = renderNodeContextMgr_->GetGpuResourceManager();
+            GpuBufferDesc shDesc {};
+            shDesc.usageFlags = CORE_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+            shDesc.memoryPropertyFlags = CORE_MEMORY_PROPERTY_HOST_VISIBLE_BIT | CORE_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+            shDesc.byteSize = (uint32_t)(newCapacity * 48ULL * sizeof(float));
+            shDesc.engineCreationFlags = CORE_ENGINE_BUFFER_CREATION_DYNAMIC_BARRIERS;
+            shBuffer_ = gpuResMgr.Create("GS_ShDyn", shDesc);
+            hasShData_ = true;
+        }
+        const bool countChanged = newCount != gaussianCount_;
+        gaussianCount_ = newCount;
+        hasShData_ = g_sp.Sh() != nullptr;
+        needsUpload_ = true;
+        if (appendOnly) {
+            // The existing prefix is unchanged, so the applied order still covers
+            // it: keep drawing it and let the sort thread extend to the new tail.
+            sortBufferUploaded_ = false;
+        } else {
+            if (sortState_) {
+                sortState_->hasApplied = false;
+            }
+            sortBufferUploaded_ = false;
+            // A rewritten set invalidates the previous order.
+            visibleCount_ = 0;
+        }
+        uploadedGeneration_ = generation;
+        g_sp.MarkUploaded(generation);
+    }
+    if (gaussianCount_ == 0) return;
     if (!RenderHandleUtil::IsValid(psoHandle_)) {
         if (frameCount_ < 3) {
             PLUGIN_LOG_E("GS::ExecuteFrame: PSO invalid, skipping");
@@ -853,13 +972,32 @@ void RenderNodeGaussianSplatting::ExecuteFrame(IRenderCommandList& cmdList)
 
     auto& gpuResMgr = renderNodeContextMgr_->GetGpuResourceManager();
 
-    // ---- 1. Upload gaussian data (once) ----
+    // ---- 1. Upload gaussian data ----
     if (needsUpload_ && g_sp.Ready() && gaussianBuffer_) {
-        void* mapped = gpuResMgr.MapBuffer(gaussianBuffer_.GetHandle());
+        const uint32_t start = g_sp.UploadStart();
+        const bool appendOnly = (start > 0u) && (start < gaussianCount_);
+        // Appends write into the buffer that is currently being drawn (past the
+        // data the GPU reads); full rebuilds go into the alternate buffer and are
+        // switched in only after the copy completes.
+        RenderHandleReference* target = appendOnly ? (altActive_ ? &gaussianBufferAlt_ : &gaussianBuffer_)
+                                                   : (altActive_ ? &gaussianBuffer_ : &gaussianBufferAlt_);
+        if (!*target) {
+            *target = gaussianBuffer_;
+        }
+        void* mapped = gpuResMgr.MapBuffer(target->GetHandle());
         if (mapped) {
-            std::memcpy(mapped, g_sp.Data(), gaussianCount_ * sizeof(GpuGaussian));
-            gpuResMgr.UnmapBuffer(gaussianBuffer_.GetHandle());
-            PLUGIN_LOG_I("GS: uploaded %u gaussians to GPU", gaussianCount_);
+            const uint32_t first = appendOnly ? start : 0u;
+            const size_t bytes = (size_t)(gaussianCount_ - first) * sizeof(GpuGaussian);
+            std::memcpy(static_cast<uint8_t*>(mapped) + (size_t)first * sizeof(GpuGaussian),
+                static_cast<const uint8_t*>(static_cast<const void*>(g_sp.Data())) +
+                    (size_t)first * sizeof(GpuGaussian),
+                bytes);
+            gpuResMgr.UnmapBuffer(target->GetHandle());
+            if (!appendOnly) {
+                altActive_ = (*target).GetHandle().id == gaussianBufferAlt_.GetHandle().id;
+            }
+            PLUGIN_LOG_I("GS: uploaded gaussians [%u,%u) to GPU (%s)", first, gaussianCount_,
+                appendOnly ? "append" : (altActive_ ? "alt" : "primary"));
         }
         // Build the compact cull records (position + largest scale).
         {
@@ -877,8 +1015,9 @@ void RenderNodeGaussianSplatting::ExecuteFrame(IRenderCommandList& cmdList)
                 (uint32_t)(cullRecords_.size() * sizeof(float) / (1024 * 1024)));
         }
 
-        // Upload SH coefficients (zeros when absent — SH eval contributes nothing)
-        if (shBuffer_) {
+        // Upload SH coefficients (skipped for DC-only models: the shader does not
+        // sample the SH buffer when both weights are zero)
+        if (shBuffer_ && hasShData_) {
             const size_t shBytes = (size_t)gaussianCount_ * 48ULL * sizeof(float);
             void* shMapped = gpuResMgr.MapBuffer(shBuffer_.GetHandle());
             if (shMapped) {
@@ -988,7 +1127,21 @@ void RenderNodeGaussianSplatting::ExecuteFrame(IRenderCommandList& cmdList)
             }
         }
 
-        // ---- 3.5 Frustum + size cull, back-to-front bucket sort ----
+        // Depth range for the cull comes from the app camera (big LOD scenes need a
+    // much larger far plane than the small demo models).
+    float clipNear = 0.05f;
+    float clipFar = 2000.0f;
+    if (g_sp.CameraReady()) {
+        const auto& appCam = g_sp.Camera();
+        if (appCam.clip[0] > 0.0f) {
+            clipNear = appCam.clip[0];
+        }
+        if (appCam.clip[1] > clipNear) {
+            clipFar = appCam.clip[1];
+        }
+    }
+
+    // ---- 3.5 Frustum + size cull, back-to-front bucket sort ----
         // Re-sorted only when the view rotated/zoomed past a small threshold;
         // the cull pass reduces both GPU vertex load and sort work.
         if (sortIndexBuffer_[slot] && gaussianCount_ > 0 && g_sp.Data()) {
@@ -1025,8 +1178,11 @@ void RenderNodeGaussianSplatting::ExecuteFrame(IRenderCommandList& cmdList)
                     // frame is correctly ordered.
                     sortState_->applied.resize(gaussianCount_);
                     SortTiming timing;
+                    const float nearZ = clipNear;
+                    const float farZ = clipFar;
                     sortState_->appliedCount = ComputeSort(cullRecords_.data(), gaussianCount_,
-                        sortState_->scratch, sortState_->applied.data(), vm, pm, (float)height, &timing);
+                        sortState_->scratch, sortState_->applied.data(), vm, pm, (float)height, nearZ, farZ,
+                        &timing);
                     sortState_->hasApplied = true;
                     visibleCount_ = sortState_->appliedCount;
                     sortBufferUploaded_ = true;
@@ -1040,6 +1196,8 @@ void RenderNodeGaussianSplatting::ExecuteFrame(IRenderCommandList& cmdList)
                         std::memcpy(sortState_->view, vm, sizeof(sortState_->view));
                         std::memcpy(sortState_->proj, pm, sizeof(sortState_->proj));
                         sortState_->viewportHeight = (float)height;
+                        sortState_->nearZ = clipNear;
+                        sortState_->farZ = clipFar;
                         sortState_->records = cullRecords_.data();
                         sortState_->count = gaussianCount_;
                         sortState_->requestPending = true;
@@ -1079,6 +1237,9 @@ void RenderNodeGaussianSplatting::ExecuteFrame(IRenderCommandList& cmdList)
             // Tail padded with 0xFFFFFFFF sentinel — shader skips those entries.
             void* sortMapped = gpuResMgr.MapBuffer(sortIndexBuffer_[slot].GetHandle());
             if (sortMapped) {
+                if (visibleCount_ > gaussianCount_) {
+                    visibleCount_ = 0;
+                }
                 if (visibleCount_ > 0 && sortState_ && sortState_->hasApplied) {
                     std::memcpy(sortMapped, sortState_->applied.data(), visibleCount_ * sizeof(uint32_t));
                 }
@@ -1103,7 +1264,8 @@ void RenderNodeGaussianSplatting::ExecuteFrame(IRenderCommandList& cmdList)
         // Bind this frame's slot buffers
         pipelineDescriptorSetBinder_->BindBuffer(0u, 0u, BindableBuffer { cameraUbo_[slot].GetHandle() });
         if (gaussianBuffer_) {
-            pipelineDescriptorSetBinder_->BindBuffer(0u, 1u, BindableBuffer { gaussianBuffer_.GetHandle() });
+            pipelineDescriptorSetBinder_->BindBuffer(0u, 1u,
+                BindableBuffer { (altActive_ ? gaussianBufferAlt_ : gaussianBuffer_).GetHandle() });
         }
         if (sortIndexBuffer_[slot]) {
             pipelineDescriptorSetBinder_->BindBuffer(0u, 2u, BindableBuffer { sortIndexBuffer_[slot].GetHandle() });

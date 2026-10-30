@@ -315,7 +315,76 @@ hdc file recv /data/local/tmp/a.jpeg "D:\Source\3DGS\captures\a.jpeg"
 
 ---
 
-## 8. 参考实现对照
+## 8. 大场景 LOD（SOG 瓦片）
+
+### 8.1 数据格式
+
+```text
+<scene>/
+  default.scene.json    mobileLodDistances[] / maxRenderCountOfMobile / cameraInfo
+  lod-meta.json         lodLevels, filenames[], tree
+  grid0_y/*.sog  ...    每个文件是同一 LOD 下若干叶子的连续拼接池
+```
+
+- `tree` 是**二叉空间划分树**：内部节点只有 `bound` + `children`，**叶子**有 `bound` + `lods`
+- 叶子 `lods["0".."N-1"] = { file, offset, count }`：`file` 是 `filenames` 下标，
+  `offset/count` 是该文件内的高斯区间
+- 验证：212 个 (文件, LOD) 组合里文件 `count` **正好等于**所有叶子区间之和（0 处不一致）
+- 样例 `500w/syp_uav_0611`：2816 叶子、4 级 LOD、643 MB；LOD0 37.5M / LOD1 11.3M /
+  LOD2 4.5M / LOD3 1.5M 高斯；瓦片只有 `sh0`（diffuse，无 SH rest）
+- **世界缩放必须是 1.0**：这些瓦片的 `means` 已经是 log 空间的世界坐标
+  （`exp(7.02)-1 = 1115` 正好等于树里该区域的 bound），不能再乘 100
+
+### 8.2 运行时结构
+
+```text
+渲染线程：view 变了 -> UpdateCamera(快照)
+          每帧 Poll -> 有新的装配结果就更新共享全局 + generation++
+          RenderNode：generation 变了就按 uploadStart 上传（append 只传尾巴）
+后台线程：等待 350ms 静止（防抖）-> 视锥剔除 -> 按距离选 LOD（带 15% 回差）
+          -> 缺瓦片就解码（整文件解码 + 计数上限 LRU 缓存）
+          -> 按叶子顺序把新区间追加进缓冲（只增不减）-> publish
+```
+
+- **只增不减的瓦片表**：`(leaf, level)` 已经驻留的条目保留，重建只追加新条目。
+  这样拖动时不会整块替换（整块替换会看到几何"闪一下"），旧的继续画。
+- **双 SSBO + 增量上传**：追加时只上传 `[uploadStart, count)` 到**当前**正在画的缓冲
+  （GPU 读的是前缀，写的是尾部）；整块重建时写另一块缓冲，传完再切换。
+- **回差**：距离跨过阈值 15% 才换级，避免叶子在两级之间来回跳（表现为"闪"）。
+- **静止压缩**：缓冲条目超过 `1.1 × budget` 时，等相机静止 1.2 s 后做一次整块重建，
+  把陈旧条目清掉（这是唯一一次可见跳变，发生在静止时）。
+- 容量：选择预算 `maxRenderCountOfMobile`（样例 1,000,000），缓冲容量 1.5×，
+  解码缓存上限 3,000,000 高斯。
+
+### 8.3 踩坑
+
+1. **`visibleCount_` 未重置导致 memset 长度下溢**
+   - 现象：切到 LOD 后拖动就 SIGSEGV，崩在 `memset`。
+   - 根因：新数据集只有 150k，但 `visibleCount_` 还是上一个模型的 600k，
+     `gaussianCount_ - visibleCount_` 下溢成 ~4 GB。
+   - 修复：count 变化时清零，并在上传排序索引前 clamp。
+2. **单块 SSBO 边画边写 → 闪烁**
+   - 每次 publish 都覆盖同一块 GPU 缓冲，而 GPU 可能还在读上一帧。
+   - 修复：双 SSBO 交替 + 增量上传（见 8.2）。
+3. **LOD 没有回差 → 级别抖动**
+4. **整块重建太频繁 → 画面反复跳变**
+   - 修复：只增不减 + 静止才压缩。
+5. **资产权限**：`hdc file send` 到沙箱目录后文件属主是 root，app（UID 20020208）
+   读不到；需要 `chown -R 20020208:20020208` + `chmod -R u+rwX,g+rX,o+rX`。
+
+### 8.4 资产投放
+
+```powershell
+hdc shell "mkdir -p /data/app/el2/100/base/com.example.lumeapp/haps/entry/files/assets/lod"
+hdc file send "D:\Source\3DGS\data\500w\syp_uav_0611" "/data/app/el2/100/base/com.example.lumeapp/haps/entry/files/assets/lod/"
+hdc shell "chown -R 20020208:20020208 /data/app/el2/100/base/com.example.lumeapp/haps/entry/files/assets/lod"
+hdc shell "chmod -R u+rwX,g+rX,o+rX /data/app/el2/100/base/com.example.lumeapp/haps/entry/files/assets/lod"
+```
+
+app 优先读沙箱里的 `assets/lod/<name>`；没有则回退到 HAP 内置的
+`assets/lod_fallback/<name>`（只放 LOD2+LOD3 子集时用）。
+
+## 9. 参考实现对照
 
 **PlayCanvas 引擎（`src/scene/gsplat/gsplat-sorter.js` + `gsplat-sort-worker.js`）**
 - CPU 计数排序，跑在**独立 Web Worker**，渲染线程从不等待；结果延迟一帧、双缓冲上传。
