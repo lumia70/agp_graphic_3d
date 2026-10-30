@@ -205,11 +205,9 @@ private:
                 continue;
             }
 
-            // Publish immediately when the camera moved: the assembly only uses
-            // levels that are already cached (the pinned coarse base guarantees
-            // there is something for every leaf), so this is a cheap append and it
-            // is what keeps the centre of the screen from going blank while
-            // rotating.
+            // 1) Immediate coverage: append what is already cached (the pinned
+            //    coarse base guarantees something for every leaf), so the centre
+            //    never goes blank while rotating.
             const bool cameraChanged = (snapshot != lastBuiltRequest_);
             if (cameraChanged || dirty_) {
                 BuildView(cam, false);
@@ -218,21 +216,29 @@ private:
             }
             seen = snapshot;
 
-            // Then keep decoding the next missing (finer) tiles, two at a time.
+            // 2) Decode the next missing (finer) tiles, two at a time.
             const int32_t missing = NextMissingTile(cam);
-            if (missing < 0) {
+            if (missing >= 0) {
+                const uint64_t now = ++clock_;
+                const int32_t second = NextMissingTileExcluding(cam, missing);
+                if (second >= 0) {
+                    auto async = std::async(std::launch::async, [this, second, now] {
+                        EnsureTile(second, now);
+                    });
+                    EnsureTile(missing, now);
+                    async.wait();
+                } else {
+                    EnsureTile(missing, now);
+                }
                 continue;
             }
-            const uint64_t now = ++clock_;
-            const int32_t second = NextMissingTileExcluding(cam, missing);
-            if (second >= 0) {
-                auto async = std::async(std::launch::async, [this, second, now] {
-                    EnsureTile(second, now);
-                });
-                EnsureTile(missing, now);
-                async.wait();
-            } else {
-                EnsureTile(missing, now);
+
+            // 3) Everything the view needs is decoded. Only now is a compaction
+            //    safe: a rebuild re-derives levels from the cache, so doing it
+            //    while fine tiles are still missing shows a coarse frame.
+            if (totalWritten_ + 1u > capacity_) {
+                BuildView(cam, true);
+                seen = requestId_;
             }
         }
     }
@@ -431,17 +437,15 @@ private:
         while (cacheCount_ > cacheBudget_ && caches_.size() > 1) {
             auto oldest = caches_.end();
             for (auto it = caches_.begin(); it != caches_.end(); ++it) {
+                if (pinned_.count(it->first) != 0) {
+                    continue;  // pinned (coarse base) tiles stay
+                }
                 if (oldest == caches_.end() || it->second->lastUse < oldest->second->lastUse) {
                     oldest = it;
                 }
             }
             if (oldest == caches_.end()) {
-                return;
-            }
-            if (pinned_.count(oldest->first) != 0) {
-                // Pinned (coarse base) tiles stay: a full turn must always have
-                // something to draw.
-                return;
+                return;  // everything is pinned
             }
             cacheCount_ -= (uint32_t)oldest->second->data.size();
             caches_.erase(oldest);
@@ -498,14 +502,6 @@ private:
         // coarser than the appended mixture, so doing it on every "settle" made
         // the picture visibly degrade when the finger was lifted.
         const bool full = first || (totalWritten_ + appended > capacity_);
-        // Remember the previous assembly so a rebuild that would be much coarser
-        // (fine tiles were evicted) can be rejected instead of flashing.
-        const std::vector<Entry> prevEntries = full ? entries_ : std::vector<Entry> {};
-        const std::unordered_map<uint32_t, uint32_t> prevEntryOf = full ? entryOf_ : std::unordered_map<uint32_t, uint32_t> {};
-        const uint32_t prevTotal = totalWritten_;
-        const int prevWriteIndex = writeIndex_;
-        const uint32_t prevCount = publishCount_;
-        const int prevPublished = publishedBuffer_;
         (void)settled;
         if (full) {
             entries_.clear();
@@ -571,26 +567,6 @@ private:
                 Publish(writeIndex_, totalWritten_, uploadStart);
                 lastPublished = totalWritten_;
             }
-        }
-
-        // A rebuild that loses a lot of detail (fine tiles evicted from the cache)
-        // would show a coarse frame; keep the current buffer and retry later.
-        if (full && !first && lastUniqueTotal_ > 0 && totalWritten_ < lastUniqueTotal_ * 8u / 10u) {
-            entries_ = prevEntries;
-            entryOf_ = prevEntryOf;
-            totalWritten_ = prevTotal;
-            writeIndex_ = prevWriteIndex;
-            publishCount_ = prevCount;
-            publishedBuffer_ = prevPublished;
-            LOGI("LOD: rebuild skipped (would shrink %u -> %u)", prevTotal, totalWritten_);
-            return;
-        }
-
-        if (full) {
-            // Remember the unique size of an accepted rebuild: appends later add
-            // duplicates, so comparing against the raw buffer would always look
-            // like a degradation.
-            lastUniqueTotal_ = totalWritten_;
         }
 
         if (totalWritten_ > lastPublished) {
