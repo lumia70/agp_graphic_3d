@@ -270,7 +270,7 @@ struct SortTiming {
 // and writes the order into `out` (which must hold `count` entries).
 uint32_t ComputeSort(const float* records, const uint32_t count, SortScratch& s, uint32_t* out,
     const float* vm, const float* pm, const float viewportHeight, const float nearZ, const float farZ,
-    SortTiming* timing)
+    const bool parallel, SortTiming* timing)
 {
     const auto sortBegin = std::chrono::steady_clock::now();
     auto ms = [](std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b) {
@@ -278,7 +278,9 @@ uint32_t ComputeSort(const float* records, const uint32_t count, SortScratch& s,
     };
 
     SortPool& pool = SortPool::Instance();
-    const uint32_t tasks = pool.Tasks();
+    // The synchronous (first) sort must not touch the pool: it would race with a
+    // background sort that is already using the pool and its scratch.
+    const uint32_t tasks = parallel ? pool.Tasks() : 1u;
     if (s.tasks != tasks || s.sliceSize != (count + tasks - 1u) / tasks) {
         s.tasks = tasks;
         s.sliceSize = (count + tasks - 1u) / tasks;
@@ -464,7 +466,8 @@ uint32_t ComputeSort(const float* records, const uint32_t count, SortScratch& s,
 // last finished order (PlayCanvas does the same with a web worker). Requests are
 // coalesced: only the newest camera state matters.
 struct RenderNodeGaussianSplatting::SortState {
-    SortScratch scratch;
+    SortScratch scratch;        // background sort (parallel, pool)
+    SortScratch inlineScratch;  // synchronous first sort (serial, no pool)
 
     std::mutex mutex;
     std::condition_variable cvStart;
@@ -556,7 +559,7 @@ void RenderNodeGaussianSplatting::ensureSortThread()
             state.result.resize(count);
             SortTiming timing;
             const uint32_t visible = ComputeSort(records, count, state.scratch, state.result.data(), view,
-                proj, viewportHeight, nearZ, farZ, &timing);
+                proj, viewportHeight, nearZ, farZ, true, &timing);
 
             {
                 std::lock_guard<std::mutex> lock(state.mutex);
@@ -936,6 +939,7 @@ void RenderNodeGaussianSplatting::ExecuteFrame(IRenderCommandList& cmdList)
             if (sortState_) {
                 sortState_->hasApplied = false;
                 sortState_->scratch = SortScratch {};
+                sortState_->inlineScratch = SortScratch {};
             }
             sortBufferUploaded_ = false;
             visibleCount_ = 0;
@@ -1194,8 +1198,8 @@ void RenderNodeGaussianSplatting::ExecuteFrame(IRenderCommandList& cmdList)
                     const float nearZ = clipNear;
                     const float farZ = clipFar;
                     sortState_->appliedCount = ComputeSort(cullRecords_.data(), gaussianCount_,
-                        sortState_->scratch, sortState_->applied.data(), vm, pm, (float)height, nearZ, farZ,
-                        &timing);
+                        sortState_->inlineScratch, sortState_->applied.data(), vm, pm, (float)height, nearZ,
+                        farZ, false, &timing);
                     sortState_->hasApplied = true;
                     visibleCount_ = sortState_->appliedCount;
                     sortBufferUploaded_ = true;

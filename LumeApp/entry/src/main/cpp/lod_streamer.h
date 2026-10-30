@@ -65,6 +65,7 @@ public:
         entryOf_.clear();
         totalWritten_ = 0;
         previousLevels_.clear();
+        basePreloaded_ = false;
         stopped_ = false;
         worker_ = std::thread([this] { Loop(); });
         LOGI("LOD streamer: budget %{public}u, cache %{public}u", budget_, cacheBudget_);
@@ -149,6 +150,23 @@ private:
                 snapshot = requestId_;
                 cam = pending_;
             }
+            // First fill the cache with the coarsest level of the whole scene: it
+            // is only a handful of tiles and gives every leaf a fallback, so a
+            // rotation always has *something* to show while finer tiles decode.
+            // This runs before the first camera arrives so it starts immediately.
+            if (!basePreloaded_) {
+                if (DecodeNextBaseTile()) {
+                    // Show whatever the base layer already covers instead of
+                    // waiting for the whole preload (progressive first view).
+                    if (publishedBuffer_ < 0 && cam.valid) {
+                        BuildView(cam, false);
+                    }
+                    continue;
+                }
+                basePreloaded_ = true;
+                continue;
+            }
+
             if (!cam.valid) {
                 continue;
             }
@@ -184,6 +202,34 @@ private:
             lastBuiltRequest_ = snapshot;
             seen = snapshot;
         }
+    }
+
+    bool DecodeNextBaseTile()
+    {
+        // Nearest-to-the-initial-camera first: the first frames then show the part
+        // of the coarse layer that is actually in view instead of empty sky.
+        const int baseLevel = scene_.levelCount - 1;
+        float bestDist = 0.0f;
+        int32_t bestFile = -1;
+        for (const auto& leaf : scene_.leaves) {
+            if (baseLevel >= leaf.levels) {
+                continue;
+            }
+            const int32_t file = leaf.lods[baseLevel].file;
+            if (file < 0 || caches_.find(file) != caches_.end()) {
+                continue;
+            }
+            const float dist = DistanceToAabb(scene_.camPos, leaf);
+            if (bestFile < 0 || dist < bestDist) {
+                bestFile = file;
+                bestDist = dist;
+            }
+        }
+        if (bestFile < 0) {
+            return false;
+        }
+        LOGI("LOD: preloading base tile %{public}d", bestFile);
+        return EnsureTile(bestFile, ++clock_);
     }
 
     // First tile of the current selection that is not decoded yet (priority
@@ -282,11 +328,30 @@ private:
         // buffer, and a rebuild only appends the newly selected ones. This keeps
         // motion smooth (no whole-set swap, no geometry disappearing) and lets the
         // node upload just the appended tail.
+        // Use the requested level only if its tile is decoded; otherwise fall back
+        // to the coarsest level that is already cached (the base layer preload
+        // guarantees that every leaf has one after start-up). This is what makes
+        // a big rotation show coarse content immediately and refine afterwards.
+        auto resolveLevel = [&](uint32_t leafIndex, int desired) {
+            const Leaf& leaf = scene_.leaves[leafIndex];
+            for (int level = desired; level < leaf.levels; level++) {
+                const int32_t file = leaf.lods[level].file;
+                if (file >= 0 && caches_.find(file) != caches_.end()) {
+                    return level;
+                }
+            }
+            return -1;
+        };
+
         uint32_t appended = 0;
         for (const auto& it : sel.items) {
-            const uint32_t key = (it.leaf * 16u) + (uint32_t)it.level;
+            const int level = resolveLevel(it.leaf, it.level);
+            if (level < 0) {
+                continue;
+            }
+            const uint32_t key = (it.leaf * 16u) + (uint32_t)level;
             if (entryOf_.find(key) == entryOf_.end()) {
-                appended += scene_.leaves[it.leaf].lods[it.level].count;
+                appended += scene_.leaves[it.leaf].lods[level].count;
             }
         }
         // Full rewrites alternate to the other SSBO, which may still be read by a
@@ -318,12 +383,16 @@ private:
         uint32_t lastPublished = before;
 
         for (const auto& it : sel.items) {
-            const uint32_t key = (it.leaf * 16u) + (uint32_t)it.level;
+            const int level = resolveLevel(it.leaf, it.level);
+            if (level < 0) {
+                continue;
+            }
+            const uint32_t key = (it.leaf * 16u) + (uint32_t)level;
             if (entryOf_.find(key) != entryOf_.end()) {
                 continue;
             }
             const Leaf& leaf = scene_.leaves[it.leaf];
-            const Slice& slice = leaf.lods[it.level];
+            const Slice& slice = leaf.lods[level];
             if (slice.file < 0) {
                 continue;
             }
@@ -412,6 +481,7 @@ private:
     uint32_t cacheCount_ = 0;
     uint64_t clock_ = 0;
     uint64_t lastBuiltRequest_ = 0;
+    bool basePreloaded_ = false;
 };
 
 } // namespace lod
