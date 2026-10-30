@@ -64,9 +64,12 @@ public:
         publishedBuffer_ = -1;
         publishUploadStart_ = 0;
         writeIndex_ = -1;
+        entries_.clear();
+        entryOf_.clear();
+        totalWritten_ = 0;
+        dirty_ = false;
         previousLevels_.clear();
         lastBuiltRequest_ = 0;
-        publishedForRequest_ = false;
         basePreloaded_ = false;
         stopped_ = false;
         worker_ = std::thread([this] { Loop(); });
@@ -231,18 +234,30 @@ private:
                 });
             }
             if (!settled) {
+                // While the camera keeps moving, append the tiles that just became
+                // available (tail upload, no buffer swap -> no flash). This is what
+                // makes a newly visible area show up without lifting the finger.
+                if (dirty_) {
+                    BuildView(cam, false);
+                    dirty_ = false;
+                    lastBuiltRequest_ = snapshot;
+                }
+                seen = requestId_;
                 continue;
             }
 
-            // Only rebuild when the camera has settled: a rebuild swaps buffers,
-            // and doing that while moving produces visible jumps/flashes.
-            if (snapshot == lastBuiltRequest_) {
+            const bool cameraChanged = (snapshot != lastBuiltRequest_);
+            if (!dirty_ && !cameraChanged) {
                 continue;
             }
-            BuildView(cam, false);
+            // Settled -> full rebuild into the alternate buffer (compacts stale
+            // entries, no tearing because nothing is moving). While moving ->
+            // append only the newly available tiles, which uploads a tail and
+            // never swaps buffers, so it cannot flash.
+            BuildView(cam, settled);
             lastBuiltRequest_ = snapshot;
             seen = snapshot;
-            publishedForRequest_ = true;
+            dirty_ = false;
         }
     }
 
@@ -383,6 +398,7 @@ private:
         }
         caches_[file] = entry;
         cacheCount_ += (uint32_t)entry->data.size();
+        dirty_ = true;
         LOGI("LOD: decoded tile %{public}d (%{public}zu gaussians, %.0f ms)", file, entry->data.size(), ms);
         EvictLocked();
         return true;
@@ -413,26 +429,18 @@ private:
     }
 
     // Fill the write buffer in leaf order (nearest first) and publish prefixes.
-    // Full rebuild of the visible set into the buffer that is NOT published, then
-    // swap. Rebuilds only happen when the camera is at rest, so the GPU is never
-    // handed a buffer that is being written (that caused one-frame flashes).
-    void BuildView(const Camera& cam, bool forceCompact = false)
+    // Assembles the current selection.
+    //   settled == false : append-only update (uploads only the new tail, the
+    //                      buffer that is being drawn is never swapped);
+    //   settled == true  : full rebuild into the other buffer, then swap.
+    void BuildView(const Camera& cam, bool settled)
     {
-        (void)forceCompact;
         if (previousLevels_.size() != scene_.leaves.size()) {
             previousLevels_.assign(scene_.leaves.size(), (int8_t)-1);
         }
         Selection sel;
         SelectVisible(scene_, cam.view, cam.proj, cam.camPos, budget_, previousLevels_.data(), sel);
-        LOGI("LOD: %{public}zu leaves visible (%{public}u culled), %{public}u gaussians "
-             "[L0 %u/%u L1 %u/%u L2 %u/%u L3 %u/%u]",
-            sel.items.size(), sel.culled, sel.total,
-            sel.perLevelLeaves[0], sel.perLevelGaussians[0], sel.perLevelLeaves[1],
-            sel.perLevelGaussians[1], sel.perLevelLeaves[2], sel.perLevelGaussians[2],
-            sel.perLevelLeaves[3], sel.perLevelGaussians[3]);
 
-        // Prefer the requested level; fall back to the coarsest level that is
-        // already decoded so a leaf is never missing from the picture.
         auto resolveLevel = [&](uint32_t leafIndex, int desired) {
             const Leaf& leaf = scene_.leaves[leafIndex];
             for (int level = desired; level < leaf.levels; level++) {
@@ -444,13 +452,39 @@ private:
             return -1;
         };
 
-        const int writeIndex = (publishedBuffer_ < 0) ? 0 : (1 - publishedBuffer_);
-        const bool progressive = (publishedBuffer_ < 0);
+        // New (leaf, level) entries that the current selection needs.
+        uint32_t appended = 0;
+        for (const auto& it : sel.items) {
+            const int level = resolveLevel(it.leaf, it.level);
+            if (level < 0) {
+                continue;
+            }
+            const uint32_t key = (it.leaf * 16u) + (uint32_t)level;
+            if (entryOf_.find(key) == entryOf_.end()) {
+                appended += scene_.leaves[it.leaf].lods[level].count;
+            }
+        }
+
+        const bool first = (publishedBuffer_ < 0);
+        // Full rewrite when nothing exists yet, when the camera is at rest, or
+        // when appending would overflow the buffer.
+        const bool full = first || settled || (totalWritten_ + appended > capacity_);
+        if (full) {
+            entries_.clear();
+            entryOf_.clear();
+            totalWritten_ = 0;
+            writeIndex_ = first ? 0 : (1 - publishedBuffer_);
+        } else if (writeIndex_ < 0) {
+            writeIndex_ = 0;
+        }
+
+        const uint32_t uploadStart = full ? 0u : totalWritten_;
+        const uint32_t before = totalWritten_;
+        const bool progressive = first;
         const uint32_t publishStep = progressive ? std::max<uint32_t>(budget_ / 8u, 150000u)
                                                  : (budget_ + 1u);
         const uint64_t now = ++clock_;
-        uint32_t written = 0;
-        uint32_t lastPublished = 0;
+        uint32_t lastPublished = before;
         uint32_t skippedNoTile = 0;
 
         for (const auto& it : sel.items) {
@@ -459,48 +493,59 @@ private:
                 skippedNoTile++;
                 continue;
             }
-            const Slice& slice = scene_.leaves[it.leaf].lods[level];
-            if (slice.file < 0) {
+            const uint32_t key = (it.leaf * 16u) + (uint32_t)level;
+            if (entryOf_.find(key) != entryOf_.end()) {
                 continue;
             }
-            if (!EnsureTile(slice.file, now)) {
+            const Slice& slice = scene_.leaves[it.leaf].lods[level];
+            if (slice.file < 0 || !EnsureTile(slice.file, now)) {
                 continue;
             }
             CacheEntryPtr entry;
             {
                 std::lock_guard<std::mutex> lock(cacheMutex_);
-                auto it = caches_.find(slice.file);
-                if (it == caches_.end()) {
+                auto it2 = caches_.find(slice.file);
+                if (it2 == caches_.end()) {
                     continue;
                 }
-                entry = it->second;
+                entry = it2->second;
             }
             const auto& src = entry->data;
             if (slice.offset + slice.count > src.size()) {
-                LOGE("LOD: slice out of range (file %{public}d offset %{public}u count %{public}u size %{public}zu)",
-                    slice.file, slice.offset, slice.count, src.size());
+                LOGE("LOD: slice out of range (file %{public}d offset %{public}u count %{public}u)",
+                    slice.file, slice.offset, slice.count);
                 continue;
             }
-            if (written + slice.count > capacity_) {
+            if (totalWritten_ + slice.count > capacity_) {
                 break;
             }
-            std::memcpy(&buffers_[writeIndex][written], &src[slice.offset],
+            std::memcpy(&buffers_[writeIndex_][totalWritten_], &src[slice.offset],
                 (size_t)slice.count * sizeof(GpuGaussianData));
-            written += slice.count;
-            if (written - lastPublished >= publishStep) {
-                Publish(writeIndex, written, 0);
-                lastPublished = written;
+            Entry entryInfo;
+            entryInfo.count = slice.count;
+            entryInfo.dst = totalWritten_;
+            entries_.push_back(entryInfo);
+            entryOf_[key] = (uint32_t)(entries_.size() - 1);
+            totalWritten_ += slice.count;
+
+            if (totalWritten_ - lastPublished >= publishStep) {
+                Publish(writeIndex_, totalWritten_, uploadStart);
+                lastPublished = totalWritten_;
             }
         }
 
-        if (written >= lastPublished) {
-            Publish(writeIndex, written, 0);
+        if (totalWritten_ > lastPublished) {
+            Publish(writeIndex_, totalWritten_, uploadStart);
+        } else if (full && totalWritten_ == before && before > 0) {
+            // Nothing changed and the set is not empty: keep the published buffer.
+            LOGI("LOD: rebuild produced no change (%u gaussians)", totalWritten_);
         }
         for (const auto& it : sel.items) {
             previousLevels_[it.leaf] = (int8_t)it.level;
         }
-        LOGI("LOD: assembly %{public}u gaussians (no-tile %{public}u, gen 0x%{public}x)", written,
-            skippedNoTile, publishGeneration_);
+        LOGI("LOD: %{public}s %{public}u gaussians (+%{public}u, no-tile %{public}u, gen 0x%{public}x)",
+            full ? "rebuild" : "append", totalWritten_, totalWritten_ - before, skippedNoTile,
+            publishGeneration_);
     }
 
     void Publish(int bufferIndex, uint32_t count, uint32_t uploadStart)
@@ -525,8 +570,17 @@ private:
     uint64_t requestId_ = 0;
 
     std::vector<GpuGaussianData> buffers_[2];
-    int writeIndex_ = -1;
+    struct Entry {
+        uint32_t count = 0;
+        uint32_t dst = 0;
+    };
+
     uint32_t publishUploadStart_ = 0;
+    int writeIndex_ = -1;
+    std::vector<Entry> entries_;
+    std::unordered_map<uint32_t, uint32_t> entryOf_;
+    uint32_t totalWritten_ = 0;
+    bool dirty_ = false;
     int publishedBuffer_ = -1;
     uint32_t publishCount_ = 0;
     uint32_t publishGeneration_ = 0;
