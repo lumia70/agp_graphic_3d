@@ -15,6 +15,7 @@
  */
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <cstring>
 #include <future>
@@ -84,6 +85,9 @@ public:
         dirty_ = false;
         publishPoolSize_ = 0;
         publishLiveCount_ = 0;
+        publishLiveHash_ = 0;
+        lastLiveHash_ = 0;
+        decodeFile_ = -1;
         previousLevels_.clear();
         lastBuiltRequest_ = 0;
         basePreloaded_ = false;
@@ -223,9 +227,17 @@ private:
                 continue;
             }
 
-            // 1) Immediate coverage: append what is already cached (the pinned
-            //    coarse base guarantees something for every leaf), so the centre
-            //    never goes blank while rotating.
+            // 1) Collect a finished background decode (never blocks the loop).
+            if (decodeFuture_.valid() &&
+                decodeFuture_.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
+                decodeFuture_.get();
+                decodeFile_ = -1;
+                dirty_ = true;
+            }
+
+            // 2) Publish immediately when the camera moved or new data landed. This
+            //    is cheap (block table only) and is what makes newly visible leaves
+            //    show up *while* the finger is still moving.
             const bool cameraChanged = (snapshot != lastBuiltRequest_);
             if (cameraChanged || dirty_) {
                 BuildView(cam, false);
@@ -234,24 +246,17 @@ private:
             }
             seen = snapshot;
 
-            // 2) Decode the next missing (finer) tiles, two at a time.
-            const int32_t missing = NextMissingTile(cam);
-            if (missing >= 0) {
-                const uint64_t now = ++clock_;
-                const int32_t second = NextMissingTileExcluding(cam, missing);
-                if (second >= 0) {
-                    auto async = std::async(std::launch::async, [this, second, now] {
-                        EnsureTile(second, now);
+            // 3) Keep one decode in flight for the next missing tile.
+            if (decodeFile_ < 0) {
+                const int32_t missing = NextMissingTile(cam);
+                if (missing >= 0) {
+                    const uint64_t now = ++clock_;
+                    decodeFile_ = missing;
+                    decodeFuture_ = std::async(std::launch::async, [this, missing, now] {
+                        return EnsureTile(missing, now);
                     });
-                    EnsureTile(missing, now);
-                    async.wait();
-                } else {
-                    EnsureTile(missing, now);
                 }
-                continue;
             }
-
-            // 3) Nothing left to decode for this view.
         }
     }
 
@@ -585,7 +590,14 @@ private:
             previousLevels_[it.leaf] = (int8_t)it.level;
         }
 
-        const bool liveChanged = live_.size() != publishLiveCount_;
+        // The live *content* can change without changing the count (leaves enter /
+        // leave the frustum), so compare a hash of the selection as well.
+        uint64_t hash = 1469598103934665603ull ^ (uint64_t)live_.size();
+        for (const auto& it : sel.items) {
+            hash = (hash ^ ((uint64_t)it.leaf * 16u + (uint64_t)it.level)) * 1099511628211ull;
+        }
+        lastLiveHash_ = hash;
+        const bool liveChanged = live_.size() != publishLiveCount_ || hash != publishLiveHash_;
         if (dirtyRanges_.empty() && !liveChanged) {
             return;
         }
@@ -686,6 +698,7 @@ private:
         publishCount_ = (uint32_t)live_.size();
         publishPoolSize_ = poolTop_;
         publishLiveCount_ = (uint32_t)live_.size();
+        publishLiveHash_ = lastLiveHash_;
         publishUploadStart_ = 0;
         ++publishGeneration_;
     }
@@ -718,6 +731,10 @@ private:
     uint32_t publishUploadStart_ = 0;
     uint32_t publishPoolSize_ = 0;
     uint32_t publishLiveCount_ = 0;
+    uint64_t publishLiveHash_ = 0;
+    uint64_t lastLiveHash_ = 0;
+    std::future<bool> decodeFuture_;
+    int32_t decodeFile_ = -1;
     int writeIndex_ = -1;
     std::unordered_map<uint32_t, Entry> leafEntry_;  // leaf -> block
     std::vector<Block> freeBlocks_;
@@ -725,7 +742,7 @@ private:
     std::vector<uint32_t> dirtyRanges_;  // (start, count) pairs
     std::vector<uint32_t> live_;   // pool indices of the drawn set
     uint64_t buildId_ = 0;
-    bool dirty_ = false;
+    std::atomic<bool> dirty_ { false };
     int publishedBuffer_ = -1;
     uint32_t publishCount_ = 0;
     uint32_t publishGeneration_ = 0;
