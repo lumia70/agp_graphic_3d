@@ -45,8 +45,8 @@ public:
         // The two assembly buffers already take 2 * capacity * 64 B; keep the decoded
         // tile cache below the scene's own suggestion to stay around 500 MB RSS.
         cacheBudget_ = cacheBudget ? cacheBudget
-                                   : std::min<uint32_t>(scene_.cacheCount ? scene_.cacheCount : 3000000u,
-                                         3000000u);
+                                   : std::min<uint32_t>(scene_.cacheCount ? scene_.cacheCount : 4000000u,
+                                         4000000u);
         if (budget_ > 4000000u) {
             budget_ = 4000000u;
         }
@@ -136,55 +136,75 @@ private:
         uint64_t seen = 0;
         for (;;) {
             Camera cam;
-            uint64_t applied = 0;
+            uint64_t snapshot = 0;
             {
                 std::unique_lock<std::mutex> lock(mutex_);
-                cv_.wait(lock, [this, &seen] { return stopped_ || requestId_ != seen; });
-                if (stopped_) {
-                    return;
-                }
-                // Debounce: wait until the camera stops moving (the touch stream
-                // sends updates every frame while dragging). Re-assembling during
-                // motion would re-upload the whole buffer continuously, which
-                // flickers because the GPU may still be reading it.
-                const uint64_t target = requestId_;
-                cv_.wait_for(lock, std::chrono::milliseconds(350), [this, target] {
-                    return stopped_ || requestId_ != target;
+                cv_.wait_for(lock, std::chrono::milliseconds(200), [this, &seen] {
+                    return stopped_ || requestId_ != seen;
                 });
                 if (stopped_) {
                     return;
                 }
                 seen = requestId_;
-                applied = requestId_;
+                snapshot = requestId_;
                 cam = pending_;
             }
-            if (!cam.valid || applied == 0) {
+            if (!cam.valid) {
                 continue;
             }
-            BuildView(cam);
-            // Accumulated stale entries inflate the drawn set; once the camera
-            // stops, rebuild compactly (this is the only "jump" and it happens
-            // while the scene is static).
-            if (totalWritten_ > (budget_ * 11u) / 10u) {
-                const uint64_t settled = requestId_;
-                std::unique_lock<std::mutex> lock(mutex_);
-                cv_.wait_for(lock, std::chrono::milliseconds(1200), [this, settled] {
-                    return stopped_ || requestId_ != settled;
-                });
-                if (stopped_) {
-                    return;
-                }
-                if (requestId_ == settled) {
-                    seen = requestId_;
-                    cam = pending_;
-                } else {
-                    continue;  // camera moved again: normal loop picks it up
-                }
-            } else {
+
+            // Decode work runs while the camera keeps moving: each iteration
+            // prepares at most one missing tile for the *current* selection, then
+            // re-reads the camera. This is what removes the multi-second wait
+            // after a large rotation (tiles are already cached when the camera
+            // stops).
+            const int32_t missing = NextMissingTile(cam);
+            if (missing >= 0) {
+                EnsureTile(missing, ++clock_);
                 continue;
             }
-            BuildView(cam, true);
+
+            // Everything needed is cached. Assemble once the camera is still.
+            bool settled = false;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                settled = (requestId_ == snapshot);
+            }
+            if (!settled) {
+                continue;
+            }
+
+            const bool compact = totalWritten_ > (budget_ * 11u) / 10u;
+            // Nothing to do unless the camera moved since the last assembly or a
+            // compaction is due (otherwise this loop would spin every 200 ms).
+            if (!compact && snapshot == lastBuiltRequest_) {
+                continue;
+            }
+            BuildView(cam, compact);
+            lastBuiltRequest_ = snapshot;
+            seen = snapshot;
         }
+    }
+
+    // First tile of the current selection that is not decoded yet (priority
+    // order: nearest leaf first).
+    int32_t NextMissingTile(const Camera& cam)
+    {
+        if (previousLevels_.size() != scene_.leaves.size()) {
+            previousLevels_.assign(scene_.leaves.size(), (int8_t)-1);
+        }
+        Selection sel;
+        SelectVisible(scene_, cam.view, cam.proj, cam.camPos, budget_, previousLevels_.data(), sel);
+        for (const auto& it : sel.items) {
+            const Slice& slice = scene_.leaves[it.leaf].lods[it.level];
+            if (slice.file < 0) {
+                continue;
+            }
+            if (caches_.find(slice.file) == caches_.end()) {
+                return slice.file;
+            }
+        }
+        return -1;
     }
 
     bool EnsureTile(int32_t file, uint64_t now)
@@ -269,7 +289,13 @@ private:
                 appended += scene_.leaves[it.leaf].lods[it.level].count;
             }
         }
-        bool fullRebuild = forceCompact || (publishedBuffer_ < 0) || (totalWritten_ + appended > capacity_);
+        // Full rewrites alternate to the other SSBO, which may still be read by a
+        // frame that is already in flight -> one corrupted frame (seen as a black
+        // flash while rotating). So only rebuild when the camera is settled (the
+        // compaction pass) or for the very first build; while moving we simply
+        // stop appending once the buffer is full and keep drawing the current set.
+        const bool overflowing = (totalWritten_ + appended > capacity_);
+        bool fullRebuild = forceCompact || (publishedBuffer_ < 0);
         if (fullRebuild) {
             entries_.clear();
             entryOf_.clear();
@@ -337,8 +363,9 @@ private:
         for (const auto& it : sel.items) {
             previousLevels_[it.leaf] = (int8_t)it.level;
         }
-        LOGI("LOD: assembly %{public}u gaussians (+%{public}u, uploadStart %{public}u, %s)",
-            totalWritten_, totalWritten_ - before, uploadStart, fullRebuild ? "full" : "append");
+        LOGI("LOD: assembly %{public}u gaussians (+%{public}u, uploadStart %{public}u, %s%s)",
+            totalWritten_, totalWritten_ - before, uploadStart, fullRebuild ? "full" : "append",
+            overflowing ? ", buffer full" : "");
     }
 
     void Publish(int bufferIndex, uint32_t count, uint32_t uploadStart)
@@ -384,6 +411,7 @@ private:
     std::unordered_map<int32_t, CacheEntry> caches_;
     uint32_t cacheCount_ = 0;
     uint64_t clock_ = 0;
+    uint64_t lastBuiltRequest_ = 0;
 };
 
 } // namespace lod

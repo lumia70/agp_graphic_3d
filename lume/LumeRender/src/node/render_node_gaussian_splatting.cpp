@@ -60,6 +60,7 @@ struct SharedPtrs {
     uint32_t* generationPtr = nullptr;
     uint32_t* uploadedGenerationPtr = nullptr;
     uint32_t* uploadStartPtr = nullptr;
+    float* backgroundPtr = nullptr;
     bool resolved = false;
 
     void Resolve() {
@@ -77,6 +78,7 @@ struct SharedPtrs {
             generationPtr = (uint32_t*)dlsym(h, "g_gaussianSplatGeneration");
             uploadedGenerationPtr = (uint32_t*)dlsym(h, "g_gaussianSplatUploadedGeneration");
             uploadStartPtr = (uint32_t*)dlsym(h, "g_gaussianSplatUploadStart");
+            backgroundPtr = (float*)dlsym(h, "g_gaussianBackground");
         }
         resolved = true;
     }
@@ -89,6 +91,7 @@ struct SharedPtrs {
     uint32_t Capacity() const { return capacityPtr ? *capacityPtr : 0u; }
     uint32_t Generation() const { return generationPtr ? *generationPtr : 0u; }
     uint32_t UploadStart() const { return uploadStartPtr ? *uploadStartPtr : 0u; }
+    const float* Background() const { return backgroundPtr; }
     void MarkUploaded(uint32_t generation) const
     {
         if (uploadedGenerationPtr) {
@@ -1317,8 +1320,11 @@ void RenderNodeGaussianSplatting::ExecuteFrame(IRenderCommandList& cmdList)
         rpDesc.attachmentHandles[0] = offscreenImage_.GetHandle();
         rpDesc.attachments[0].loadOp = AttachmentLoadOp::CORE_ATTACHMENT_LOAD_OP_CLEAR;
         rpDesc.attachments[0].storeOp = AttachmentStoreOp::CORE_ATTACHMENT_STORE_OP_STORE;
-        // Raw (gamma-space) background, matching the web capture (18,12,6)
-        rpDesc.attachments[0].clearValue = ClearValue(0.071f, 0.047f, 0.024f, 1.0f);
+        // Raw (gamma-space) background; the app switches it to a sky colour for
+        // large scenes (defaults to the web capture's (18,12,6)).
+        const float* bg = g_sp.Background();
+        rpDesc.attachments[0].clearValue = bg ? ClearValue(bg[0], bg[1], bg[2], 1.0f)
+                                              : ClearValue(0.071f, 0.047f, 0.024f, 1.0f);
         rpDesc.renderArea.offsetX = 0;
         rpDesc.renderArea.offsetY = 0;
         rpDesc.renderArea.extentWidth = width;

@@ -165,6 +165,11 @@ struct OrbitCamera {
     // derived from the view direction, which can point at the sky).
     float pivotX = 0.0f, pivotY = 0.0f, pivotZ = 0.0f;
     bool hasPivot = false;
+    // Roaming bounds: keep the eye inside the scene (expanded) so a fast walk
+    // cannot leave the model behind and show an empty screen.
+    float boundsMin[3] = { -1e30f, -1e30f, -1e30f };
+    float boundsMax[3] = { 1e30f, 1e30f, 1e30f };
+    bool hasBounds = false;
 
     // Touch state
     float lastX = 0.0f, lastY = 0.0f;
@@ -243,11 +248,21 @@ struct OrbitCamera {
     }
 
     // Pan target along camera right/up so content follows the finger
+    void ClampTarget() {
+        if (!hasBounds) {
+            return;
+        }
+        targetX = targetX < boundsMin[0] ? boundsMin[0] : (targetX > boundsMax[0] ? boundsMax[0] : targetX);
+        targetY = targetY < boundsMin[1] ? boundsMin[1] : (targetY > boundsMax[1] ? boundsMax[1] : targetY);
+        targetZ = targetZ < boundsMin[2] ? boundsMin[2] : (targetZ > boundsMax[2] ? boundsMax[2] : targetZ);
+    }
+
     // Walk mode movement: dx strafes, dy dollies along the view direction.
     void Walk(float dxScreen, float dyScreen, float scale) {
         targetX += (rightX * dxScreen - backX * dyScreen) * scale;
         targetY += (rightY * dxScreen - backY * dyScreen) * scale;
         targetZ += (rightZ * dxScreen - backZ * dyScreen) * scale;
+        ClampTarget();
     }
 
     // Dolly along the view direction (positive = forward).
@@ -255,6 +270,7 @@ struct OrbitCamera {
         targetX -= backX * forward;
         targetY -= backY * forward;
         targetZ -= backZ * forward;
+        ClampTarget();
     }
 
     void Pan(float dxScreen, float dyScreen, float scale) {
@@ -712,6 +728,26 @@ bool InitEcs()
     return true;
 }
 
+static CORE_NS::Entity g_cameraEntity {};
+
+// Large scenes get a light sky clear colour: an empty view then looks like sky
+// instead of a black screen (which is indistinguishable from a broken frame).
+static void SetClearColor(float r, float g, float b)
+{
+    if (!g_lume.ecs) {
+        return;
+    }
+    auto* camMgr = CORE_NS::GetManager<CORE3D_NS::ICameraComponentManager>(*g_lume.ecs);
+    if (!camMgr) {
+        return;
+    }
+    auto handle = camMgr->Write(g_cameraEntity);
+    if (handle) {
+        handle->clearColorValue = { r, g, b, 1.0f };
+        LOGI("Clear colour set to (%.2f,%.2f,%.2f)", r, g, b);
+    }
+}
+
 void SetupCameraAndLight()
 {
     if (!g_lume.graphicsContext || !g_lume.ecs) {
@@ -731,6 +767,7 @@ void SetupCameraAndLight()
 
     CORE_NS::Entity cameraEntity = sceneUtil.CreateCamera(
         ecs, cameraPos, cameraRot, zNear, zFar, fovDeg);
+    g_cameraEntity = cameraEntity;
 
     // Point the camera at the origin.
     const BASE_NS::Math::Vec3 target { 0.0f, 0.0f, 0.0f };
@@ -1003,6 +1040,11 @@ void LoadLodScene(const DemoModelConfig& cfg)
         return;
     }
     g_lodActive = true;
+    SetClearColor(0.62f, 0.72f, 0.82f);
+    g_gaussianBackground[0] = 0.62f;
+    g_gaussianBackground[1] = 0.72f;
+    g_gaussianBackground[2] = 0.82f;
+    g_gaussianBackground[3] = 1.0f;
 
     const lod::Scene& scene = g_lodStreamer.GetScene();
     g_orbitCam.fovYDeg = cfg.fovYDeg;
@@ -1073,6 +1115,14 @@ void LoadLodScene(const DemoModelConfig& cfg)
     g_orbitCam.pivotY = scene.camLookAt[1];
     g_orbitCam.pivotZ = scene.camLookAt[2];
     g_orbitCam.hasPivot = true;
+    // Roaming is confined to the scene bounds plus a margin, so walking cannot
+    // leave the model behind (which looks like a black screen).
+    for (int i = 0; i < 3; i++) {
+        const float margin = (scene.boundsMax[i] - scene.boundsMin[i]) * 0.15f;
+        g_orbitCam.boundsMin[i] = scene.boundsMin[i] - margin;
+        g_orbitCam.boundsMax[i] = scene.boundsMax[i] + margin;
+    }
+    g_orbitCam.hasBounds = true;
     g_orbitCam.LogState("lod-initial");
 
     // No CPU splat array: the node waits for the first streamed assembly.
@@ -1134,6 +1184,11 @@ void LoadSplatModel()
         LoadLodScene(cfg);
         return;
     }
+    SetClearColor(0.006f, 0.004f, 0.002f);  // warm black (matches the web viewer)
+    g_gaussianBackground[0] = 0.071f;
+    g_gaussianBackground[1] = 0.047f;
+    g_gaussianBackground[2] = 0.024f;
+    g_gaussianBackground[3] = 1.0f;
     std::string path = g_filesDir + "/assets/" + cfg.file;
     LOGI("Loading splat model: %{public}s", path.c_str());
 
@@ -1212,6 +1267,7 @@ void LoadSplatModel()
     g_orbitCam.firstPerson = false;
     g_orbitCam.fpBackoff = 0.0f;
     g_orbitCam.hasPivot = false;
+    g_orbitCam.hasBounds = false;
     // Restore the small-scene clip range (the LOD scene widens it for the scene
     // diagonal, and leaving it wide changes which splats survive the far cull).
     g_orbitCam.nearPlane = 0.05f;

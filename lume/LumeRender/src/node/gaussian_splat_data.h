@@ -46,6 +46,10 @@ extern __attribute__((visibility("default"))) uint32_t g_gaussianSplatUploadStar
 extern __attribute__((visibility("default"))) uint32_t g_gaussianSplatUploadedGeneration;
 extern __attribute__((visibility("default"))) const float* g_gaussianShData;
 extern __attribute__((visibility("default"))) GaussianCameraData g_gaussianCameraData;
+// Background of the splat offscreen pass (raw code-space RGBA, i.e. the value
+// that ends up on screen after the copy pass). Large scenes use a sky colour so
+// an empty view does not look like a broken black frame.
+extern __attribute__((visibility("default"))) float g_gaussianBackground[4];
 extern __attribute__((visibility("default"))) bool g_gaussianDataReady;
 extern __attribute__((visibility("default"))) bool g_gaussianCameraReady;
 

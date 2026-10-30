@@ -13,6 +13,7 @@ __attribute__((visibility("default"))) uint32_t g_gaussianSplatUploadStart = 0;
 __attribute__((visibility("default"))) uint32_t g_gaussianSplatUploadedGeneration = 0;
 __attribute__((visibility("default"))) const float* g_gaussianShData = nullptr;
 __attribute__((visibility("default"))) GaussianCameraData g_gaussianCameraData = {};
+__attribute__((visibility("default"))) float g_gaussianBackground[4] = { 0.071f, 0.047f, 0.024f, 1.0f };
 __attribute__((visibility("default"))) bool g_gaussianDataReady = false;
 __attribute__((visibility("default"))) bool g_gaussianCameraReady = false;
 }
