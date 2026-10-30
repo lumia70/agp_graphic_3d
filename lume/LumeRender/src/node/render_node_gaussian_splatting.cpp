@@ -61,6 +61,10 @@ struct SharedPtrs {
     uint32_t* uploadedGenerationPtr = nullptr;
     uint32_t* uploadStartPtr = nullptr;
     float* backgroundPtr = nullptr;
+    uint32_t* poolSizePtr = nullptr;
+    const uint32_t** liveIndicesPtr = nullptr;
+    const uint32_t** dirtyRangesPtr = nullptr;
+    uint32_t* dirtyRangeCountPtr = nullptr;
     bool resolved = false;
 
     void Resolve() {
@@ -79,6 +83,10 @@ struct SharedPtrs {
             uploadedGenerationPtr = (uint32_t*)dlsym(h, "g_gaussianSplatUploadedGeneration");
             uploadStartPtr = (uint32_t*)dlsym(h, "g_gaussianSplatUploadStart");
             backgroundPtr = (float*)dlsym(h, "g_gaussianBackground");
+            poolSizePtr = (uint32_t*)dlsym(h, "g_gaussianPoolSize");
+            liveIndicesPtr = (const uint32_t**)dlsym(h, "g_gaussianLiveIndices");
+            dirtyRangesPtr = (const uint32_t**)dlsym(h, "g_gaussianDirtyRanges");
+            dirtyRangeCountPtr = (uint32_t*)dlsym(h, "g_gaussianDirtyRangeCount");
         }
         resolved = true;
     }
@@ -92,6 +100,10 @@ struct SharedPtrs {
     uint32_t Generation() const { return generationPtr ? *generationPtr : 0u; }
     uint32_t UploadStart() const { return uploadStartPtr ? *uploadStartPtr : 0u; }
     const float* Background() const { return backgroundPtr; }
+    uint32_t PoolSize() const { return poolSizePtr ? *poolSizePtr : 0u; }
+    const uint32_t* LiveIndices() const { return liveIndicesPtr ? *liveIndicesPtr : nullptr; }
+    const uint32_t* DirtyRanges() const { return dirtyRangesPtr ? *dirtyRangesPtr : nullptr; }
+    uint32_t DirtyRangeCount() const { return dirtyRangeCountPtr ? *dirtyRangeCountPtr : 0u; }
     void MarkUploaded(uint32_t generation) const
     {
         if (uploadedGenerationPtr) {
@@ -268,9 +280,9 @@ struct SortTiming {
 
 // Frustum + size cull and back-to-front bucket sort. Returns the visible count
 // and writes the order into `out` (which must hold `count` entries).
-uint32_t ComputeSort(const float* records, const uint32_t count, SortScratch& s, uint32_t* out,
-    const float* vm, const float* pm, const float viewportHeight, const float nearZ, const float farZ,
-    const bool parallel, SortTiming* timing)
+uint32_t ComputeSort(const float* records, const uint32_t count, const uint32_t* liveIndices,
+    SortScratch& s, uint32_t* out, const float* vm, const float* pm, const float viewportHeight,
+    const float nearZ, const float farZ, const bool parallel, SortTiming* timing)
 {
     const auto sortBegin = std::chrono::steady_clock::now();
     auto ms = [](std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b) {
@@ -314,7 +326,8 @@ uint32_t ComputeSort(const float* records, const uint32_t count, SortScratch& s,
         uint32_t visible = 0;
         float zmin = 1e30f, zmax = -1e30f;
         for (uint32_t i = begin; i < finish; i++) {
-            const float* rec = records + (size_t)i * 4u;
+            const uint32_t poolIndex = liveIndices ? liveIndices[i] : i;
+            const float* rec = records + (size_t)poolIndex * 4u;
             const float px = rec[0], py = rec[1], pz = rec[2];
             const float vz = f0*px + f1*py + f2*pz + t2;
             const float z = -vz;  // positive distance in front
@@ -327,7 +340,7 @@ uint32_t ComputeSort(const float* records, const uint32_t count, SortScratch& s,
             if (fabsf(vy) > z * tanY + wr) continue;
             // Projected 2*sqrt(2)*sigma extent below 2 px (minPixelSize=2.0)
             if (focalY * ms_ * 2.83f / z < 2.0f) continue;
-            ids[visible] = i;
+            ids[visible] = poolIndex;
             keys[visible] = z;
             visible++;
             if (z < zmin) zmin = z;
@@ -480,6 +493,7 @@ struct RenderNodeGaussianSplatting::SortState {
     uint64_t finishedId = 0;
     const float* records = nullptr;
     uint32_t count = 0;
+    std::vector<uint32_t> liveIndices;  // copy: the app may rewrite its list
     float view[16] = {};
     float proj[16] = {};
     float viewportHeight = 0.0f;
@@ -558,8 +572,9 @@ void RenderNodeGaussianSplatting::ensureSortThread()
             // the render thread under the mutex after publication.
             state.result.resize(count);
             SortTiming timing;
-            const uint32_t visible = ComputeSort(records, count, state.scratch, state.result.data(), view,
-                proj, viewportHeight, nearZ, farZ, true, &timing);
+            const uint32_t visible = ComputeSort(records, count, state.liveIndices.data(),
+                state.scratch, state.result.data(), view, proj, viewportHeight, nearZ, farZ, true,
+                &timing);
 
             {
                 std::lock_guard<std::mutex> lock(state.mutex);
@@ -913,7 +928,9 @@ void RenderNodeGaussianSplatting::ExecuteFrame(IRenderCommandList& cmdList)
     const uint32_t generation = g_sp.Generation();
     if (generation != uploadedGeneration_ && g_sp.Ready()) {
         const uint32_t newCount = g_sp.Count();
-        const uint32_t newCapacity = g_sp.Capacity() > newCount ? g_sp.Capacity() : newCount;
+        const uint32_t poolHint = g_sp.PoolSize() > newCount ? g_sp.PoolSize() : newCount;
+        const uint32_t newCapacity =
+            g_sp.Capacity() > poolHint ? g_sp.Capacity() : poolHint;
         if (newCapacity != gaussianCapacity_ || !gaussianBuffer_) {
             // Recreate the gaussian + sort buffers for the new capacity.
             auto& gpuResMgr = renderNodeContextMgr_->GetGpuResourceManager();
@@ -945,9 +962,8 @@ void RenderNodeGaussianSplatting::ExecuteFrame(IRenderCommandList& cmdList)
             visibleCount_ = 0;
             PLUGIN_LOG_I("GS: recreated buffers for capacity %u", newCapacity);
         }
-        const uint32_t uploadStart = g_sp.UploadStart();
-        const bool appendOnly = (uploadStart > 0u) && (uploadStart <= newCount) &&
-                                (newCapacity == gaussianCapacity_) && (bool)gaussianBuffer_;
+        const uint32_t pool = g_sp.PoolSize() > newCount ? g_sp.PoolSize() : newCount;
+        const bool partialUpload = g_sp.DirtyRangeCount() > 0 && (bool)gaussianBuffer_;
         const bool needShBuffer = g_sp.Sh() != nullptr && !hasShData_;
         if (needShBuffer) {
             auto& gpuResMgr = renderNodeContextMgr_->GetGpuResourceManager();
@@ -961,11 +977,12 @@ void RenderNodeGaussianSplatting::ExecuteFrame(IRenderCommandList& cmdList)
         }
         const bool countChanged = newCount != gaussianCount_;
         gaussianCount_ = newCount;
+        poolSize_ = pool;
         hasShData_ = g_sp.Sh() != nullptr;
         needsUpload_ = true;
-        if (appendOnly) {
-            // The existing prefix is unchanged, so the applied order still covers
-            // it: keep drawing it and let the sort thread extend to the new tail.
+        if (partialUpload) {
+            // Only some blocks changed: the applied order still references valid
+            // pool slots, so keep drawing it and let the sort thread refresh.
             sortBufferUploaded_ = false;
         } else {
             if (sortState_) {
@@ -990,46 +1007,68 @@ void RenderNodeGaussianSplatting::ExecuteFrame(IRenderCommandList& cmdList)
     auto& gpuResMgr = renderNodeContextMgr_->GetGpuResourceManager();
 
     // ---- 1. Upload gaussian data ----
+    // Dirty ranges (LOD block replacement) patch the buffer in place; without them
+    // the whole pool is rewritten into the alternate buffer and swapped.
     if (needsUpload_ && g_sp.Ready() && gaussianBuffer_) {
-        const uint32_t start = g_sp.UploadStart();
-        const bool appendOnly = (start > 0u) && (start < gaussianCount_);
-        // Appends write into the buffer that is currently being drawn (past the
-        // data the GPU reads); full rebuilds go into the alternate buffer and are
-        // switched in only after the copy completes.
-        RenderHandleReference* target = appendOnly ? (altActive_ ? &gaussianBufferAlt_ : &gaussianBuffer_)
-                                                   : (altActive_ ? &gaussianBuffer_ : &gaussianBufferAlt_);
+        const uint32_t rangeCount = g_sp.DirtyRangeCount();
+        const uint32_t* ranges = g_sp.DirtyRanges();
+        const bool partial = rangeCount > 0 && ranges != nullptr;
+        RenderHandleReference* target = partial ? (altActive_ ? &gaussianBufferAlt_ : &gaussianBuffer_)
+                                                : (altActive_ ? &gaussianBuffer_ : &gaussianBufferAlt_);
         if (!*target) {
             *target = gaussianBuffer_;
         }
         void* mapped = gpuResMgr.MapBuffer(target->GetHandle());
         if (mapped) {
-            const uint32_t first = appendOnly ? start : 0u;
-            const size_t bytes = (size_t)(gaussianCount_ - first) * sizeof(GpuGaussian);
-            std::memcpy(static_cast<uint8_t*>(mapped) + (size_t)first * sizeof(GpuGaussian),
-                static_cast<const uint8_t*>(static_cast<const void*>(g_sp.Data())) +
-                    (size_t)first * sizeof(GpuGaussian),
-                bytes);
+            auto* dstBytes = static_cast<uint8_t*>(mapped);
+            const auto* srcBytes = static_cast<const uint8_t*>(static_cast<const void*>(g_sp.Data()));
+            if (partial) {
+                for (uint32_t r = 0; r < rangeCount; r++) {
+                    const uint32_t s = ranges[r * 2];
+                    const uint32_t c = ranges[r * 2 + 1];
+                    if (s >= poolSize_ || c == 0 || s + c > poolSize_) {
+                        continue;
+                    }
+                    std::memcpy(dstBytes + (size_t)s * sizeof(GpuGaussian),
+                        srcBytes + (size_t)s * sizeof(GpuGaussian), (size_t)c * sizeof(GpuGaussian));
+                }
+            } else if (poolSize_ > 0) {
+                std::memcpy(dstBytes, srcBytes, (size_t)poolSize_ * sizeof(GpuGaussian));
+            }
             gpuResMgr.UnmapBuffer(target->GetHandle());
-            if (!appendOnly) {
+            if (!partial) {
                 altActive_ = (*target).GetHandle().id == gaussianBufferAlt_.GetHandle().id;
             }
-            PLUGIN_LOG_I("GS: uploaded gaussians [%u,%u) to GPU (%s)", first, gaussianCount_,
-                appendOnly ? "append" : (altActive_ ? "alt" : "primary"));
+            PLUGIN_LOG_I("GS: uploaded %u gaussians (%s, %u ranges)", poolSize_,
+                partial ? "patch" : "full", partial ? rangeCount : 1u);
         }
-        // Build the compact cull records (position + largest scale).
+        // Cull records (position + largest scale), keyed by pool index.
         {
             const GpuGaussianData* src = g_sp.Data();
-            cullRecords_.resize((size_t)gaussianCount_ * 4u);
+            cullRecords_.resize((size_t)poolSize_ * 4u);
             float* dst = cullRecords_.data();
-            for (uint32_t i = 0; i < gaussianCount_; i++, dst += 4) {
-                const float msx = src[i].sx, msy = src[i].sy, msz = src[i].sz;
-                dst[0] = src[i].px;
-                dst[1] = src[i].py;
-                dst[2] = src[i].pz;
-                dst[3] = msx > msy ? (msx > msz ? msx : msz) : (msy > msz ? msy : msz);
+            auto fill = [src, dst](uint32_t first, uint32_t count) {
+                for (uint32_t i = first; i < first + count; i++) {
+                    const float msx = src[i].sx, msy = src[i].sy, msz = src[i].sz;
+                    float* rec = dst + (size_t)i * 4u;
+                    rec[0] = src[i].px;
+                    rec[1] = src[i].py;
+                    rec[2] = src[i].pz;
+                    rec[3] = msx > msy ? (msx > msz ? msx : msz) : (msy > msz ? msy : msz);
+                }
+            };
+            if (partial) {
+                for (uint32_t r = 0; r < rangeCount; r++) {
+                    const uint32_t s = ranges[r * 2];
+                    const uint32_t c = ranges[r * 2 + 1];
+                    if (s >= poolSize_ || c == 0 || s + c > poolSize_) {
+                        continue;
+                    }
+                    fill(s, c);
+                }
+            } else if (poolSize_ > 0) {
+                fill(0, poolSize_);
             }
-            PLUGIN_LOG_I("GS: built %u cull records (%u MB)", gaussianCount_,
-                (uint32_t)(cullRecords_.size() * sizeof(float) / (1024 * 1024)));
         }
 
         // Upload SH coefficients (skipped for DC-only models: the shader does not
@@ -1197,9 +1236,10 @@ void RenderNodeGaussianSplatting::ExecuteFrame(IRenderCommandList& cmdList)
                     SortTiming timing;
                     const float nearZ = clipNear;
                     const float farZ = clipFar;
-                    sortState_->appliedCount = ComputeSort(cullRecords_.data(), gaussianCount_,
-                        sortState_->inlineScratch, sortState_->applied.data(), vm, pm, (float)height, nearZ,
-                        farZ, false, &timing);
+                    const uint32_t* live = g_sp.LiveIndices();
+                    sortState_->appliedCount = ComputeSort(cullRecords_.data(), gaussianCount_, live,
+                        sortState_->inlineScratch, sortState_->applied.data(), vm, pm, (float)height,
+                        nearZ, farZ, false, &timing);
                     sortState_->hasApplied = true;
                     visibleCount_ = sortState_->appliedCount;
                     sortBufferUploaded_ = true;
@@ -1217,6 +1257,12 @@ void RenderNodeGaussianSplatting::ExecuteFrame(IRenderCommandList& cmdList)
                         sortState_->farZ = clipFar;
                         sortState_->records = cullRecords_.data();
                         sortState_->count = gaussianCount_;
+                        const uint32_t* live = g_sp.LiveIndices();
+                        if (live) {
+                            sortState_->liveIndices.assign(live, live + gaussianCount_);
+                        } else {
+                            sortState_->liveIndices.clear();
+                        }
                         sortState_->requestPending = true;
                         ++sortState_->requestId;
                     }

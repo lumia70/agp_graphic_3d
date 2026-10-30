@@ -124,7 +124,8 @@ private:
     // Descriptor set management
     IPipelineDescriptorSetBinder::Ptr pipelineDescriptorSetBinder_;
 
-    uint32_t gaussianCount_ = 0;
+    uint32_t gaussianCount_ = 0;   // live gaussians (drawn/sorted)
+    uint32_t poolSize_ = 0;        // slots used in the pool
     uint32_t emptyFrameCount_ = 0;
     uint32_t lastDrawnCount_ = 0;
     uint32_t gaussianCapacity_ = 0;

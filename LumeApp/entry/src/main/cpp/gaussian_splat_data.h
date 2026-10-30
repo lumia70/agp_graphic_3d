@@ -49,6 +49,16 @@ extern __attribute__((visibility("default"))) GaussianCameraData g_gaussianCamer
 // Background of the splat offscreen pass (raw code-space RGBA, i.e. the value
 // that ends up on screen after the copy pass). Large scenes use a sky colour so
 // an empty view does not look like a broken black frame.
+// Pool layout support (LOD block allocator):
+//   g_gaussianSplatCount      number of LIVE gaussians (what is drawn/sorted)
+//   g_gaussianPoolSize        slots used in the pool (buffer sizing; 0 = count)
+//   g_gaussianLiveIndices     pool index per live gaussian (null = identity)
+//   g_gaussianDirtyRanges     pairs (poolIndex, count) that changed; empty = full upload
+extern __attribute__((visibility("default"))) uint32_t g_gaussianPoolSize;
+extern __attribute__((visibility("default"))) const uint32_t* g_gaussianLiveIndices;
+extern __attribute__((visibility("default"))) const uint32_t* g_gaussianDirtyRanges;
+extern __attribute__((visibility("default"))) uint32_t g_gaussianDirtyRangeCount;
+
 extern __attribute__((visibility("default"))) float g_gaussianBackground[4];
 extern __attribute__((visibility("default"))) bool g_gaussianDataReady;
 extern __attribute__((visibility("default"))) bool g_gaussianCameraReady;

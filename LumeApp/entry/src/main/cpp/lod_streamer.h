@@ -59,10 +59,6 @@ public:
         // Appends add duplicates (a leaf at a new level), so the buffer grows over
         // a session. Past this we stop appending instead of compacting: a
         // compaction shrinks the drawn set, which reads as a "coarse flash".
-        drawLimit_ = budget_ + budget_ / 4u;
-        if (drawLimit_ > capacity_) {
-            drawLimit_ = capacity_;
-        }
         // Every file that holds the coarsest level is pinned in the cache.
         {
             const int baseLevel = scene_.levelCount - 1;
@@ -79,12 +75,15 @@ public:
         publishGeneration_ = 0;
         publishedBuffer_ = -1;
         publishUploadStart_ = 0;
-        writeIndex_ = -1;
-        entries_.clear();
-        entryOf_.clear();
-        totalWritten_ = 0;
+        writeIndex_ = 0;
+        leafEntry_.clear();
+        freeBlocks_.clear();
+        poolTop_ = 0;
+        dirtyRanges_.clear();
+        live_.clear();
         dirty_ = false;
-        lastUniqueTotal_ = 0;
+        publishPoolSize_ = 0;
+        publishLiveCount_ = 0;
         previousLevels_.clear();
         lastBuiltRequest_ = 0;
         basePreloaded_ = false;
@@ -122,19 +121,31 @@ public:
     }
 
     // Returns true when a new assembly is published for the render thread to use.
-    bool Poll(uint32_t& generation, const GpuGaussianData** data, uint32_t& count,
-        uint32_t& uploadStart)
+    struct Result {
+        uint32_t generation = 0;
+        const GpuGaussianData* data = nullptr;
+        uint32_t count = 0;
+        uint32_t poolSize = 0;
+        const uint32_t* liveIndices = nullptr;
+        const uint32_t* dirtyRanges = nullptr;
+        uint32_t dirtyRangeCount = 0;
+    };
+
+    bool Poll(Result& result)
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (publishedBuffer_ < 0 || publishGeneration_ == consumedGeneration_) {
             return false;
         }
         consumedGeneration_ = publishGeneration_;
-        generation = publishGeneration_;
-        *data = buffers_[publishedBuffer_].data();
-        count = publishCount_;
-        uploadStart = publishUploadStart_;
-        return count > 0;
+        result.generation = publishGeneration_;
+        result.data = buffers_[publishedBuffer_].data();
+        result.count = publishCount_;
+        result.poolSize = publishPoolSize_;
+        result.liveIndices = live_.empty() ? nullptr : live_.data();
+        result.dirtyRanges = dirtyRanges_.empty() ? nullptr : dirtyRanges_.data();
+        result.dirtyRangeCount = (uint32_t)(dirtyRanges_.size() / 2);
+        return result.count > 0;
     }
 
     uint32_t Budget() const { return budget_; }
@@ -240,29 +251,7 @@ private:
                 continue;
             }
 
-            // 3) Everything the view needs is decoded. If the buffer is full (the
-            //    append-only set reached the draw cap) and the user has been idle
-            //    for a while, compact: this is the only operation that shrinks the
-            //    drawn set, so it must never happen while moving/interacting.
-            if (totalWritten_ + 1u > drawLimit_) {
-                bool idle = false;
-                {
-                    std::unique_lock<std::mutex> lock(mutex_);
-                    const uint64_t target = requestId_;
-                    idle = !cv_.wait_for(lock, std::chrono::milliseconds(5000), [this, target] {
-                        return stopped_ || requestId_ != target;
-                    });
-                }
-                if (idle) {
-                    BuildView(cam, true);
-                    seen = requestId_;
-                    continue;
-                }
-            }
-
-            // 3) Everything the view needs is decoded. Only now is a compaction
-            //    safe: a rebuild re-derives levels from the cache, so doing it
-            //    while fine tiles are still missing shows a coarse frame.
+            // 3) Nothing left to decode for this view.
         }
     }
 
@@ -483,11 +472,11 @@ private:
     }
 
     // Fill the write buffer in leaf order (nearest first) and publish prefixes.
-    // Assembles the current selection.
-    //   settled == false : append-only update (uploads only the new tail, the
-    //                      buffer that is being drawn is never swapped);
-    //   settled == true  : full rebuild into the other buffer, then swap.
-    void BuildView(const Camera& cam, bool force)
+    // Rebuilds the drawn set from the current selection. Blocks are owned per leaf
+    // in a shared pool: when a leaf's level changes, only its block is rewritten
+    // (allocated / reused) and only those slots are uploaded. The rest of the pool
+    // is untouched, so nothing "shrinks" and nothing is rebuilt globally.
+    void BuildView(const Camera& cam, bool /*force*/)
     {
         if (previousLevels_.size() != scene_.leaves.size()) {
             previousLevels_.assign(scene_.leaves.size(), (int8_t)-1);
@@ -506,43 +495,13 @@ private:
             return -1;
         };
 
-        // New (leaf, level) entries that the current selection needs.
-        uint32_t appended = 0;
-        for (const auto& it : sel.items) {
-            const int level = resolveLevel(it.leaf, it.level);
-            if (level < 0) {
-                continue;
-            }
-            const uint32_t key = (it.leaf * 16u) + (uint32_t)level;
-            if (entryOf_.find(key) == entryOf_.end()) {
-                appended += scene_.leaves[it.leaf].lods[level].count;
-            }
-        }
-
-        const bool first = (publishedBuffer_ < 0);
-        // Full rewrite only when nothing exists yet or when the accumulated set
-        // no longer fits. A rebuild re-derives the levels from the cache, which is
-        // coarser than the appended mixture, so doing it on every "settle" made
-        // the picture visibly degrade when the finger was lifted.
-        const bool full = first || force;
-        if (full) {
-            entries_.clear();
-            entryOf_.clear();
-            totalWritten_ = 0;
-            writeIndex_ = first ? 0 : (1 - publishedBuffer_);
-        } else if (writeIndex_ < 0) {
+        if (writeIndex_ < 0) {
             writeIndex_ = 0;
         }
-
-        const uint32_t uploadStart = full ? 0u : totalWritten_;
-        const uint32_t before = totalWritten_;
-        const bool progressive = first;
-        // Publish in moderate steps so refinement grows smoothly (the app uploads
-        // the new tail and re-sorts in the background for each step).
-        const uint32_t publishStep = std::max<uint32_t>(budget_ / 12u, 80000u);
-        const uint64_t now = ++clock_;
-        uint32_t lastPublished = before;
+        ++buildId_;
+        dirtyRanges_.clear();
         uint32_t skippedNoTile = 0;
+        uint32_t replaced = 0;
 
         for (const auto& it : sel.items) {
             const int level = resolveLevel(it.leaf, it.level);
@@ -550,76 +509,190 @@ private:
                 skippedNoTile++;
                 continue;
             }
-            const uint32_t key = (it.leaf * 16u) + (uint32_t)level;
-            if (entryOf_.find(key) != entryOf_.end()) {
-                continue;
-            }
             const Slice& slice = scene_.leaves[it.leaf].lods[level];
-            if (slice.file < 0 || !EnsureTile(slice.file, now)) {
+            if (slice.file < 0 || slice.count == 0) {
                 continue;
             }
-            CacheEntryPtr entry;
+            auto found = leafEntry_.find(it.leaf);
+            Entry entry = (found != leafEntry_.end()) ? found->second : Entry {};
+            if (entry.level == level && entry.count == slice.count && entry.start + entry.count <= poolTop_) {
+                entry.lastUse = buildId_;
+                leafEntry_[it.leaf] = entry;
+                continue;
+            }
+            if (!EnsureTile(slice.file, ++clock_)) {
+                continue;
+            }
+            CacheEntryPtr tile;
             {
                 std::lock_guard<std::mutex> lock(cacheMutex_);
-                auto it2 = caches_.find(slice.file);
-                if (it2 == caches_.end()) {
+                auto cached = caches_.find(slice.file);
+                if (cached == caches_.end()) {
                     continue;
                 }
-                entry = it2->second;
+                tile = cached->second;
             }
-            const auto& src = entry->data;
-            if (slice.offset + slice.count > src.size()) {
-                LOGE("LOD: slice out of range (file %{public}d offset %{public}u count %{public}u)",
-                    slice.file, slice.offset, slice.count);
+            if (slice.offset + slice.count > tile->data.size()) {
                 continue;
             }
-            if (totalWritten_ + slice.count > drawLimit_) {
-                break;
+
+            // Reuse the existing block when it is big enough, otherwise allocate.
+            uint32_t start = 0;
+            bool reused = false;
+            if (entry.count >= slice.count && entry.start + entry.count <= poolTop_) {
+                start = entry.start;
+                reused = true;
+                if (entry.count > slice.count) {
+                    FreeBlock(entry.start + slice.count, entry.count - slice.count);
+                }
+            } else if (!AllocBlock(slice.count, start, sel)) {
+                continue;  // pool exhausted and nothing evictable
             }
-            std::memcpy(&buffers_[writeIndex_][totalWritten_], &src[slice.offset],
+
+            std::memcpy(&buffers_[writeIndex_][start], &tile->data[slice.offset],
                 (size_t)slice.count * sizeof(GpuGaussianData));
-            Entry entryInfo;
-            entryInfo.count = slice.count;
-            entryInfo.dst = totalWritten_;
-            entries_.push_back(entryInfo);
-            entryOf_[key] = (uint32_t)(entries_.size() - 1);
-            totalWritten_ += slice.count;
+            dirtyRanges_.push_back(start);
+            dirtyRanges_.push_back(slice.count);
 
-            if (totalWritten_ - lastPublished >= publishStep) {
-                Publish(writeIndex_, totalWritten_, uploadStart);
-                lastPublished = totalWritten_;
+            entry.level = (int8_t)level;
+            entry.start = start;
+            entry.count = slice.count;
+            entry.lastUse = buildId_;
+            leafEntry_[it.leaf] = entry;
+            if (!reused) {
+                replaced++;
             }
         }
 
-        if (totalWritten_ > lastPublished) {
-            Publish(writeIndex_, totalWritten_, uploadStart);
-        } else if (full && totalWritten_ == before && before > 0) {
-            // Nothing changed and the set is not empty: keep the published buffer.
-            LOGI("LOD: rebuild produced no change (%u gaussians)", totalWritten_);
+        // Live list = the gaussians of the selected leaves only (no duplicates).
+        live_.clear();
+        live_.reserve(sel.items.size() * 64u);
+        for (const auto& it : sel.items) {
+            auto found = leafEntry_.find(it.leaf);
+            if (found == leafEntry_.end()) {
+                continue;
+            }
+            const Entry& e = found->second;
+            if (e.count == 0 || e.start + e.count > poolTop_) {
+                continue;
+            }
+            for (uint32_t i = 0; i < e.count; i++) {
+                live_.push_back(e.start + i);
+            }
         }
+
         for (const auto& it : sel.items) {
             previousLevels_[it.leaf] = (int8_t)it.level;
         }
-        LOGI("LOD: %{public}s %{public}u gaussians (+%{public}u, no-tile %{public}u) "
-             "[L0 %u L1 %u L2 %u L3 %u] gen 0x%{public}x",
-            full ? "rebuild" : "append", totalWritten_, totalWritten_ - before, skippedNoTile,
-            sel.perLevelGaussians[0], sel.perLevelGaussians[1], sel.perLevelGaussians[2],
-            sel.perLevelGaussians[3], publishGeneration_);
+
+        const bool liveChanged = live_.size() != publishLiveCount_;
+        if (dirtyRanges_.empty() && !liveChanged) {
+            return;
+        }
+        Publish();
+        LOGI("LOD: set %{public}zu live gaussians (pool %{public}u, %{public}u dirty ranges, "
+             "%{public}u new blocks, no-tile %{public}u) gen 0x%{public}x",
+            live_.size(), poolTop_, (unsigned)(dirtyRanges_.size() / 2), replaced, skippedNoTile,
+            publishGeneration_);
     }
 
-    void Publish(int bufferIndex, uint32_t count, uint32_t uploadStart)
+    // First-fit block allocation from the free list, then from the bump pointer.
+    bool AllocBlock(uint32_t count, uint32_t& start, const Selection& sel)
+    {
+        if (TryAlloc(count, start)) {
+            return true;
+        }
+        // Pool exhausted: release blocks that are not part of this selection, least
+        // recently used first, until the request fits.
+        while (true) {
+            auto victim = leafEntry_.end();
+            for (auto it = leafEntry_.begin(); it != leafEntry_.end(); ++it) {
+                if (it->second.count == 0) {
+                    continue;
+                }
+                bool inSelection = false;
+                for (const auto& item : sel.items) {
+                    if (item.leaf == it->first) {
+                        inSelection = true;
+                        break;
+                    }
+                }
+                if (inSelection) {
+                    continue;
+                }
+                if (victim == leafEntry_.end() || it->second.lastUse < victim->second.lastUse) {
+                    victim = it;
+                }
+            }
+            if (victim == leafEntry_.end()) {
+                return false;
+            }
+            FreeBlock(victim->second.start, victim->second.count);
+            victim->second = Entry {};
+            if (TryAlloc(count, start)) {
+                return true;
+            }
+        }
+    }
+
+    bool TryAlloc(uint32_t count, uint32_t& start)
+    {
+        for (size_t i = 0; i < freeBlocks_.size(); i++) {
+            if (freeBlocks_[i].size < count) {
+                continue;
+            }
+            start = freeBlocks_[i].start;
+            freeBlocks_[i].start += count;
+            freeBlocks_[i].size -= count;
+            if (freeBlocks_[i].size == 0) {
+                freeBlocks_.erase(freeBlocks_.begin() + (long)i);
+            }
+            return true;
+        }
+        if (poolTop_ + count > capacity_) {
+            return false;
+        }
+        start = poolTop_;
+        poolTop_ += count;
+        return true;
+    }
+
+    void FreeBlock(uint32_t start, uint32_t count)
+    {
+        if (count == 0) {
+            return;
+        }
+        size_t i = 0;
+        while (i < freeBlocks_.size() && freeBlocks_[i].start < start) {
+            i++;
+        }
+        freeBlocks_.insert(freeBlocks_.begin() + (long)i, Block { start, count });
+        // Coalesce with the next and previous block.
+        for (size_t k = 0; k + 1 < freeBlocks_.size();) {
+            if (freeBlocks_[k].start + freeBlocks_[k].size == freeBlocks_[k + 1].start) {
+                freeBlocks_[k].size += freeBlocks_[k + 1].size;
+                freeBlocks_.erase(freeBlocks_.begin() + (long)(k + 1));
+            } else {
+                k++;
+            }
+        }
+    }
+
+    void Publish()
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        publishedBuffer_ = bufferIndex;
-        publishCount_ = count;
-        publishUploadStart_ = uploadStart;
+        writeIndex_ = (writeIndex_ < 0) ? 0 : writeIndex_;
+        publishedBuffer_ = writeIndex_;
+        publishCount_ = (uint32_t)live_.size();
+        publishPoolSize_ = poolTop_;
+        publishLiveCount_ = (uint32_t)live_.size();
+        publishUploadStart_ = 0;
         ++publishGeneration_;
     }
 
     Scene scene_;
     uint32_t budget_ = 1000000;
     uint32_t capacity_ = 2000000;
-    uint32_t drawLimit_ = 1250000;
     uint32_t cacheBudget_ = 3000000;
 
     std::mutex mutex_;
@@ -631,17 +704,28 @@ private:
 
     std::vector<GpuGaussianData> buffers_[2];
     struct Entry {
+        int8_t level = -1;
+        uint32_t start = 0;
         uint32_t count = 0;
-        uint32_t dst = 0;
+        uint64_t lastUse = 0;
+    };
+
+    struct Block {
+        uint32_t start = 0;
+        uint32_t size = 0;
     };
 
     uint32_t publishUploadStart_ = 0;
+    uint32_t publishPoolSize_ = 0;
+    uint32_t publishLiveCount_ = 0;
     int writeIndex_ = -1;
-    std::vector<Entry> entries_;
-    std::unordered_map<uint32_t, uint32_t> entryOf_;
-    uint32_t totalWritten_ = 0;
+    std::unordered_map<uint32_t, Entry> leafEntry_;  // leaf -> block
+    std::vector<Block> freeBlocks_;
+    uint32_t poolTop_ = 0;
+    std::vector<uint32_t> dirtyRanges_;  // (start, count) pairs
+    std::vector<uint32_t> live_;   // pool indices of the drawn set
+    uint64_t buildId_ = 0;
     bool dirty_ = false;
-    uint32_t lastUniqueTotal_ = 0;
     int publishedBuffer_ = -1;
     uint32_t publishCount_ = 0;
     uint32_t publishGeneration_ = 0;

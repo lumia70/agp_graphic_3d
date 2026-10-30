@@ -1035,6 +1035,7 @@ void LoadLodScene(const DemoModelConfig& cfg)
     }
     LOGI("LOD scene dir: %{public}s", dir.c_str());
 
+    // 0 = use the scene's own budget (maxRenderCountOfMobile).
     if (!g_lodStreamer.Start(dir, 0, 0)) {
         LOGE("LOD scene failed to start");
         return;
@@ -1168,6 +1169,10 @@ static void ReleaseSplatModel()
     g_gaussianSplatData = nullptr;
     g_gaussianSplatCount = 0;
     g_gaussianSplatCapacity = 0;
+    g_gaussianPoolSize = 0;
+    g_gaussianLiveIndices = nullptr;
+    g_gaussianDirtyRanges = nullptr;
+    g_gaussianDirtyRangeCount = 0;
     ++g_gaussianSplatGeneration;
     g_gaussianShData = nullptr;
     g_gaussianDataReady = false;
@@ -1286,6 +1291,10 @@ void LoadSplatModel()
     g_gaussianSplatData = reinterpret_cast<const GpuGaussianData*>(g_lume.splatData.gaussians.data());
     g_gaussianSplatCount = g_lume.splatData.gaussianCount;
     g_gaussianSplatCapacity = g_lume.splatData.gaussianCount;
+    g_gaussianPoolSize = g_lume.splatData.gaussianCount;
+    g_gaussianLiveIndices = nullptr;  // identity
+    g_gaussianDirtyRanges = nullptr;  // full upload
+    g_gaussianDirtyRangeCount = 0;
     g_gaussianShData = g_lume.splatData.sh.empty() ? nullptr : g_lume.splatData.sh.data();
     g_gaussianDataReady = true;
     ++g_gaussianSplatGeneration;
@@ -1345,20 +1354,21 @@ void DrawFrame()
             g_lodStreamer.UpdateCamera(g_gaussianCameraData.view, g_gaussianCameraData.proj,
                 g_gaussianCameraData.cameraPos);
         }
-        uint32_t lodGeneration = 0;
-        uint32_t lodCount = 0;
-        uint32_t lodUploadStart = 0;
-        const GpuGaussianData* lodData = nullptr;
-        if (g_lodStreamer.Poll(lodGeneration, &lodData, lodCount, lodUploadStart)) {
-            g_gaussianSplatData = lodData;
-            g_gaussianSplatCount = lodCount;
+        lod::Streamer::Result lod {};
+        if (g_lodStreamer.Poll(lod)) {
+            g_gaussianSplatData = lod.data;
+            g_gaussianSplatCount = lod.count;
             g_gaussianSplatCapacity = g_lodStreamer.Capacity();
             g_gaussianShData = nullptr;
             g_gaussianDataReady = true;
-            g_gaussianSplatUploadStart = lodUploadStart;
+            g_gaussianPoolSize = lod.poolSize;
+            g_gaussianLiveIndices = lod.liveIndices;
+            g_gaussianDirtyRanges = lod.dirtyRanges;
+            g_gaussianDirtyRangeCount = lod.dirtyRangeCount;
             ++g_gaussianSplatGeneration;
             g_forceRenderFrames = 30;
-            LOGI("LOD: published %{public}u gaussians (gen 0x%{public}x)", lodCount, lodGeneration);
+            LOGI("LOD: published %{public}u/%{public}u gaussians (gen 0x%{public}x)", lod.count,
+                lod.poolSize, lod.generation);
         }
     }
 
