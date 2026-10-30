@@ -1307,6 +1307,14 @@ void RenderNodeGaussianSplatting::ExecuteFrame(IRenderCommandList& cmdList)
         return;
     }
 
+    // Diagnostic: a frame whose drawn set is much smaller than the previous one
+    // is what the eye sees as a "coarse flash".
+    if (lastDrawnCount_ > 0 && gaussianCount_ * 10u < lastDrawnCount_ * 8u) {
+        PLUGIN_LOG_I("GS: set shrink %u -> %u gen=0x%x", lastDrawnCount_, gaussianCount_,
+            g_sp.Generation());
+    }
+    lastDrawnCount_ = gaussianCount_;
+
     // ---- 4. Update descriptor sets ----
     if (pipelineDescriptorSetBinder_) {
         // Bind this frame's slot buffers

@@ -55,7 +55,14 @@ public:
         }
         // The buffer keeps stale entries around while moving (append-only), so it
         // has headroom over the per-frame selection budget.
-        capacity_ = budget_ + budget_ / 2u;
+        capacity_ = budget_ * 2u;
+        // Appends add duplicates (a leaf at a new level), so the buffer grows over
+        // a session. Past this we stop appending instead of compacting: a
+        // compaction shrinks the drawn set, which reads as a "coarse flash".
+        drawLimit_ = budget_ + budget_ / 4u;
+        if (drawLimit_ > capacity_) {
+            drawLimit_ = capacity_;
+        }
         // Every file that holds the coarsest level is pinned in the cache.
         {
             const int baseLevel = scene_.levelCount - 1;
@@ -233,13 +240,29 @@ private:
                 continue;
             }
 
+            // 3) Everything the view needs is decoded. If the buffer is full (the
+            //    append-only set reached the draw cap) and the user has been idle
+            //    for a while, compact: this is the only operation that shrinks the
+            //    drawn set, so it must never happen while moving/interacting.
+            if (totalWritten_ + 1u > drawLimit_) {
+                bool idle = false;
+                {
+                    std::unique_lock<std::mutex> lock(mutex_);
+                    const uint64_t target = requestId_;
+                    idle = !cv_.wait_for(lock, std::chrono::milliseconds(5000), [this, target] {
+                        return stopped_ || requestId_ != target;
+                    });
+                }
+                if (idle) {
+                    BuildView(cam, true);
+                    seen = requestId_;
+                    continue;
+                }
+            }
+
             // 3) Everything the view needs is decoded. Only now is a compaction
             //    safe: a rebuild re-derives levels from the cache, so doing it
             //    while fine tiles are still missing shows a coarse frame.
-            if (totalWritten_ + 1u > capacity_) {
-                BuildView(cam, true);
-                seen = requestId_;
-            }
         }
     }
 
@@ -464,7 +487,7 @@ private:
     //   settled == false : append-only update (uploads only the new tail, the
     //                      buffer that is being drawn is never swapped);
     //   settled == true  : full rebuild into the other buffer, then swap.
-    void BuildView(const Camera& cam, bool settled)
+    void BuildView(const Camera& cam, bool force)
     {
         if (previousLevels_.size() != scene_.leaves.size()) {
             previousLevels_.assign(scene_.leaves.size(), (int8_t)-1);
@@ -501,8 +524,7 @@ private:
         // no longer fits. A rebuild re-derives the levels from the cache, which is
         // coarser than the appended mixture, so doing it on every "settle" made
         // the picture visibly degrade when the finger was lifted.
-        const bool full = first || (totalWritten_ + appended > capacity_);
-        (void)settled;
+        const bool full = first || force;
         if (full) {
             entries_.clear();
             entryOf_.clear();
@@ -551,7 +573,7 @@ private:
                     slice.file, slice.offset, slice.count);
                 continue;
             }
-            if (totalWritten_ + slice.count > capacity_) {
+            if (totalWritten_ + slice.count > drawLimit_) {
                 break;
             }
             std::memcpy(&buffers_[writeIndex_][totalWritten_], &src[slice.offset],
@@ -596,7 +618,8 @@ private:
 
     Scene scene_;
     uint32_t budget_ = 1000000;
-    uint32_t capacity_ = 1500000;
+    uint32_t capacity_ = 2000000;
+    uint32_t drawLimit_ = 1250000;
     uint32_t cacheBudget_ = 3000000;
 
     std::mutex mutex_;
