@@ -413,6 +413,16 @@ uint32_t ComputeSort(const float* records, const uint32_t count, SortScratch& s,
         });
     }
 
+    // Safety net: if the cull removed everything (camera inside geometry, extreme
+    // zoom) fall back to the full unsorted set instead of drawing nothing. The
+    // projection still clips what is off-screen, this only costs overdraw.
+    if (visibleCount == 0 && count > 0) {
+        for (uint32_t i = 0; i < count; i++) {
+            out[i] = i;
+        }
+        visibleCount = count;
+    }
+
     if (timing) {
         const auto sortEnd = std::chrono::steady_clock::now();
         timing->totalMs = ms(sortBegin, sortEnd);

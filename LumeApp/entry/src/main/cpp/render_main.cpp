@@ -153,6 +153,9 @@ struct OrbitCamera {
     float targetX = 0.0f, targetY = 0.0f, targetZ = 0.0f;
     float nearPlane = 0.05f;
     float farPlane = 2000.0f;
+    // Smallest orbit distance: below this the camera would sit inside the
+    // geometry and the near cull could hide the whole scene.
+    float minDistance = 0.1f;
 
     // Touch state
     float lastX = 0.0f, lastY = 0.0f;
@@ -983,8 +986,13 @@ void LoadLodScene(const DemoModelConfig& cfg)
     float ey = scene.boundsMax[1] - scene.boundsMin[1];
     float ez = scene.boundsMax[2] - scene.boundsMin[2];
     const float diag = std::sqrt(ex * ex + ey * ey + ez * ez);
-    g_orbitCam.nearPlane = std::max(0.1f, diag * 0.0005f);
+    // No depth buffer -> the near plane only has to stop clipping splats that are
+    // right in front of the camera. Keeping it in world units (0.1) instead of a
+    // fraction of the scene diagonal avoids the "zoom in -> everything culled"
+    // black screen on a solid scene.
+    g_orbitCam.nearPlane = 0.1f;
     g_orbitCam.farPlane = (len + diag) * 2.0f;
+    g_orbitCam.minDistance = std::max(1.0f, diag * 0.002f);
     g_orbitCam.insideDistance = std::max(1.0f, diag * 0.05f);
     g_orbitCam.farDistance = len;
     // Start in the far framing so the first double-tap zooms into the scene.
@@ -1399,8 +1407,15 @@ void DispatchTouchEvent(OH_NativeXComponent* component, void* window)
             if (g_orbitCam.lastDist > 1.f) {
                 float ratio = g_orbitCam.lastDist / dist;
                 g_orbitCam.distance *= ratio;
-                if (g_orbitCam.distance < 0.1f) g_orbitCam.distance = 0.1f;
-                if (g_orbitCam.distance > g_orbitCam.farPlane) g_orbitCam.distance = g_orbitCam.farPlane;
+                if (g_orbitCam.distance < g_orbitCam.minDistance) {
+                    g_orbitCam.distance = g_orbitCam.minDistance;
+                }
+                // Keep the target comfortably inside the far plane, otherwise the
+                // whole scene can end up beyond it at maximum zoom-out.
+                const float maxDistance = g_orbitCam.farPlane * 0.75f;
+                if (g_orbitCam.distance > maxDistance) {
+                    g_orbitCam.distance = maxDistance;
+                }
             }
             g_orbitCam.lastDist = dist;
 
