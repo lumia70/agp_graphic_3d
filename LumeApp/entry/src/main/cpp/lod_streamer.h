@@ -564,6 +564,7 @@ private:
         dirtyRanges_.clear();
         uint32_t skippedNoTile = 0;
         uint32_t replaced = 0;
+        uint32_t growFailures = 0;
 
         for (const auto& it : sel.items) {
             const int level = resolveLevel(it.leaf, it.level);
@@ -608,15 +609,24 @@ private:
                     FreeBlock(entry.start + slice.count, entry.count - slice.count);
                 }
             } else {
-                // Growing: release the old block first so the pool only needs the
-                // larger of the two sizes at any time.
+                // Growing. Try to allocate the larger block first; only release the
+                // old one once that succeeded. Freeing first and then failing left
+                // the leaf with no block at all, which shows up as a hole in the
+                // picture when the pool is tight.
+                if (!AllocBlock(slice.count, start)) {
+                    // Cannot grow (pool full, everything evictable is selected):
+                    // keep the existing coarser block so the leaf stays visible.
+                    if (entry.count > 0) {
+                        entry.lastUse = buildId_;
+                        leafEntry_[it.leaf] = entry;
+                    }
+                    growFailures++;
+                    continue;
+                }
                 if (entry.count > 0 && entry.start + entry.count <= poolTop_) {
                     FreeBlock(entry.start, entry.count);
-                    entry = Entry {};
                 }
-                if (!AllocBlock(slice.count, start)) {
-                    continue;  // pool exhausted and nothing evictable
-                }
+                entry = Entry {};
             }
 
             std::memcpy(&buffers_[writeIndex_][start], &tile->data[slice.offset],
@@ -683,9 +693,10 @@ private:
             return std::chrono::duration<double, std::milli>(b - a).count();
         };
         LOGI("LOD: set %{public}zu live gaussians (pool %{public}u, %{public}u dirty ranges, "
-             "%{public}u new blocks, no-tile %{public}u, %{public}.0f ms = sel %{public}.0f + "
+             "%{public}u new blocks, no-tile %{public}u, grow-fail %{public}u, %{public}.0f ms = sel %{public}.0f + "
              "blocks %{public}.0f + live %{public}.0f) gen 0x%{public}x",
             (size_t)liveCount_, poolTop_, (unsigned)(dirtyRanges_.size() / 2), replaced, skippedNoTile,
+            growFailures,
             buildMs, msBetween(tSel0, tSel1), msBetween(tSel1, tBlocks), msBetween(tBlocks, tLive),
             publishGeneration_);
     }

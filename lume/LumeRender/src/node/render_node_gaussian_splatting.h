@@ -93,7 +93,8 @@ private:
     SortState* sortState_ = nullptr;
     // Compact cull input (px, py, pz, maxScale = 16 B) built once per upload so
     // the sort's cull pass streams 16 B/gaussian instead of the full 64 B record.
-    BASE_NS::vector<float> cullRecords_;
+    BASE_NS::vector<float> cullRecords_[2];
+    int cullActive_ = 0;
     uint32_t visibleCount_ = 0;
     // Coarse view-change tracking (re-sort threshold)
     float lastDirX_ = 0.f, lastDirY_ = 0.f, lastDirZ_ = -1.f;

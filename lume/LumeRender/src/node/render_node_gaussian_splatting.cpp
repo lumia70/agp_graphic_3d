@@ -283,10 +283,10 @@ struct SortTiming {
 
 // Frustum + size cull and back-to-front bucket sort. Returns the visible count
 // and writes the order into `out` (which must hold `count` entries).
-uint32_t ComputeSort(const float* records, const uint32_t count, const uint32_t* liveRanges,
-    const uint32_t liveRangeCount, SortScratch& s, uint32_t* out, const float* vm, const float* pm,
-    const float viewportHeight, const float nearZ, const float farZ, const bool parallel,
-    SortTiming* timing)
+uint32_t ComputeSort(const float* records, const uint32_t count, const uint32_t poolSize,
+    const uint32_t* liveRanges, const uint32_t liveRangeCount, SortScratch& s, uint32_t* out,
+    const float* vm, const float* pm, const float viewportHeight, const float nearZ, const float farZ,
+    const bool parallel, SortTiming* timing)
 {
     const auto sortBegin = std::chrono::steady_clock::now();
     auto ms = [](std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b) {
@@ -350,6 +350,10 @@ uint32_t ComputeSort(const float* records, const uint32_t count, const uint32_t*
             const uint32_t endInRange = std::min(rn, finish - liveStart);
             for (uint32_t k = skip; k < endInRange; k++) {
                 const uint32_t poolIndex = rs + k;
+                // Defensive: a stale range must never read past the records.
+                if (poolIndex >= poolSize) {
+                    continue;
+                }
             const float* rec = records + (size_t)poolIndex * 4u;
             const float px = rec[0], py = rec[1], pz = rec[2];
             const float vz = f0*px + f1*py + f2*pz + t2;
@@ -519,6 +523,7 @@ struct RenderNodeGaussianSplatting::SortState {
     uint32_t count = 0;
     std::vector<uint32_t> liveRanges;   // copy of (start, count) pairs
     uint32_t liveRangeCount = 0;
+    uint32_t poolSize = 0;
     float view[16] = {};
     float proj[16] = {};
     float viewportHeight = 0.0f;
@@ -597,9 +602,9 @@ void RenderNodeGaussianSplatting::ensureSortThread()
             // the render thread under the mutex after publication.
             state.result.resize(count);
             SortTiming timing;
-            const uint32_t visible = ComputeSort(records, count, state.liveRanges.data(),
-                state.liveRangeCount, state.scratch, state.result.data(), view, proj, viewportHeight,
-                nearZ, farZ, true, &timing);
+            const uint32_t visible = ComputeSort(records, count, state.poolSize,
+                state.liveRanges.data(), state.liveRangeCount, state.scratch, state.result.data(),
+                view, proj, viewportHeight, nearZ, farZ, true, &timing);
 
             {
                 std::lock_guard<std::mutex> lock(state.mutex);
@@ -1067,11 +1072,14 @@ void RenderNodeGaussianSplatting::ExecuteFrame(IRenderCommandList& cmdList)
             PLUGIN_LOG_I("GS: uploaded %u gaussians (%s, %u ranges)", poolSize_,
                 partial ? "patch" : "full", partial ? rangeCount : 1u);
         }
-        // Cull records (position + largest scale), keyed by pool index.
+        // Cull records (position + largest scale), keyed by pool index. Two buffers
+        // alternate: the sort thread may still be reading the previous snapshot
+        // while this one is rebuilt (resizing a single buffer there was the crash).
         {
             const GpuGaussianData* src = g_sp.Data();
-            cullRecords_.resize((size_t)poolSize_ * 4u);
-            float* dst = cullRecords_.data();
+            BASE_NS::vector<float>& records = cullRecords_[1 - cullActive_];
+            records.resize((size_t)poolSize_ * 4u);
+            float* dst = records.data();
             auto fill = [src, dst](uint32_t first, uint32_t count) {
                 for (uint32_t i = first; i < first + count; i++) {
                     const float msx = src[i].sx, msy = src[i].sy, msz = src[i].sz;
@@ -1094,6 +1102,7 @@ void RenderNodeGaussianSplatting::ExecuteFrame(IRenderCommandList& cmdList)
             } else if (poolSize_ > 0) {
                 fill(0, poolSize_);
             }
+            cullActive_ = 1 - cullActive_;
         }
 
         // Upload SH coefficients (skipped for DC-only models: the shader does not
@@ -1263,9 +1272,9 @@ void RenderNodeGaussianSplatting::ExecuteFrame(IRenderCommandList& cmdList)
                     const float farZ = clipFar;
                     const uint32_t* ranges = g_sp.LiveRanges();
                     const uint32_t rangeCount = g_sp.LiveRangeCount();
-                    sortState_->appliedCount = ComputeSort(cullRecords_.data(), gaussianCount_, ranges,
-                        rangeCount, sortState_->inlineScratch, sortState_->applied.data(), vm, pm,
-                        (float)height, nearZ, farZ, false, &timing);
+                    sortState_->appliedCount = ComputeSort(cullRecords_[cullActive_].data(),
+                        gaussianCount_, poolSize_, ranges, rangeCount, sortState_->inlineScratch,
+                        sortState_->applied.data(), vm, pm, (float)height, nearZ, farZ, false, &timing);
                     sortState_->hasApplied = true;
                     visibleCount_ = sortState_->appliedCount;
                     sortBufferUploaded_ = true;
@@ -1281,8 +1290,9 @@ void RenderNodeGaussianSplatting::ExecuteFrame(IRenderCommandList& cmdList)
                         sortState_->viewportHeight = (float)height;
                         sortState_->nearZ = clipNear;
                         sortState_->farZ = clipFar;
-                        sortState_->records = cullRecords_.data();
+                        sortState_->records = cullRecords_[cullActive_].data();
                         sortState_->count = gaussianCount_;
+                        sortState_->poolSize = poolSize_;
                         const uint32_t* ranges = g_sp.LiveRanges();
                         const uint32_t rangeCount = g_sp.LiveRangeCount();
                         if (ranges && rangeCount > 0) {
