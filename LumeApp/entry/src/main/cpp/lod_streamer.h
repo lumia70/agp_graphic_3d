@@ -56,7 +56,7 @@ public:
         }
         // The buffer keeps stale entries around while moving (append-only), so it
         // has headroom over the per-frame selection budget.
-        capacity_ = budget_ * 2u;
+        capacity_ = (budget_ * 4u) / 3u;  // pool slack without doubling the memory
         // Appends add duplicates (a leaf at a new level), so the buffer grows over
         // a session. Past this we stop appending instead of compacting: a
         // compaction shrinks the drawn set, which reads as a "coarse flash".
@@ -509,6 +509,12 @@ private:
         const auto tSel0 = std::chrono::steady_clock::now();
         SelectVisible(scene_, cam.view, cam.proj, cam.camPos, budget_, previousLevels_.data(), sel);
         const auto tSel1 = std::chrono::steady_clock::now();
+        uint32_t levelChanges = 0;
+        for (const auto& item : sel.items) {
+            if (previousLevels_[item.leaf] >= 0 && previousLevels_[item.leaf] != (int8_t)item.level) {
+                levelChanges++;
+            }
+        }
 
         // If the selection did not change and no tile arrived, there is nothing to
         // do. Rebuilding the live list (~1M entries) and republishing on every
@@ -693,10 +699,11 @@ private:
             return std::chrono::duration<double, std::milli>(b - a).count();
         };
         LOGI("LOD: set %{public}zu live gaussians (pool %{public}u, %{public}u dirty ranges, "
-             "%{public}u new blocks, no-tile %{public}u, grow-fail %{public}u, %{public}.0f ms = sel %{public}.0f + "
+             "%{public}u new blocks, no-tile %{public}u, grow-fail %{public}u, level-chg %{public}u, "
+             "%{public}.0f ms = sel %{public}.0f + "
              "blocks %{public}.0f + live %{public}.0f) gen 0x%{public}x",
             (size_t)liveCount_, poolTop_, (unsigned)(dirtyRanges_.size() / 2), replaced, skippedNoTile,
-            growFailures,
+            growFailures, levelChanges,
             buildMs, msBetween(tSel0, tSel1), msBetween(tSel1, tBlocks), msBetween(tBlocks, tLive),
             publishGeneration_);
     }

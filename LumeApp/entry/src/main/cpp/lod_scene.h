@@ -316,9 +316,10 @@ inline int PickLevel(const Scene& scene, float dist)
     return scene.levelCount - 1;
 }
 
-// Hysteresis: only switch away from the previous level once the distance
-// crosses the threshold by 15%, which stops leaves oscillating between two
-// levels (visible as geometry popping while the camera drifts).
+// Sticky level selection: keep the level a leaf already has unless the distance
+// clearly moved into another band (15% hysteresis). Re-deriving the level from
+// distance every frame made whole blocks jump between LODs while rotating, which
+// reads as the picture flickering, because only one level per leaf is drawn.
 inline int PickLevelHysteresis(const Scene& scene, float dist, int previous)
 {
     if (previous < 0 || previous >= scene.levelCount) {
@@ -382,8 +383,17 @@ inline void SelectVisible(const Scene& scene, const float view[16], const float 
         const float dist = DistanceToAabb(camPos, leaf);
         Item item;
         item.leaf = i;
-        item.level = (uint8_t)PickLevelHysteresis(scene, dist,
-            previousLevels ? previousLevels[i] : -1);
+        if (previousLevels && previousLevels[i] >= 0) {
+            // Sticky: keep the level the leaf already has. The budget pass below
+            // is the only thing that changes it, driven by real overshoot.
+            int level = previousLevels[i];
+            if (level >= leaf.levels) {
+                level = leaf.levels - 1;
+            }
+            item.level = (uint8_t)level;
+        } else {
+            item.level = (uint8_t)PickLevelHysteresis(scene, dist, -1);
+        }
         item.dist = dist;
         out.items.push_back(item);
     }

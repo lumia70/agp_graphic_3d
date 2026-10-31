@@ -1035,8 +1035,11 @@ void LoadLodScene(const DemoModelConfig& cfg)
     }
     LOGI("LOD scene dir: %{public}s", dir.c_str());
 
-    // 0 = use the scene's own budget (maxRenderCountOfMobile).
-    if (!g_lodStreamer.Start(dir, 0, 0)) {
+    // The scene asks for 1M splats, which leaves large parts of an aerial view at
+    // the coarsest band. 1.5M costs a bit of fill rate but noticeably raises the
+    // average density.
+    const uint32_t lodBudget = 1500000u;
+    if (!g_lodStreamer.Start(dir, lodBudget, 0)) {
         LOGE("LOD scene failed to start");
         return;
     }
