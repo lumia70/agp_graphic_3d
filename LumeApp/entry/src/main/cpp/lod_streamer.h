@@ -49,8 +49,8 @@ public:
         // The two assembly buffers already take 2 * capacity * 64 B; keep the decoded
         // tile cache below the scene's own suggestion to stay around 500 MB RSS.
         cacheBudget_ = cacheBudget ? cacheBudget
-                                   : std::min<uint32_t>(scene_.cacheCount ? scene_.cacheCount : 4000000u,
-                                         4000000u);
+                                   : std::min<uint32_t>(scene_.cacheCount ? scene_.cacheCount : 5000000u,
+                                         5000000u);
         if (budget_ > 4000000u) {
             budget_ = 4000000u;
         }
@@ -469,6 +469,12 @@ private:
                 if (pinned_.count(it->first) != 0) {
                     continue;  // pinned (coarse base) tiles stay
                 }
+                // Tiles the current selection depends on must not be evicted:
+                // re-decoding them on the next frame is what made the picture
+                // flicker between coarse and fine while the camera was still.
+                if (selectionFiles_.count(it->first) != 0) {
+                    continue;
+                }
                 if (oldest == caches_.end() || it->second->lastUse < oldest->second->lastUse) {
                     oldest = it;
                 }
@@ -545,8 +551,15 @@ private:
         }
         ++buildId_;
         selectedLeaves_.clear();
+        selectionFiles_.clear();
         for (const auto& item : sel.items) {
             selectedLeaves_.insert(item.leaf);
+            const Leaf& leaf = scene_.leaves[item.leaf];
+            for (int lvl = item.level; lvl < leaf.levels; lvl++) {
+                if (leaf.lods[lvl].file >= 0) {
+                    selectionFiles_.insert(leaf.lods[lvl].file);
+                }
+            }
         }
         dirtyRanges_.clear();
         uint32_t skippedNoTile = 0;
@@ -803,6 +816,7 @@ private:
     std::vector<uint32_t> liveRanges_;  // (start, count) pairs of the drawn set
     uint32_t liveCount_ = 0;
     std::unordered_set<uint32_t> selectedLeaves_;
+    std::unordered_set<int32_t> selectionFiles_;
     uint64_t buildId_ = 0;
     uint64_t lastBuiltHash_ = 0;
     uint64_t lastBuildMs_ = 0;
