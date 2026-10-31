@@ -55,7 +55,10 @@ extern __attribute__((visibility("default"))) GaussianCameraData g_gaussianCamer
 //   g_gaussianLiveIndices     pool index per live gaussian (null = identity)
 //   g_gaussianDirtyRanges     pairs (poolIndex, count) that changed; empty = full upload
 extern __attribute__((visibility("default"))) uint32_t g_gaussianPoolSize;
-extern __attribute__((visibility("default"))) const uint32_t* g_gaussianLiveIndices;
+// Live pool ranges: pairs (start, count) covering every drawn slot. Much smaller
+// than a per-gaussian index list (one pair per leaf).
+extern __attribute__((visibility("default"))) const uint32_t* g_gaussianLiveRanges;
+extern __attribute__((visibility("default"))) uint32_t g_gaussianLiveRangeCount;
 extern __attribute__((visibility("default"))) const uint32_t* g_gaussianDirtyRanges;
 extern __attribute__((visibility("default"))) uint32_t g_gaussianDirtyRangeCount;
 

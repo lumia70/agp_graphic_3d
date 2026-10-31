@@ -81,7 +81,8 @@ public:
         freeBlocks_.clear();
         poolTop_ = 0;
         dirtyRanges_.clear();
-        live_.clear();
+        liveRanges_.clear();
+        liveCount_ = 0;
         dirty_ = false;
         publishPoolSize_ = 0;
         publishLiveCount_ = 0;
@@ -132,7 +133,8 @@ public:
         const GpuGaussianData* data = nullptr;
         uint32_t count = 0;
         uint32_t poolSize = 0;
-        const uint32_t* liveIndices = nullptr;
+        const uint32_t* liveRanges = nullptr;
+        uint32_t liveRangeCount = 0;
         const uint32_t* dirtyRanges = nullptr;
         uint32_t dirtyRangeCount = 0;
     };
@@ -148,7 +150,8 @@ public:
         result.data = buffers_[publishedBuffer_].data();
         result.count = publishCount_;
         result.poolSize = publishPoolSize_;
-        result.liveIndices = live_.empty() ? nullptr : live_.data();
+        result.liveRanges = liveRanges_.empty() ? nullptr : liveRanges_.data();
+        result.liveRangeCount = (uint32_t)(liveRanges_.size() / 2);
         result.dirtyRanges = dirtyRanges_.empty() ? nullptr : dirtyRanges_.data();
         result.dirtyRangeCount = (uint32_t)(dirtyRanges_.size() / 2);
         return result.count > 0;
@@ -492,11 +495,14 @@ private:
     // is untouched, so nothing "shrinks" and nothing is rebuilt globally.
     void BuildView(const Camera& cam, bool /*force*/)
     {
+        const auto buildBegin = std::chrono::steady_clock::now();
         if (previousLevels_.size() != scene_.leaves.size()) {
             previousLevels_.assign(scene_.leaves.size(), (int8_t)-1);
         }
         Selection sel;
+        const auto tSel0 = std::chrono::steady_clock::now();
         SelectVisible(scene_, cam.view, cam.proj, cam.camPos, budget_, previousLevels_.data(), sel);
+        const auto tSel1 = std::chrono::steady_clock::now();
 
         // If the selection did not change and no tile arrived, there is nothing to
         // do. Rebuilding the live list (~1M entries) and republishing on every
@@ -538,6 +544,10 @@ private:
             writeIndex_ = 0;
         }
         ++buildId_;
+        selectedLeaves_.clear();
+        for (const auto& item : sel.items) {
+            selectedLeaves_.insert(item.leaf);
+        }
         dirtyRanges_.clear();
         uint32_t skippedNoTile = 0;
         uint32_t replaced = 0;
@@ -584,8 +594,16 @@ private:
                 if (entry.count > slice.count) {
                     FreeBlock(entry.start + slice.count, entry.count - slice.count);
                 }
-            } else if (!AllocBlock(slice.count, start, sel)) {
-                continue;  // pool exhausted and nothing evictable
+            } else {
+                // Growing: release the old block first so the pool only needs the
+                // larger of the two sizes at any time.
+                if (entry.count > 0 && entry.start + entry.count <= poolTop_) {
+                    FreeBlock(entry.start, entry.count);
+                    entry = Entry {};
+                }
+                if (!AllocBlock(slice.count, start)) {
+                    continue;  // pool exhausted and nothing evictable
+                }
             }
 
             std::memcpy(&buffers_[writeIndex_][start], &tile->data[slice.offset],
@@ -603,9 +621,15 @@ private:
             }
         }
 
+        const auto tBlocks = std::chrono::steady_clock::now();
+
         // Live list = the gaussians of the selected leaves only (no duplicates).
-        live_.clear();
-        live_.reserve(sel.items.size() * 64u);
+        // Live set as ranges (one pair per selected leaf): publishing a per-gaussian
+        // index list cost tens of milliseconds per rebuild plus a 4 MB copy per
+        // publish, which starved everything else.
+        liveRanges_.clear();
+        liveRanges_.reserve(sel.items.size() * 2u);
+        uint32_t liveTotal = 0;
         for (const auto& it : sel.items) {
             auto found = leafEntry_.find(it.leaf);
             if (found == leafEntry_.end()) {
@@ -615,55 +639,58 @@ private:
             if (e.count == 0 || e.start + e.count > poolTop_) {
                 continue;
             }
-            for (uint32_t i = 0; i < e.count; i++) {
-                live_.push_back(e.start + i);
-            }
+            liveRanges_.push_back(e.start);
+            liveRanges_.push_back(e.count);
+            liveTotal += e.count;
         }
+        liveCount_ = liveTotal;
 
         for (const auto& it : sel.items) {
             previousLevels_[it.leaf] = (int8_t)it.level;
         }
 
+        const auto tLive = std::chrono::steady_clock::now();
+
         // The live *content* can change without changing the count (leaves enter /
         // leave the frustum), so compare a hash of the selection as well.
-        uint64_t hash = 1469598103934665603ull ^ (uint64_t)live_.size();
+        uint64_t hash = 1469598103934665603ull ^ (uint64_t)liveCount_;
         for (const auto& it : sel.items) {
             hash = (hash ^ ((uint64_t)it.leaf * 16u + (uint64_t)it.level)) * 1099511628211ull;
         }
         lastLiveHash_ = hash;
-        const bool liveChanged = live_.size() != publishLiveCount_ || hash != publishLiveHash_;
+        const bool liveChanged = liveCount_ != publishLiveCount_ || hash != publishLiveHash_;
         if (dirtyRanges_.empty() && !liveChanged) {
             return;
         }
         Publish();
+        const double buildMs = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - buildBegin).count();
+        auto msBetween = [](std::chrono::steady_clock::time_point a,
+                             std::chrono::steady_clock::time_point b) {
+            return std::chrono::duration<double, std::milli>(b - a).count();
+        };
         LOGI("LOD: set %{public}zu live gaussians (pool %{public}u, %{public}u dirty ranges, "
-             "%{public}u new blocks, no-tile %{public}u) gen 0x%{public}x",
-            live_.size(), poolTop_, (unsigned)(dirtyRanges_.size() / 2), replaced, skippedNoTile,
+             "%{public}u new blocks, no-tile %{public}u, %{public}.0f ms = sel %{public}.0f + "
+             "blocks %{public}.0f + live %{public}.0f) gen 0x%{public}x",
+            (size_t)liveCount_, poolTop_, (unsigned)(dirtyRanges_.size() / 2), replaced, skippedNoTile,
+            buildMs, msBetween(tSel0, tSel1), msBetween(tSel1, tBlocks), msBetween(tBlocks, tLive),
             publishGeneration_);
     }
 
     // First-fit block allocation from the free list, then from the bump pointer.
-    bool AllocBlock(uint32_t count, uint32_t& start, const Selection& sel)
+    bool AllocBlock(uint32_t count, uint32_t& start)
     {
         if (TryAlloc(count, start)) {
             return true;
         }
-        // Pool exhausted: release blocks that are not part of this selection, least
-        // recently used first, until the request fits.
+        // Pool exhausted: release blocks that are not part of this selection,
+        // least recently used first. Membership is a hash set (building it inside
+        // the victim search made every allocation O(entries * selection) and
+        // effectively froze the streamer once the pool filled up).
         while (true) {
             auto victim = leafEntry_.end();
             for (auto it = leafEntry_.begin(); it != leafEntry_.end(); ++it) {
-                if (it->second.count == 0) {
-                    continue;
-                }
-                bool inSelection = false;
-                for (const auto& item : sel.items) {
-                    if (item.leaf == it->first) {
-                        inSelection = true;
-                        break;
-                    }
-                }
-                if (inSelection) {
+                if (it->second.count == 0 || selectedLeaves_.count(it->first) != 0) {
                     continue;
                 }
                 if (victim == leafEntry_.end() || it->second.lastUse < victim->second.lastUse) {
@@ -729,9 +756,9 @@ private:
         std::lock_guard<std::mutex> lock(mutex_);
         writeIndex_ = (writeIndex_ < 0) ? 0 : writeIndex_;
         publishedBuffer_ = writeIndex_;
-        publishCount_ = (uint32_t)live_.size();
+        publishCount_ = liveCount_;
         publishPoolSize_ = poolTop_;
-        publishLiveCount_ = (uint32_t)live_.size();
+        publishLiveCount_ = liveCount_;
         publishLiveHash_ = lastLiveHash_;
         publishUploadStart_ = 0;
         ++publishGeneration_;
@@ -773,7 +800,9 @@ private:
     std::vector<Block> freeBlocks_;
     uint32_t poolTop_ = 0;
     std::vector<uint32_t> dirtyRanges_;  // (start, count) pairs
-    std::vector<uint32_t> live_;   // pool indices of the drawn set
+    std::vector<uint32_t> liveRanges_;  // (start, count) pairs of the drawn set
+    uint32_t liveCount_ = 0;
+    std::unordered_set<uint32_t> selectedLeaves_;
     uint64_t buildId_ = 0;
     uint64_t lastBuiltHash_ = 0;
     uint64_t lastBuildMs_ = 0;

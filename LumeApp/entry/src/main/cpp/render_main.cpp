@@ -1170,7 +1170,8 @@ static void ReleaseSplatModel()
     g_gaussianSplatCount = 0;
     g_gaussianSplatCapacity = 0;
     g_gaussianPoolSize = 0;
-    g_gaussianLiveIndices = nullptr;
+    g_gaussianLiveRanges = nullptr;
+    g_gaussianLiveRangeCount = 0;
     g_gaussianDirtyRanges = nullptr;
     g_gaussianDirtyRangeCount = 0;
     ++g_gaussianSplatGeneration;
@@ -1292,7 +1293,8 @@ void LoadSplatModel()
     g_gaussianSplatCount = g_lume.splatData.gaussianCount;
     g_gaussianSplatCapacity = g_lume.splatData.gaussianCount;
     g_gaussianPoolSize = g_lume.splatData.gaussianCount;
-    g_gaussianLiveIndices = nullptr;  // identity
+    g_gaussianLiveRanges = nullptr;
+    g_gaussianLiveRangeCount = 0;
     g_gaussianDirtyRanges = nullptr;  // full upload
     g_gaussianDirtyRangeCount = 0;
     g_gaussianShData = g_lume.splatData.sh.empty() ? nullptr : g_lume.splatData.sh.data();
@@ -1362,7 +1364,8 @@ void DrawFrame()
             g_gaussianShData = nullptr;
             g_gaussianDataReady = true;
             g_gaussianPoolSize = lod.poolSize;
-            g_gaussianLiveIndices = lod.liveIndices;
+            g_gaussianLiveRanges = lod.liveRanges;
+            g_gaussianLiveRangeCount = lod.liveRangeCount;
             g_gaussianDirtyRanges = lod.dirtyRanges;
             g_gaussianDirtyRangeCount = lod.dirtyRangeCount;
             ++g_gaussianSplatGeneration;

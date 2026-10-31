@@ -62,7 +62,8 @@ struct SharedPtrs {
     uint32_t* uploadStartPtr = nullptr;
     float* backgroundPtr = nullptr;
     uint32_t* poolSizePtr = nullptr;
-    const uint32_t** liveIndicesPtr = nullptr;
+    const uint32_t** liveRangesPtr = nullptr;
+    uint32_t* liveRangeCountPtr = nullptr;
     const uint32_t** dirtyRangesPtr = nullptr;
     uint32_t* dirtyRangeCountPtr = nullptr;
     bool resolved = false;
@@ -84,7 +85,8 @@ struct SharedPtrs {
             uploadStartPtr = (uint32_t*)dlsym(h, "g_gaussianSplatUploadStart");
             backgroundPtr = (float*)dlsym(h, "g_gaussianBackground");
             poolSizePtr = (uint32_t*)dlsym(h, "g_gaussianPoolSize");
-            liveIndicesPtr = (const uint32_t**)dlsym(h, "g_gaussianLiveIndices");
+            liveRangesPtr = (const uint32_t**)dlsym(h, "g_gaussianLiveRanges");
+            liveRangeCountPtr = (uint32_t*)dlsym(h, "g_gaussianLiveRangeCount");
             dirtyRangesPtr = (const uint32_t**)dlsym(h, "g_gaussianDirtyRanges");
             dirtyRangeCountPtr = (uint32_t*)dlsym(h, "g_gaussianDirtyRangeCount");
         }
@@ -101,7 +103,8 @@ struct SharedPtrs {
     uint32_t UploadStart() const { return uploadStartPtr ? *uploadStartPtr : 0u; }
     const float* Background() const { return backgroundPtr; }
     uint32_t PoolSize() const { return poolSizePtr ? *poolSizePtr : 0u; }
-    const uint32_t* LiveIndices() const { return liveIndicesPtr ? *liveIndicesPtr : nullptr; }
+    const uint32_t* LiveRanges() const { return liveRangesPtr ? *liveRangesPtr : nullptr; }
+    uint32_t LiveRangeCount() const { return liveRangeCountPtr ? *liveRangeCountPtr : 0u; }
     const uint32_t* DirtyRanges() const { return dirtyRangesPtr ? *dirtyRangesPtr : nullptr; }
     uint32_t DirtyRangeCount() const { return dirtyRangeCountPtr ? *dirtyRangeCountPtr : 0u; }
     void MarkUploaded(uint32_t generation) const
@@ -280,9 +283,10 @@ struct SortTiming {
 
 // Frustum + size cull and back-to-front bucket sort. Returns the visible count
 // and writes the order into `out` (which must hold `count` entries).
-uint32_t ComputeSort(const float* records, const uint32_t count, const uint32_t* liveIndices,
-    SortScratch& s, uint32_t* out, const float* vm, const float* pm, const float viewportHeight,
-    const float nearZ, const float farZ, const bool parallel, SortTiming* timing)
+uint32_t ComputeSort(const float* records, const uint32_t count, const uint32_t* liveRanges,
+    const uint32_t liveRangeCount, SortScratch& s, uint32_t* out, const float* vm, const float* pm,
+    const float viewportHeight, const float nearZ, const float farZ, const bool parallel,
+    SortTiming* timing)
 {
     const auto sortBegin = std::chrono::steady_clock::now();
     auto ms = [](std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b) {
@@ -325,8 +329,27 @@ uint32_t ComputeSort(const float* records, const uint32_t count, const uint32_t*
         float* keys = s.keys.data() + begin;
         uint32_t visible = 0;
         float zmin = 1e30f, zmax = -1e30f;
-        for (uint32_t i = begin; i < finish; i++) {
-            const uint32_t poolIndex = liveIndices ? liveIndices[i] : i;
+        // Walk the live ranges and clip each to this task's [begin, finish) slice
+        // of the live list. Without a range list the pool is assumed dense.
+        const uint32_t rangeCount = liveRanges ? liveRangeCount : 1u;
+        uint32_t rangeCursor = 0;
+        for (uint32_t r = 0; r < rangeCount; r++) {
+            uint32_t rs = 0;
+            uint32_t rn = count;
+            if (liveRanges) {
+                rs = liveRanges[r * 2];
+                rn = liveRanges[r * 2 + 1];
+            }
+            // The ranges are ordered by live index, so track the live offset.
+            const uint32_t liveStart = rangeCursor;
+            rangeCursor += rn;
+            if (rangeCursor <= begin || liveStart >= finish) {
+                continue;
+            }
+            const uint32_t skip = begin > liveStart ? (begin - liveStart) : 0u;
+            const uint32_t endInRange = std::min(rn, finish - liveStart);
+            for (uint32_t k = skip; k < endInRange; k++) {
+                const uint32_t poolIndex = rs + k;
             const float* rec = records + (size_t)poolIndex * 4u;
             const float px = rec[0], py = rec[1], pz = rec[2];
             const float vz = f0*px + f1*py + f2*pz + t2;
@@ -340,11 +363,12 @@ uint32_t ComputeSort(const float* records, const uint32_t count, const uint32_t*
             if (fabsf(vy) > z * tanY + wr) continue;
             // Projected 2*sqrt(2)*sigma extent below 2 px (minPixelSize=2.0)
             if (focalY * ms_ * 2.83f / z < 2.0f) continue;
-            ids[visible] = poolIndex;
-            keys[visible] = z;
-            visible++;
-            if (z < zmin) zmin = z;
-            if (z > zmax) zmax = z;
+                ids[visible] = poolIndex;
+                keys[visible] = z;
+                visible++;
+                if (z < zmin) zmin = z;
+                if (z > zmax) zmax = z;
+            }
         }
         s.taskVisible[t] = visible;
         s.taskZMin[t] = zmin;
@@ -493,7 +517,8 @@ struct RenderNodeGaussianSplatting::SortState {
     uint64_t finishedId = 0;
     const float* records = nullptr;
     uint32_t count = 0;
-    std::vector<uint32_t> liveIndices;  // copy: the app may rewrite its list
+    std::vector<uint32_t> liveRanges;   // copy of (start, count) pairs
+    uint32_t liveRangeCount = 0;
     float view[16] = {};
     float proj[16] = {};
     float viewportHeight = 0.0f;
@@ -572,9 +597,9 @@ void RenderNodeGaussianSplatting::ensureSortThread()
             // the render thread under the mutex after publication.
             state.result.resize(count);
             SortTiming timing;
-            const uint32_t visible = ComputeSort(records, count, state.liveIndices.data(),
-                state.scratch, state.result.data(), view, proj, viewportHeight, nearZ, farZ, true,
-                &timing);
+            const uint32_t visible = ComputeSort(records, count, state.liveRanges.data(),
+                state.liveRangeCount, state.scratch, state.result.data(), view, proj, viewportHeight,
+                nearZ, farZ, true, &timing);
 
             {
                 std::lock_guard<std::mutex> lock(state.mutex);
@@ -1236,10 +1261,11 @@ void RenderNodeGaussianSplatting::ExecuteFrame(IRenderCommandList& cmdList)
                     SortTiming timing;
                     const float nearZ = clipNear;
                     const float farZ = clipFar;
-                    const uint32_t* live = g_sp.LiveIndices();
-                    sortState_->appliedCount = ComputeSort(cullRecords_.data(), gaussianCount_, live,
-                        sortState_->inlineScratch, sortState_->applied.data(), vm, pm, (float)height,
-                        nearZ, farZ, false, &timing);
+                    const uint32_t* ranges = g_sp.LiveRanges();
+                    const uint32_t rangeCount = g_sp.LiveRangeCount();
+                    sortState_->appliedCount = ComputeSort(cullRecords_.data(), gaussianCount_, ranges,
+                        rangeCount, sortState_->inlineScratch, sortState_->applied.data(), vm, pm,
+                        (float)height, nearZ, farZ, false, &timing);
                     sortState_->hasApplied = true;
                     visibleCount_ = sortState_->appliedCount;
                     sortBufferUploaded_ = true;
@@ -1257,11 +1283,14 @@ void RenderNodeGaussianSplatting::ExecuteFrame(IRenderCommandList& cmdList)
                         sortState_->farZ = clipFar;
                         sortState_->records = cullRecords_.data();
                         sortState_->count = gaussianCount_;
-                        const uint32_t* live = g_sp.LiveIndices();
-                        if (live) {
-                            sortState_->liveIndices.assign(live, live + gaussianCount_);
+                        const uint32_t* ranges = g_sp.LiveRanges();
+                        const uint32_t rangeCount = g_sp.LiveRangeCount();
+                        if (ranges && rangeCount > 0) {
+                            sortState_->liveRanges.assign(ranges, ranges + rangeCount * 2u);
+                            sortState_->liveRangeCount = rangeCount;
                         } else {
-                            sortState_->liveIndices.clear();
+                            sortState_->liveRanges.clear();
+                            sortState_->liveRangeCount = 0;
                         }
                         sortState_->requestPending = true;
                         ++sortState_->requestId;
