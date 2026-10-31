@@ -111,7 +111,7 @@ Linux OHOS 产品化构建示例（从提供该脚本的完整产品源码根，
 | Surface、SurfaceBuffer、Swapchain、TextureLayer、offscreen、camera preview | `platform-adapter-binding.md`、`3d_widget_adapter/AGENTS.md`、`3d_scene_adapter/AGENTS.md` |
 | ECS、component manager、system graph、glTF、animation、material | `Lume3D.md`、`Lume_3D/AGENTS.md`、`LumeEngine/AGENTS.md` |
 | RenderNode、RenderDataStore、GPU resource、shader、SPIR-V、ROFS、plugin UID | `render-resource-plugin-pipeline.md`、`LumeRender/AGENTS.md`、`lume/AGENTS.md` |
-| 3DGS、gaussian splat、splat、PLY、泼溅、splat 排序、splat 颜色、演示模型资产 | `3dgs-rendering-integration.md`、`3dgs-demo-assets.md`、`3dgs-demo-summary.md`、`LumeRender/AGENTS.md` |
+| 3DGS、gaussian splat、splat、PLY、泼溅、splat 排序、splat 颜色、演示模型资产、大场景 LOD | `3dgs-rendering-integration.md`、`3dgs-demo-assets.md`、`3dgs-demo-summary.md`、`3dgs-lod-status.md`、`LumeRender/AGENTS.md` |
 | fuzz、XTS、真实设备、测试目标、构建命令 | `build-test-validation.md` |
 
 ## 项目约束
