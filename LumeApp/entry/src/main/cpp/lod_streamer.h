@@ -510,7 +510,13 @@ private:
                 std::chrono::steady_clock::now().time_since_epoch()).count();
             const bool changed = (h != lastBuiltHash_);
             const bool throttled = !dirty_ && (nowMs - lastBuildMs_ < 150u);
-            if (!changed || throttled) {
+            // Never skip while a tile just landed: the *selection* (which leaves
+            // and levels) does not change when a tile finishes decoding, so a hash
+            // check alone would decode tiles and never use them.
+            if (!changed && !dirty_) {
+                return;
+            }
+            if (throttled && !dirty_) {
                 return;
             }
             lastBuiltHash_ = h;
