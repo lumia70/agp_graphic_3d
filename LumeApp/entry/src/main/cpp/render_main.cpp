@@ -886,9 +886,12 @@ static const DemoModelConfig kDemoModels[] = {
     { "", 60.0f, 0.0f, 0.0f, false, {}, {}, {}, {}, 0.0f, 0.0f, "lod/syp_uav_0611" },
 };
 static constexpr int kDemoModelCount = (int)(sizeof(kDemoModels) / sizeof(kDemoModels[0]));
-static int g_modelIndex = 3;  // doll.glb by default (must track kDemoModels order)
+static int g_modelIndex = 4;  // LOD scene by default (must track kDemoModels order)
 static int g_pendingModelIndex = -1;  // set from ArkTS, applied on the render thread
 static int g_pendingCameraMode = -1;  // -1 = use the model default, 0 = orbit, 1 = first person
+// LOD splat budget, switchable from ArkTS (dropdown) and remembered across model
+// switches: 1.5M is the densest, 900k is the default that keeps the UI responsive.
+static std::atomic<uint32_t> g_lodBudgetPreference { 900000 };
 
 // Robust framing statistics. Raw bounds are misleading: a few outlier
 // gaussians (room walls, an environment sphere) can stretch them far beyond
@@ -1038,7 +1041,7 @@ void LoadLodScene(const DemoModelConfig& cfg)
     // The scene asks for 1M splats, which leaves large parts of an aerial view at
     // the coarsest band. 1.5M costs a bit of fill rate but noticeably raises the
     // average density.
-    const uint32_t lodBudget = 1500000u;
+    const uint32_t lodBudget = g_lodBudgetPreference.load();
     if (!g_lodStreamer.Start(dir, lodBudget, 0)) {
         LOGE("LOD scene failed to start");
         return;
@@ -1630,14 +1633,6 @@ void DispatchTouchEvent(OH_NativeXComponent* component, void* window)
                 nowMs - g_orbitCam.lastTapTimeMs < 350.0 &&
                 dx*dx + dy*dy < 1600.0f) {
                 if (g_orbitCam.firstPerson) {
-                    // Double-tap in first person cycles the LOD budget so the
-                    // frame-time / density trade-off can be judged on device.
-                    static uint32_t stage = 0;
-                    static const uint32_t kBudgets[3] = { 1500000u, 900000u, 600000u };
-                    if (g_lodActive) {
-                        stage = (stage + 1) % 3;
-                        g_lodStreamer.SetBudget(kBudgets[stage]);
-                    }
                     g_orbitCam.lastTapTimeMs = 0.0;
                 } else if (g_orbitCam.insideView) {
                     g_orbitCam.distance = g_orbitCam.farDistance;
@@ -1719,6 +1714,23 @@ static napi_value NapiSetCameraMode(napi_env env, napi_callback_info info)
     return nullptr;
 }
 
+static napi_value NapiSetLodBudget(napi_env env, napi_callback_info info)
+{
+    size_t argc = 1;
+    napi_value args[1] = { nullptr };
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    int32_t value = 0;
+    if (argc >= 1 && args[0] != nullptr && napi_get_value_int32(env, args[0], &value) == napi_ok &&
+        value > 0) {
+        g_lodBudgetPreference.store((uint32_t)value);
+        if (g_lodActive) {
+            g_lodStreamer.SetBudget((uint32_t)value);
+        }
+        LOGI("setLodBudget: %{public}d", value);
+    }
+    return nullptr;
+}
+
 static napi_value NapiSetModel(napi_env env, napi_callback_info info)
 {
     size_t argc = 1;
@@ -1776,6 +1788,7 @@ static napi_value Init(napi_env env, napi_value exports)
         {"drawFrame", nullptr, NapiDrawFrame, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"setModel", nullptr, NapiSetModel, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"setCameraMode", nullptr, NapiSetCameraMode, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"setLodBudget", nullptr, NapiSetLodBudget, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"initResourceManager", nullptr, NapiInitResourceManager, nullptr, nullptr, nullptr, napi_default, nullptr},
     };
     napi_define_properties(env, exports, sizeof(desc) / sizeof(desc[0]), desc);
