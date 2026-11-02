@@ -39,7 +39,7 @@ namespace lod {
 // -DLOD_DIAG_ENABLED=1 or by flipping the value below; logs one "LODDIAG:" line
 // per published build with level transitions, block churn and per-leaf repeats.
 #ifndef LOD_DIAG_ENABLED
-#define LOD_DIAG_ENABLED 1
+#define LOD_DIAG_ENABLED 0
 #endif
 
 // Motion handling (plan A). While the camera moves, a leaf that is already drawn

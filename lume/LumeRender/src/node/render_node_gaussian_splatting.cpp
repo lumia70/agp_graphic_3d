@@ -1618,22 +1618,18 @@ void RenderNodeGaussianSplatting::ExecuteFrame(IRenderCommandList& cmdList)
                     execMs, upMs, gaussianCount_, g_sp.DirtyRangeCount());
             }
         }
-#if (RENDER_DEV_ENABLED == 1)
         execSumMs_ += execMs;
         if (execMs > execMaxMs_) {
             execMaxMs_ = execMs;
         }
-        if (++execCount_ >= 60u) {
+        if (++execCount_ >= 120u) {
             const float avg = execSumMs_ / (float)execCount_;
-            PLUGIN_LOG_I("GS::ExecuteFrame cost: avg %.2f ms, max %.2f ms over %u frames (sort avg %.1f ms)",
-                avg, execMaxMs_, execCount_, lastSortMs_);
+            PLUGIN_LOG_I("GS: frame avg %.1f ms, max %.1f ms over %u frames (%u/%u visible)",
+                avg, execMaxMs_, execCount_, visibleCount_, gaussianCount_);
             execSumMs_ = 0.0f;
             execMaxMs_ = 0.0f;
             execCount_ = 0;
         }
-#else
-        (void)execMs;
-#endif
     }
 
     if (frameCount_ < 3 || (frameCount_ % 300 == 0)) {
