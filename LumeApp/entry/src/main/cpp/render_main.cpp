@@ -1633,15 +1633,6 @@ void DispatchTouchEvent(OH_NativeXComponent* component, void* window)
                 nowMs - g_orbitCam.lastTapTimeMs < 350.0 &&
                 dx*dx + dy*dy < 1600.0f) {
                 if (g_orbitCam.firstPerson) {
-                    // Hidden dev aid: double-tap cycles the LOD budget (the UI
-                    // dropdown is the user-facing control).
-                    static uint32_t stage = 1;
-                    static const uint32_t kBudgets[3] = { 1500000u, 900000u, 600000u };
-                    if (g_lodActive) {
-                        stage = (stage + 1) % 3;
-                        g_lodBudgetPreference.store(kBudgets[stage]);
-                        g_lodStreamer.SetBudget(kBudgets[stage]);
-                    }
                     g_orbitCam.lastTapTimeMs = 0.0;
                 } else if (g_orbitCam.insideView) {
                     g_orbitCam.distance = g_orbitCam.farDistance;
