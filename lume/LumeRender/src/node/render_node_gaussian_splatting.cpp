@@ -820,7 +820,8 @@ void RenderNodeGaussianSplatting::InitNode(IRenderNodeContextManager& mgr)
     // ---- 5. Set up custom graphics state (alpha blending, no depth test) ----
     {
         graphicsState_ = {};
-        graphicsState_.inputAssembly.primitiveTopology = PrimitiveTopology::CORE_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+        // 4-vertex quads drawn as a triangle strip (see gaussian_render.vert).
+        graphicsState_.inputAssembly.primitiveTopology = PrimitiveTopology::CORE_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
         graphicsState_.inputAssembly.enablePrimitiveRestart = false;
         graphicsState_.rasterizationState.polygonMode = PolygonMode::CORE_POLYGON_MODE_FILL;
         graphicsState_.rasterizationState.cullModeFlags = CullModeFlagBits::CORE_CULL_MODE_NONE;
@@ -1533,7 +1534,7 @@ void RenderNodeGaussianSplatting::ExecuteFrame(IRenderCommandList& cmdList)
         // One instanced quad per gaussian: the vertex shader reads the sorted index
         // with gl_InstanceIndex. Drawing visibleCount*6 vertices re-ran the whole
         // projection six times per gaussian and was the frame's main cost.
-        cmdList.Draw(6u, visibleCount_, 0u, 0u);
+        cmdList.Draw(4u, visibleCount_, 0u, 0u);
         cmdList.EndRenderPass();
     } else {
         // Nothing visible — clear the offscreen with the scene background (the LOD

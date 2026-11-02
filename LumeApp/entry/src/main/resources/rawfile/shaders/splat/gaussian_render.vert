@@ -49,9 +49,12 @@ layout(location = 0) out vec4 vColor;
 layout(location = 1) out vec2 vOffset;
 layout(location = 2) out float vOpacity;
 
-const vec2 QUAD_OFFSETS[6] = vec2[6](
-    vec2(-1.0, -1.0), vec2( 1.0, -1.0), vec2( 1.0,  1.0),
-    vec2(-1.0, -1.0), vec2( 1.0,  1.0), vec2(-1.0,  1.0)
+// Triangle strip: 4 vertices per splat instead of 6. The vertex shader does the
+// full 3D covariance projection, so drawing a two-triangle list ran it six times
+// per gaussian: the single biggest per-frame cost on the LOD scene.
+const vec2 QUAD_OFFSETS[4] = vec2[4](
+    vec2(-1.0, -1.0), vec2( 1.0, -1.0),
+    vec2(-1.0,  1.0), vec2( 1.0,  1.0)
 );
 
 const float SH_C1 = 0.4886025119029199;
@@ -140,7 +143,7 @@ void main() {
         return;
     }
 
-    uint cornerIdx = uint(gl_VertexIndex) % 6u;
+    uint cornerIdx = uint(gl_VertexIndex) & 3u;
 
     Gaussian g = gaussians[gaussianIdx];
 
