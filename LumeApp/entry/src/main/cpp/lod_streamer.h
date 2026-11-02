@@ -95,18 +95,18 @@ public:
         if (!scene_.Load(sceneDir)) {
             return false;
         }
-        budget_ = budget ? budget : scene_.maxRenderCount;
+        budget_.store(budget ? budget : scene_.maxRenderCount);
         // The two assembly buffers already take 2 * capacity * 64 B; keep the decoded
         // tile cache below the scene's own suggestion to stay around 500 MB RSS.
         cacheBudget_ = cacheBudget ? cacheBudget
                                    : std::min<uint32_t>(scene_.cacheCount ? scene_.cacheCount : 5000000u,
                                          5000000u);
-        if (budget_ > 4000000u) {
-            budget_ = 4000000u;
+        if (budget_.load() > 4000000u) {
+            budget_.store(4000000u);
         }
         // The buffer keeps stale entries around while moving (append-only), so it
         // has headroom over the per-frame selection budget.
-        capacity_ = (budget_ * 4u) / 3u;  // pool slack without doubling the memory
+        capacity_ = (budget_.load() * 4u) / 3u;  // pool slack without doubling the memory
         // Appends add duplicates (a leaf at a new level), so the buffer grows over
         // a session. Past this we stop appending instead of compacting: a
         // compaction shrinks the drawn set, which reads as a "coarse flash".
@@ -159,7 +159,7 @@ public:
         lastDecodeMs_.assign(scene_.files.size(), 0);
         stopped_ = false;
         worker_ = std::thread([this] { Loop(); });
-        LOGI("LOD streamer: budget %{public}u, cache %{public}u", budget_, cacheBudget_);
+        LOGI("LOD streamer: budget %{public}u, cache %{public}u", budget_.load(), cacheBudget_);
         return true;
     }
 
@@ -221,7 +221,20 @@ public:
         return result.count > 0;
     }
 
-    uint32_t Budget() const { return budget_; }
+    uint32_t Budget() const { return budget_.load(); }
+    // Runtime budget switch (used to compare frame time vs density on device).
+    // The pool capacity stays as allocated, so no GPU buffers are recreated.
+    void SetBudget(uint32_t gaussians)
+    {
+        if (gaussians == 0) {
+            return;
+        }
+        budget_.store(gaussians);
+        LOGI("LOD: budget set to %{public}u", gaussians);
+        std::lock_guard<std::mutex> lock(mutex_);
+        ++requestId_;  // wake the worker so the next build uses it
+        cv_.notify_one();
+    }
     uint32_t Capacity() const { return capacity_; }
     const Scene& GetScene() const { return scene_; }
 
@@ -449,7 +462,7 @@ private:
         }
         // Decode what the renderer is about to draw: same global scale as the
         // last build (or its budget fit before the first build).
-        const float scale = (lastScale_ > 0.0f) ? lastScale_ : ChooseScale(scene_, sel, budget_);
+        const float scale = (lastScale_ > 0.0f) ? lastScale_ : ChooseScale(scene_, sel, budget_.load());
         AssignLevels(scene_, sel, scale);
 
         // View direction (camera looks along -back = -(row 2 of the view matrix)).
@@ -631,7 +644,7 @@ private:
         Selection sel;
         const auto tSel0 = std::chrono::steady_clock::now();
         CullVisible(scene_, cam.view, cam.proj, cam.camPos, sel);
-        const float fit = ChooseScale(scene_, sel, budget_);
+        const float fit = ChooseScale(scene_, sel, budget_.load());
         const bool haveScale = lastScale_ > 0.0f;
         float scale = fit;
         if (haveScale && moving) {
@@ -1218,7 +1231,7 @@ private:
     }
 
     Scene scene_;
-    uint32_t budget_ = 1000000;
+    std::atomic<uint32_t> budget_ { 1000000 };
     uint32_t capacity_ = 2000000;
     uint32_t cacheBudget_ = 3000000;
 
