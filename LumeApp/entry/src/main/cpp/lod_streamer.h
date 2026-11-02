@@ -35,6 +35,13 @@
 
 namespace lod {
 
+// Per-build LOD churn diagnostics (compiled out by default). Enable with
+// -DLOD_DIAG_ENABLED=1 or by flipping the value below; logs one "LODDIAG:" line
+// per published build with level transitions, block churn and per-leaf repeats.
+#ifndef LOD_DIAG_ENABLED
+#define LOD_DIAG_ENABLED 1
+#endif
+
 // Motion handling (plan A). While the camera moves, a leaf that is already drawn
 // never switches to a finer level: the scene then only gains *new* blocks for
 // newly visible leaves, and a decoded tile cannot replace dozens of coarse
@@ -43,8 +50,8 @@ constexpr uint64_t kMoveFreezeMs = 300;
 // Idle refinement: one global-scale step per build, and only a few leaves per
 // build, so a decoded tile refines gradually instead of in one block.
 constexpr float kRefineStep = 1.06f;  // ~1/12 octave, ~6% budget loss
-constexpr uint32_t kUpgradeLeavesPerBuild = 12;
-constexpr uint32_t kCoarsenLeavesPerBuild = 12;
+constexpr uint32_t kUpgradeLeavesPerBuild = 32;
+constexpr uint32_t kCoarsenLeavesPerBuild = 32;
 // Cross-fade (plan C). A block that replaces an older one, or a leaf that just
 // became visible, is drawn at a fraction of its opacity and ramps up, while the
 // old block ramps down; both stay in the live set until the fade ends. Replacing
@@ -115,6 +122,7 @@ public:
         for (int i = 0; i < 2; i++) {
             buffers_[i].resize(capacity_);
         }
+        churn_.assign(scene_.leaves.size(), 0);
         publishCount_ = 0;
         publishGeneration_ = 0;
         publishedBuffer_ = -1;
@@ -670,6 +678,7 @@ private:
             writeIndex_ = 0;
         }
         dirtyRanges_.clear();
+        diag_ = Diag {};
         // Advance the cross-fades one step per build. This runs before new blocks
         // are written so a block created in this build starts at the fade-in
         // opacity and steps on the next one.
@@ -777,14 +786,17 @@ private:
                 if (found != leafEntry_.end() && found->second.level >= 0) {
                     it.level = (uint8_t)found->second.level;  // frozen
                 } else {
-                    // A newly visible leaf starts at its coarsest level. Its tile
-                    // is always in the pinned base layer, so the region appears
-                    // instantly and uniformly coarse instead of popping in as a
-                    // patchwork of whatever happened to be decoded. New leaves are
-                    // NOT faded in while moving: a turn can add hundreds of blocks
-                    // and rewriting all of them for two builds is what made a drag
-                    // feel like it lagged behind the finger.
-                    it.level = (uint8_t)(leaf.levels - 1);
+                    // Newly visible leaf. If the tile for its target level is
+                    // already decoded (the wide prefetch usually has it), draw it
+                    // straight at the target: otherwise every revealed leaf has to
+                    // climb LOD3 -> target through the 12-per-build upgrade quota
+                    // after the gesture ends, which kept the view "boiling" for
+                    // seconds. Only fall back to the pinned coarsest tile when the
+                    // target is not available.
+                    const int32_t targetFile = leaf.lods[it.level].file;
+                    if (targetFile < 0 || !TileReady(targetFile)) {
+                        it.level = (uint8_t)(leaf.levels - 1);
+                    }
                 }
                 total += LeafCountAt(scene_, it.leaf, it.level);
             }
@@ -919,6 +931,19 @@ private:
             }
             if (entry.level >= 0 && entry.level != (int8_t)level) {
                 levelChanges++;
+#if LOD_DIAG_ENABLED
+                if (entry.level < 8 && level < 8) {
+                    diag_.trans[entry.level][level]++;
+                }
+                if (level > entry.level) {
+                    diag_.down++;
+                } else {
+                    diag_.up++;
+                }
+                if (it.leaf < churn_.size() && churn_[it.leaf] < 255) {
+                    churn_[it.leaf]++;
+                }
+#endif
             }
             if (!EnsureTile(slice.file, ++clock_)) {
                 continue;
@@ -1065,6 +1090,25 @@ private:
             growFailures, levelChanges, scale, upgraded, coarsened, forced, fadeSteps, deferred,
             buildMs, msBetween(tSel0, tSel1), msBetween(tSel1, tBlocks), msBetween(tBlocks, tLive),
             publishGeneration_);
+#if LOD_DIAG_ENABLED
+        diag_.fades = fadeSteps;
+        diag_.newBlocks = replaced;
+        diag_.failed = growFailures;
+        uint32_t churnMax = 0;
+        uint32_t churnLeaf = 0;
+        for (uint32_t i = 0; i < churn_.size(); i++) {
+            if (churn_[i] > churnMax) {
+                churnMax = churn_[i];
+                churnLeaf = i;
+            }
+        }
+        LOGI("LODDIAG: mv %{public}d chg %{public}u up %{public}u down %{public}u new %{public}u "
+             "free %{public}u evict %{public}u fail %{public}u fade %{public}u | leaves lv0-3 "
+             "%{public}u %{public}u %{public}u %{public}u | maxChurn %{public}u leaf %{public}u",
+            moving ? 1 : 0, levelChanges, diag_.up, diag_.down, diag_.newBlocks, diag_.freed,
+            diag_.evicted, diag_.failed, diag_.fades, sel.perLevelLeaves[0], sel.perLevelLeaves[1],
+            sel.perLevelLeaves[2], sel.perLevelLeaves[3], churnMax, churnLeaf);
+#endif
         return refining;
     }
 
@@ -1102,6 +1146,9 @@ private:
             }
             FreeBlock(it->second.start, it->second.count);
             it->second = Entry {};
+#if LOD_DIAG_ENABLED
+            diag_.evicted++;
+#endif
             if (TryAlloc(count, start)) {
                 return true;
             }
@@ -1136,6 +1183,11 @@ private:
         if (count == 0) {
             return;
         }
+#if LOD_DIAG_ENABLED
+        diag_.freed++;
+#else
+        (void)start;
+#endif
         size_t i = 0;
         while (i < freeBlocks_.size() && freeBlocks_[i].start < start) {
             i++;
@@ -1186,6 +1238,17 @@ private:
         float fade = 1.0f;  // opacity multiplier currently applied to the block
     };
 
+    struct Diag {
+        uint32_t newBlocks = 0;
+        uint32_t freed = 0;
+        uint32_t evicted = 0;
+        uint32_t failed = 0;
+        uint32_t up = 0;
+        uint32_t down = 0;
+        uint32_t fades = 0;
+        uint32_t trans[8][8] = {};
+    };
+
     struct FadeOut {
         uint32_t start = 0;
         uint32_t count = 0;
@@ -1213,6 +1276,8 @@ private:
     int writeIndex_ = -1;
     std::unordered_map<uint32_t, Entry> leafEntry_;  // leaf -> block
     std::unordered_map<uint32_t, FadeOut> fadingOut_;  // leaf -> block being cross-faded out
+    Diag diag_;
+    std::vector<uint8_t> churn_;  // per-leaf level-change count (diagnostic)
     bool fadeActive_ = false;
     std::vector<Block> freeBlocks_;
     uint32_t poolTop_ = 0;
