@@ -1130,6 +1130,7 @@ void LoadLodScene(const DemoModelConfig& cfg)
     g_orbitCam.LogState("lod-initial");
 
     // No CPU splat array: the node waits for the first streamed assembly.
+    g_gaussianPoolMode = 1;  // patches only; never rewrite the whole pool
     g_gaussianSplatData = nullptr;
     g_gaussianSplatCount = 0;
     g_gaussianSplatCapacity = g_lodStreamer.Capacity();
@@ -1292,6 +1293,7 @@ void LoadSplatModel()
     // Feed data to the RenderNode via shared globals
     static_assert(sizeof(GaussianSplatGPU) == sizeof(GpuGaussianData),
         "GaussianSplatGPU must match GpuGaussianData layout");
+    g_gaussianPoolMode = 0;  // monolithic array: 0 dirty ranges = full upload
     g_gaussianSplatData = reinterpret_cast<const GpuGaussianData*>(g_lume.splatData.gaussians.data());
     g_gaussianSplatCount = g_lume.splatData.gaussianCount;
     g_gaussianSplatCapacity = g_lume.splatData.gaussianCount;

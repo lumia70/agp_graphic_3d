@@ -11,6 +11,7 @@ __attribute__((visibility("default"))) uint32_t g_gaussianSplatCapacity = 0;
 __attribute__((visibility("default"))) uint32_t g_gaussianSplatGeneration = 0;
 __attribute__((visibility("default"))) uint32_t g_gaussianSplatUploadStart = 0;
 __attribute__((visibility("default"))) uint32_t g_gaussianPoolSize = 0;
+__attribute__((visibility("default"))) uint32_t g_gaussianPoolMode = 0;
 __attribute__((visibility("default"))) const uint32_t* g_gaussianLiveRanges = nullptr;
 __attribute__((visibility("default"))) uint32_t g_gaussianLiveRangeCount = 0;
 __attribute__((visibility("default"))) const uint32_t* g_gaussianDirtyRanges = nullptr;

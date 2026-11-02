@@ -100,6 +100,15 @@ private:
     float lastDirX_ = 0.f, lastDirY_ = 0.f, lastDirZ_ = -1.f;
     float lastEyeX_ = 0.f, lastEyeY_ = 0.f, lastEyeZ_ = 0.f;
     bool sortBufferUploaded_ = false;
+    // The drawn order (and the sort index buffer contents) only change when a
+    // sort is adopted; per-slot versions skip the ~5 MB/frame re-upload.
+    uint32_t orderVersion_ = 0;
+    uint32_t slotOrderVersion_[FRAME_SLOTS] = { 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu };
+    // Pool mode: a patch bumps the epoch; the async sort result carries it so a
+    // result computed from an older pool snapshot is discarded instead of being
+    // applied to slots that now hold different gaussians.
+    uint32_t dataEpoch_ = 0;
+    uint32_t appliedEpoch_ = 0;
     // Baseline instrumentation: cull+sort cost in milliseconds (logged every
     // kSortLogInterval re-sorts so the numbers stay readable in hilog).
     float lastSortMs_ = 0.0f;

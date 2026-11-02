@@ -66,6 +66,7 @@ struct SharedPtrs {
     uint32_t* liveRangeCountPtr = nullptr;
     const uint32_t** dirtyRangesPtr = nullptr;
     uint32_t* dirtyRangeCountPtr = nullptr;
+    uint32_t* poolModePtr = nullptr;
     bool resolved = false;
 
     void Resolve() {
@@ -89,6 +90,7 @@ struct SharedPtrs {
             liveRangeCountPtr = (uint32_t*)dlsym(h, "g_gaussianLiveRangeCount");
             dirtyRangesPtr = (const uint32_t**)dlsym(h, "g_gaussianDirtyRanges");
             dirtyRangeCountPtr = (uint32_t*)dlsym(h, "g_gaussianDirtyRangeCount");
+            poolModePtr = (uint32_t*)dlsym(h, "g_gaussianPoolMode");
         }
         resolved = true;
     }
@@ -107,6 +109,9 @@ struct SharedPtrs {
     uint32_t LiveRangeCount() const { return liveRangeCountPtr ? *liveRangeCountPtr : 0u; }
     const uint32_t* DirtyRanges() const { return dirtyRangesPtr ? *dirtyRangesPtr : nullptr; }
     uint32_t DirtyRangeCount() const { return dirtyRangeCountPtr ? *dirtyRangeCountPtr : 0u; }
+    // Pool/LOD mode: g_gaussianSplatData is a slot pool and the app always sends
+    // dirty ranges for changed slots, so 0 ranges means "content unchanged".
+    bool PoolMode() const { return poolModePtr && *poolModePtr != 0u; }
     void MarkUploaded(uint32_t generation) const
     {
         if (uploadedGenerationPtr) {
@@ -529,10 +534,12 @@ struct RenderNodeGaussianSplatting::SortState {
     float viewportHeight = 0.0f;
     float nearZ = 0.05f;
     float farZ = 2000.0f;
+    uint32_t epoch = 0;
 
     // Published result (guarded by mutex)
     std::vector<uint32_t> result;
     uint32_t resultCount = 0;
+    uint32_t resultEpoch = 0;
     SortTiming resultTiming;
     bool resultReady = false;
 
@@ -574,6 +581,7 @@ void RenderNodeGaussianSplatting::ensureSortThread()
             float viewportHeight = 0.0f;
             float nearZ = 0.05f;
             float farZ = 2000.0f;
+            uint32_t epoch = 0;
             uint64_t id = 0;
             {
                 std::unique_lock<std::mutex> lock(state.mutex);
@@ -592,6 +600,7 @@ void RenderNodeGaussianSplatting::ensureSortThread()
                 viewportHeight = state.viewportHeight;
                 nearZ = state.nearZ;
                 farZ = state.farZ;
+                epoch = state.epoch;
                 state.requestPending = false;
             }
 
@@ -610,6 +619,7 @@ void RenderNodeGaussianSplatting::ensureSortThread()
                 std::lock_guard<std::mutex> lock(state.mutex);
                 state.resultCount = visible;
                 state.resultTiming = timing;
+                state.resultEpoch = epoch;
                 state.resultReady = true;
                 state.finishedId = id;
             }
@@ -948,9 +958,7 @@ void RenderNodeGaussianSplatting::PreExecuteFrame()
 // ===================================================================
 void RenderNodeGaussianSplatting::ExecuteFrame(IRenderCommandList& cmdList)
 {
-#if (RENDER_DEV_ENABLED == 1)
     const auto execBegin = std::chrono::steady_clock::now();
-#endif
     if (!initialized_) return;
 
     // Data generation changed (model switch / LOD re-assembly): pick up the new
@@ -983,6 +991,9 @@ void RenderNodeGaussianSplatting::ExecuteFrame(IRenderCommandList& cmdList)
                 sortIndexBuffer_[s] = gpuResMgr.Create(name, sortDesc);
             }
             gaussianCapacity_ = newCapacity;
+            for (uint32_t s = 0; s < FRAME_SLOTS; s++) {
+                slotOrderVersion_[s] = 0xFFFFFFFFu;  // new buffers: re-upload
+            }
             if (sortState_) {
                 sortState_->hasApplied = false;
                 sortState_->scratch = SortScratch {};
@@ -993,6 +1004,7 @@ void RenderNodeGaussianSplatting::ExecuteFrame(IRenderCommandList& cmdList)
             PLUGIN_LOG_I("GS: recreated buffers for capacity %u", newCapacity);
         }
         const uint32_t pool = g_sp.PoolSize() > newCount ? g_sp.PoolSize() : newCount;
+        const bool poolMode = g_sp.PoolMode();
         const bool partialUpload = g_sp.DirtyRangeCount() > 0 && (bool)gaussianBuffer_;
         const bool needShBuffer = g_sp.Sh() != nullptr && !hasShData_;
         if (needShBuffer) {
@@ -1009,12 +1021,21 @@ void RenderNodeGaussianSplatting::ExecuteFrame(IRenderCommandList& cmdList)
         gaussianCount_ = newCount;
         poolSize_ = pool;
         hasShData_ = g_sp.Sh() != nullptr;
-        needsUpload_ = true;
-        if (partialUpload) {
-            // Only some blocks changed: the applied order still references valid
-            // pool slots, so keep drawing it and let the sort thread refresh.
+        if (poolMode) {
+            // The pool is only ever patched. A publish without dirty ranges means
+            // the drawn set changed but the slots did not: re-sort, never rewrite
+            // the entire pool (a 128 MB upload plus a ~100 ms inline sort per
+            // update, which showed up as a hitch and the occasional white frame).
+            needsUpload_ = g_sp.DirtyRangeCount() > 0;
+            sortBufferUploaded_ = false;
+            if (partialUpload) {
+                ++dataEpoch_;
+            }
+        } else if (partialUpload) {
+            needsUpload_ = true;
             sortBufferUploaded_ = false;
         } else {
+            needsUpload_ = true;
             if (sortState_) {
                 sortState_->hasApplied = false;
             }
@@ -1039,6 +1060,7 @@ void RenderNodeGaussianSplatting::ExecuteFrame(IRenderCommandList& cmdList)
     // ---- 1. Upload gaussian data ----
     // Dirty ranges (LOD block replacement) patch the buffer in place; without them
     // the whole pool is rewritten into the alternate buffer and swapped.
+    const auto tUploadBegin = std::chrono::steady_clock::now();
     if (needsUpload_ && g_sp.Ready() && gaussianBuffer_) {
         const uint32_t rangeCount = g_sp.DirtyRangeCount();
         const uint32_t* ranges = g_sp.DirtyRanges();
@@ -1123,6 +1145,7 @@ void RenderNodeGaussianSplatting::ExecuteFrame(IRenderCommandList& cmdList)
         }
         needsUpload_ = false;
     }
+    const auto tUploadEnd = std::chrono::steady_clock::now();
 
     // ---- 2. Get backbuffer and its dimensions ----
     const RenderHandle backbufferHandle = gpuResMgr.GetImageHandle("CORE_DEFAULT_BACKBUFFER");
@@ -1137,15 +1160,22 @@ void RenderNodeGaussianSplatting::ExecuteFrame(IRenderCommandList& cmdList)
     const uint32_t width = bbDesc.width;
     const uint32_t height = bbDesc.height;
 
-    // ---- 2b. Create (or recreate) UNORM offscreen target matching backbuffer size ----
+    // ---- 2b. Create (or recreate) UNORM offscreen target ----
     // Raw code-space compositing target: splats blend here exactly like the
     // web canvas (no sRGB decode/encode), then a copy pass transfers it to
     // the sRGB backbuffer with a decode that cancels the hardware encode.
-    if (!offscreenImage_ || offscreenWidth_ != width || offscreenHeight_ != height) {
+    // Half resolution was tried here: the splat pass turned out to be vertex
+    // bound (the covariance projection runs once per quad vertex, 6x per
+    // gaussian), so halving the target only softened the image without moving
+    // the frame time. Keep full resolution until the per-vertex work is cut.
+    constexpr uint32_t kOffscreenDiv = 1u;
+    const uint32_t offWidth = width / kOffscreenDiv ? width / kOffscreenDiv : 1u;
+    const uint32_t offHeight = height / kOffscreenDiv ? height / kOffscreenDiv : 1u;
+    if (!offscreenImage_ || offscreenWidth_ != offWidth || offscreenHeight_ != offHeight) {
         GpuImageDesc offDesc {};
         offDesc.format = BASE_NS::Format::BASE_FORMAT_R8G8B8A8_UNORM;
-        offDesc.width = width;
-        offDesc.height = height;
+        offDesc.width = offWidth;
+        offDesc.height = offHeight;
         offDesc.depth = 1;
         offDesc.mipCount = 1;
         offDesc.layerCount = 1;
@@ -1155,9 +1185,10 @@ void RenderNodeGaussianSplatting::ExecuteFrame(IRenderCommandList& cmdList)
         offDesc.memoryPropertyFlags = CORE_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
         offDesc.engineCreationFlags = CORE_ENGINE_IMAGE_CREATION_DYNAMIC_BARRIERS;
         offscreenImage_ = gpuResMgr.Create("GS_Offscreen", offDesc);
-        offscreenWidth_ = width;
-        offscreenHeight_ = height;
-        PLUGIN_LOG_I("GS: UNORM offscreen created %ux%u", width, height);
+        offscreenWidth_ = offWidth;
+        offscreenHeight_ = offHeight;
+        PLUGIN_LOG_I("GS: UNORM offscreen created %ux%u (backbuffer %ux%u)",
+            offWidth, offHeight, width, height);
         // Re-bind the offscreen to the copy binder (handle changed)
         if (copyBinder_) {
             BindableImage bi {};
@@ -1231,6 +1262,7 @@ void RenderNodeGaussianSplatting::ExecuteFrame(IRenderCommandList& cmdList)
         }
     }
 
+    const auto tUploadDone = std::chrono::steady_clock::now();
     // ---- 3.5 Frustum + size cull, back-to-front bucket sort ----
         // Re-sorted only when the view rotated/zoomed past a small threshold;
         // the cull pass reduces both GPU vertex load and sort work.
@@ -1264,7 +1296,7 @@ void RenderNodeGaussianSplatting::ExecuteFrame(IRenderCommandList& cmdList)
                 lastEyeX_ = ex; lastEyeY_ = ey; lastEyeZ_ = ez;
 
                 if (!sortState_->hasApplied) {
-                    // First sort for this model: run it inline so the very first
+                    // First sort for this data set: run it inline so the first
                     // frame is correctly ordered.
                     sortState_->applied.resize(gaussianCount_);
                     SortTiming timing;
@@ -1278,6 +1310,8 @@ void RenderNodeGaussianSplatting::ExecuteFrame(IRenderCommandList& cmdList)
                     sortState_->hasApplied = true;
                     visibleCount_ = sortState_->appliedCount;
                     sortBufferUploaded_ = true;
+                    appliedEpoch_ = dataEpoch_;
+                    ++orderVersion_;
                     logSortStats(timing.totalMs, timing.cullMs, timing.histMs, timing.scatterMs);
                 } else {
                     // Hand the newest camera state to the sort thread. Requests
@@ -1302,6 +1336,7 @@ void RenderNodeGaussianSplatting::ExecuteFrame(IRenderCommandList& cmdList)
                             sortState_->liveRanges.clear();
                             sortState_->liveRangeCount = 0;
                         }
+                        sortState_->epoch = dataEpoch_;
                         sortState_->requestPending = true;
                         ++sortState_->requestId;
                     }
@@ -1318,36 +1353,42 @@ void RenderNodeGaussianSplatting::ExecuteFrame(IRenderCommandList& cmdList)
                 {
                     std::lock_guard<std::mutex> lock(sortState_->mutex);
                     if (sortState_->resultReady) {
-                        sortState_->applied.assign(sortState_->result.begin(),
-                            sortState_->result.begin() + sortState_->resultCount);
-                        sortState_->appliedCount = sortState_->resultCount;
+                        if (sortState_->resultEpoch == dataEpoch_) {
+                            sortState_->applied.assign(sortState_->result.begin(),
+                                sortState_->result.begin() + sortState_->resultCount);
+                            sortState_->appliedCount = sortState_->resultCount;
+                            adopted = true;
+                            timing = sortState_->resultTiming;
+                        }
+                        // A result from before the last patch is stale: the pool
+                        // slots it references were rewritten.
                         sortState_->resultReady = false;
-                        adopted = true;
-                        timing = sortState_->resultTiming;
                     }
                 }
                 if (adopted) {
                     sortState_->hasApplied = true;
                     visibleCount_ = sortState_->appliedCount;
                     sortBufferUploaded_ = true;
+                    ++orderVersion_;
                     logSortStats(timing.totalMs, timing.cullMs, timing.histMs, timing.scatterMs);
                 }
             }
 
-            // Upload the master sort order to THIS frame's slot every frame
-            // (slots rotate; even a skipped re-sort must refresh the slot).
-            // Tail padded with 0xFFFFFFFF sentinel — shader skips those entries.
-            void* sortMapped = gpuResMgr.MapBuffer(sortIndexBuffer_[slot].GetHandle());
-            if (sortMapped) {
-                if (visibleCount_ > gaussianCount_) {
-                    visibleCount_ = 0;
+            // Upload the order to THIS frame's slot only when it changed since the
+            // slot was last filled. The draw reads exactly visibleCount_ entries,
+            // so the tail does not need padding. Re-uploading ~5 MB every frame
+            // (plus the map/unmap barrier on a big buffer) dominated ExecuteFrame
+            // and made dragging lag behind the finger.
+            if (slotOrderVersion_[slot] != orderVersion_) {
+                void* sortMapped = gpuResMgr.MapBuffer(sortIndexBuffer_[slot].GetHandle());
+                if (sortMapped) {
+                    if (visibleCount_ > 0 && sortState_ && sortState_->hasApplied) {
+                        std::memcpy(sortMapped, sortState_->applied.data(),
+                            visibleCount_ * sizeof(uint32_t));
+                    }
+                    gpuResMgr.UnmapBuffer(sortIndexBuffer_[slot].GetHandle());
+                    slotOrderVersion_[slot] = orderVersion_;
                 }
-                if (visibleCount_ > 0 && sortState_ && sortState_->hasApplied) {
-                    std::memcpy(sortMapped, sortState_->applied.data(), visibleCount_ * sizeof(uint32_t));
-                }
-                std::memset((uint8_t*)sortMapped + visibleCount_ * sizeof(uint32_t), 0xFF,
-                    (size_t)(gaussianCount_ - visibleCount_) * sizeof(uint32_t));
-                gpuResMgr.UnmapBuffer(sortIndexBuffer_[slot].GetHandle());
             }
         }
     }
@@ -1361,6 +1402,11 @@ void RenderNodeGaussianSplatting::ExecuteFrame(IRenderCommandList& cmdList)
         if (sortState_ && sortState_->hasApplied && sortState_->appliedCount > 0 &&
             sortState_->appliedCount <= gaussianCount_) {
             visibleCount_ = sortState_->appliedCount;
+        } else if (sortState_ && sortState_->hasApplied) {
+            // The applied order is up to date and empty: nothing is on screen.
+            // Drawing pool indices 0..count-1 here (as the fallback used to)
+            // renders stale LOD blocks from other regions.
+            visibleCount_ = 0;
         } else {
             visibleCount_ = gaussianCount_;
         }
@@ -1371,7 +1417,9 @@ void RenderNodeGaussianSplatting::ExecuteFrame(IRenderCommandList& cmdList)
         }
         // Upload the fallback order for this slot (the sort upload above already
         // ran with zero entries).
-        void* sortMapped = gpuResMgr.MapBuffer(sortIndexBuffer_[slot].GetHandle());
+        void* sortMapped = (visibleCount_ > 0 && slotOrderVersion_[slot] != orderVersion_)
+                               ? gpuResMgr.MapBuffer(sortIndexBuffer_[slot].GetHandle())
+                               : nullptr;
         if (sortMapped) {
             if (sortState_ && sortState_->hasApplied && sortState_->appliedCount == visibleCount_ &&
                 !sortState_->applied.empty()) {
@@ -1382,9 +1430,8 @@ void RenderNodeGaussianSplatting::ExecuteFrame(IRenderCommandList& cmdList)
                     ids[i] = i;
                 }
             }
-            std::memset((uint8_t*)sortMapped + visibleCount_ * sizeof(uint32_t), 0xFF,
-                (size_t)(gaussianCount_ - visibleCount_) * sizeof(uint32_t));
             gpuResMgr.UnmapBuffer(sortIndexBuffer_[slot].GetHandle());
+            slotOrderVersion_[slot] = orderVersion_;
         }
     }
     if (visibleCount_ == 0) {
@@ -1428,6 +1475,7 @@ void RenderNodeGaussianSplatting::ExecuteFrame(IRenderCommandList& cmdList)
     // ---- 5. PASS 1: splats -> UNORM offscreen (raw code-space compositing) ----
     // Cleared to the web background color (raw display values) — the offscreen
     // holds the fully composited splat layer, exactly like the web canvas.
+    // Copy pass viewport (backbuffer size).
     ViewportDesc vp {};
     vp.x = 0.f;
     vp.y = 0.f;
@@ -1442,6 +1490,14 @@ void RenderNodeGaussianSplatting::ExecuteFrame(IRenderCommandList& cmdList)
     sc.extentWidth = width;
     sc.extentHeight = height;
 
+    // Splat pass viewport (offscreen size).
+    ViewportDesc vpSplat = vp;
+    vpSplat.width = (float)offscreenWidth_;
+    vpSplat.height = (float)offscreenHeight_;
+    ScissorDesc scSplat = sc;
+    scSplat.extentWidth = offscreenWidth_;
+    scSplat.extentHeight = offscreenHeight_;
+
     if (visibleCount_ > 0) {
         RenderPassDesc rpDesc {};
         rpDesc.attachmentCount = 1;
@@ -1455,8 +1511,8 @@ void RenderNodeGaussianSplatting::ExecuteFrame(IRenderCommandList& cmdList)
                                               : ClearValue(0.071f, 0.047f, 0.024f, 1.0f);
         rpDesc.renderArea.offsetX = 0;
         rpDesc.renderArea.offsetY = 0;
-        rpDesc.renderArea.extentWidth = width;
-        rpDesc.renderArea.extentHeight = height;
+        rpDesc.renderArea.extentWidth = offscreenWidth_;
+        rpDesc.renderArea.extentHeight = offscreenHeight_;
         rpDesc.subpassCount = 1;
         rpDesc.subpassContents = SubpassContents::CORE_SUBPASS_CONTENTS_INLINE;
 
@@ -1470,25 +1526,30 @@ void RenderNodeGaussianSplatting::ExecuteFrame(IRenderCommandList& cmdList)
             const uint32_t firstSetIndex = pipelineDescriptorSetBinder_->GetFirstSet();
             cmdList.BindDescriptorSets(firstSetIndex, pipelineDescriptorSetBinder_->GetDescriptorSetHandles());
         }
-        cmdList.SetDynamicStateViewport(vp);
-        cmdList.SetDynamicStateScissor(sc);
+        cmdList.SetDynamicStateViewport(vpSplat);
+        cmdList.SetDynamicStateScissor(scSplat);
 
-        // Visible gaussians only (CPU frustum + size culled, sorted back-to-front)
-        const uint32_t vertexCount = visibleCount_ * 6u;
-        cmdList.Draw(vertexCount, 1u, 0u, 0u);
+        // Visible gaussians only (CPU frustum + size culled, sorted back-to-front).
+        // One instanced quad per gaussian: the vertex shader reads the sorted index
+        // with gl_InstanceIndex. Drawing visibleCount*6 vertices re-ran the whole
+        // projection six times per gaussian and was the frame's main cost.
+        cmdList.Draw(6u, visibleCount_, 0u, 0u);
         cmdList.EndRenderPass();
     } else {
-        // Nothing visible — clear the offscreen to bg directly (no splat draw)
+        // Nothing visible — clear the offscreen with the scene background (the LOD
+        // sky), not the small-model colour, and still run the copy pass.
+        const float* bg = g_sp.Background();
         RenderPassDesc rpDesc {};
         rpDesc.attachmentCount = 1;
         rpDesc.attachmentHandles[0] = offscreenImage_.GetHandle();
         rpDesc.attachments[0].loadOp = AttachmentLoadOp::CORE_ATTACHMENT_LOAD_OP_CLEAR;
         rpDesc.attachments[0].storeOp = AttachmentStoreOp::CORE_ATTACHMENT_STORE_OP_STORE;
-        rpDesc.attachments[0].clearValue = ClearValue(0.071f, 0.047f, 0.024f, 1.0f);
+        rpDesc.attachments[0].clearValue = bg ? ClearValue(bg[0], bg[1], bg[2], 1.0f)
+                                              : ClearValue(0.071f, 0.047f, 0.024f, 1.0f);
         rpDesc.renderArea.offsetX = 0;
         rpDesc.renderArea.offsetY = 0;
-        rpDesc.renderArea.extentWidth = width;
-        rpDesc.renderArea.extentHeight = height;
+        rpDesc.renderArea.extentWidth = offscreenWidth_;
+        rpDesc.renderArea.extentHeight = offscreenHeight_;
         rpDesc.subpassCount = 1;
         rpDesc.subpassContents = SubpassContents::CORE_SUBPASS_CONTENTS_INLINE;
         RenderPassSubpassDesc subpassDesc {};
@@ -1541,10 +1602,22 @@ void RenderNodeGaussianSplatting::ExecuteFrame(IRenderCommandList& cmdList)
         cmdList.EndRenderPass();
     }
 
-#if (RENDER_DEV_ENABLED == 1)
     {
         const float execMs = std::chrono::duration<float, std::milli>(
             std::chrono::steady_clock::now() - execBegin).count();
+        if (execMs > 40.0f) {
+            static uint64_t lastSlowLogMs = 0;
+            const uint64_t nowMs = (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            if (nowMs - lastSlowLogMs > 500u) {
+                lastSlowLogMs = nowMs;
+                const float upMs = std::chrono::duration<float, std::milli>(
+                    tUploadEnd - tUploadBegin).count();
+                PLUGIN_LOG_W("GS: slow ExecuteFrame %.1f ms (upload %.1f, %u live, %u ranges)",
+                    execMs, upMs, gaussianCount_, g_sp.DirtyRangeCount());
+            }
+        }
+#if (RENDER_DEV_ENABLED == 1)
         execSumMs_ += execMs;
         if (execMs > execMaxMs_) {
             execMaxMs_ = execMs;
@@ -1557,8 +1630,10 @@ void RenderNodeGaussianSplatting::ExecuteFrame(IRenderCommandList& cmdList)
             execMaxMs_ = 0.0f;
             execCount_ = 0;
         }
-    }
+#else
+        (void)execMs;
 #endif
+    }
 
     if (frameCount_ < 3 || (frameCount_ % 300 == 0)) {
         PLUGIN_LOG_I("GS::ExecuteFrame #%u: %u/%u visible, %ux%u",

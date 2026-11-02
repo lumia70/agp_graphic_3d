@@ -35,6 +35,49 @@
 
 namespace lod {
 
+// Motion handling (plan A). While the camera moves, a leaf that is already drawn
+// never switches to a finer level: the scene then only gains *new* blocks for
+// newly visible leaves, and a decoded tile cannot replace dozens of coarse
+// blocks in the middle of a rotation (that is the "whole region jumps" look).
+constexpr uint64_t kMoveFreezeMs = 300;
+// Idle refinement: one global-scale step per build, and only a few leaves per
+// build, so a decoded tile refines gradually instead of in one block.
+constexpr float kRefineStep = 1.06f;  // ~1/12 octave, ~6% budget loss
+constexpr uint32_t kUpgradeLeavesPerBuild = 12;
+constexpr uint32_t kCoarsenLeavesPerBuild = 12;
+// Cross-fade (plan C). A block that replaces an older one, or a leaf that just
+// became visible, is drawn at a fraction of its opacity and ramps up, while the
+// old block ramps down; both stay in the live set until the fade ends. Replacing
+// a block by an instant swap is what still read as "a whole region jumps".
+// Three steps: a two-step fade was too abrupt and read as larger blocks
+// flickering between fine and coarse once the view settled.
+constexpr float kFadeInStart = 0.30f;
+constexpr float kFadeInGain = 1.50f;    // 0.30 -> 0.45 -> 0.68 -> 1.0
+constexpr float kFadeOutGain = 0.40f;   // 1.0 -> 0.40 -> 0.16 (freed)
+constexpr float kFadeOutEnd = 0.18f;
+// While the camera moves, only the first few new blocks fade in: a big turn can
+// add hundreds, and rewriting all of them each build stalled the frame.
+constexpr uint32_t kMaxFadeInWhileMoving = 0xFFFFFFFFu;  // no cap (V1 behaviour)
+// Cross-fade is OFF for now: on this GPU the double-image window (both LODs
+// blended for 2-3 builds) reads as large regions wobbling between fine and
+// coarse, which is worse than a plain swap of a few small blocks. Re-enable
+// together with the cheap per-slot opacity buffer, not by rewriting 64 B
+// records. kCrossFade=false restores the instant-swap behaviour.
+constexpr bool kCrossFade = true;  // V1 behaviour: 3-step cross-fade, old block freed after it
+// Prompt rebuild while refinement is queued (the loop otherwise waits 200 ms).
+constexpr uint64_t kRefineRetryMs = 120;
+// Do not prefetch a tile again for this long after decoding it: with a full
+// cache the widened frustum tiles are evicted right away, so re-prefetching
+// them burns both decode threads in a loop while the camera is still.
+constexpr uint64_t kPrefetchCooldownMs = 3000;
+
+inline uint64_t SteadyMs()
+{
+    return (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
 class Streamer {
 public:
     ~Streamer() { Stop(); }
@@ -78,6 +121,14 @@ public:
         publishUploadStart_ = 0;
         writeIndex_ = 0;
         leafEntry_.clear();
+        fadingOut_.clear();
+        fadeActive_ = false;
+        selectionFiles_.clear();
+        nextSelectionFiles_.clear();
+        victims_.clear();
+        victimCursor_ = 0;
+        victimsReady_ = false;
+        evictions_ = 0;
         freeBlocks_.clear();
         poolTop_ = 0;
         dirtyRanges_.clear();
@@ -91,9 +142,13 @@ public:
         decodes_.clear();
         lastBuiltHash_ = 0;
         lastBuildMs_ = 0;
-        previousLevels_.clear();
+        lastScale_ = 0.0f;
+        deferredUpgrades_ = 0;
+        lastBuildMoving_ = false;
+        upgradeOrder_.clear();
         lastBuiltRequest_ = 0;
         basePreloaded_ = false;
+        lastDecodeMs_.assign(scene_.files.size(), 0);
         stopped_ = false;
         worker_ = std::thread([this] { Loop(); });
         LOGI("LOD streamer: budget %{public}u, cache %{public}u", budget_, cacheBudget_);
@@ -122,6 +177,7 @@ public:
         std::memcpy(pending_.view, view, sizeof(pending_.view));
         std::memcpy(pending_.proj, proj, sizeof(pending_.proj));
         std::memcpy(pending_.camPos, camPos, sizeof(pending_.camPos));
+        pending_.stampMs = SteadyMs();
         pending_.valid = true;
         ++requestId_;
         cv_.notify_one();
@@ -166,8 +222,14 @@ private:
         float view[16] = {};
         float proj[16] = {};
         float camPos[3] = {};
+        uint64_t stampMs = 0;  // steady-clock time of the last camera update
         bool valid = false;
     };
+
+    static bool IsMoving(const Camera& cam)
+    {
+        return cam.valid && (int64_t)(SteadyMs() - cam.stampMs) < (int64_t)kMoveFreezeMs;
+    }
 
     struct CacheEntry {
         std::vector<GpuGaussianData> data;
@@ -183,7 +245,13 @@ private:
             uint64_t snapshot = 0;
             {
                 std::unique_lock<std::mutex> lock(mutex_);
-                cv_.wait_for(lock, std::chrono::milliseconds(200), [this, &seen] {
+                // While refinement is queued the loop must come back sooner than
+                // the idle 200 ms: each pass spreads a decoded tile over a few
+                // builds instead of replacing a whole tile's blocks at once.
+                const auto waitMs = (deferredUpgrades_ > 0 || lastBuildMoving_ || fadeActive_)
+                                        ? std::chrono::milliseconds((long long)kRefineRetryMs)
+                                        : std::chrono::milliseconds(200);
+                cv_.wait_for(lock, waitMs, [this, &seen] {
                     return stopped_ || requestId_ != seen;
                 });
                 if (stopped_) {
@@ -212,7 +280,7 @@ private:
                         EnsureTile(firstBase, now);
                     }
                     if (publishedBuffer_ < 0 && cam.valid) {
-                        BuildView(cam, false);
+                        BuildView(cam);
                     }
                     continue;
                 }
@@ -220,7 +288,7 @@ private:
                     // Show whatever the base layer already covers instead of
                     // waiting for the whole preload (progressive first view).
                     if (publishedBuffer_ < 0 && cam.valid) {
-                        BuildView(cam, false);
+                        BuildView(cam);
                     }
                     continue;
                 }
@@ -236,8 +304,12 @@ private:
             for (size_t d = 0; d < decodes_.size();) {
                 if (decodes_[d].second.wait_for(std::chrono::milliseconds(0)) ==
                     std::future_status::ready) {
+                    const int32_t decoded = decodes_[d].first;
                     decodes_[d].second.get();
                     decodes_.erase(decodes_.begin() + (long)d);
+                    if (decoded >= 0 && (size_t)decoded < lastDecodeMs_.size()) {
+                        lastDecodeMs_[decoded] = SteadyMs();
+                    }
                     dirty_ = true;
                 } else {
                     d++;
@@ -248,8 +320,12 @@ private:
             //    is cheap (block table only) and is what makes newly visible leaves
             //    show up *while* the finger is still moving.
             const bool cameraChanged = (snapshot != lastBuiltRequest_);
-            if (cameraChanged || dirty_) {
-                BuildView(cam, false);
+            // Also come back for queued refinement and for the moving -> idle
+            // transition (no request or tile arrives then, but the frozen levels
+            // must start refining).
+            const bool idleTransition = lastBuildMoving_ && !IsMoving(cam);
+            if (cameraChanged || dirty_ || deferredUpgrades_ > 0 || fadeActive_ || idleTransition) {
+                BuildView(cam);
                 dirty_ = false;
                 lastBuiltRequest_ = snapshot;
             }
@@ -355,17 +431,18 @@ private:
 
     int32_t PickTile(const Camera& cam, bool wide, int32_t exclude)
     {
-        if (previousLevels_.size() != scene_.leaves.size()) {
-            previousLevels_.assign(scene_.leaves.size(), (int8_t)-1);
-        }
         Selection sel;
         if (wide) {
             float proj[16];
             WideProj(cam, proj);
-            SelectVisible(scene_, cam.view, proj, cam.camPos, budget_, previousLevels_.data(), sel);
+            CullVisible(scene_, cam.view, proj, cam.camPos, sel);
         } else {
-            SelectVisible(scene_, cam.view, cam.proj, cam.camPos, budget_, previousLevels_.data(), sel);
+            CullVisible(scene_, cam.view, cam.proj, cam.camPos, sel);
         }
+        // Decode what the renderer is about to draw: same global scale as the
+        // last build (or its budget fit before the first build).
+        const float scale = (lastScale_ > 0.0f) ? lastScale_ : ChooseScale(scene_, sel, budget_);
+        AssignLevels(scene_, sel, scale);
 
         // View direction (camera looks along -back = -(row 2 of the view matrix)).
         float dx = -cam.view[2], dy = -cam.view[6], dz = -cam.view[10];
@@ -376,11 +453,16 @@ private:
             dz /= dlen;
         }
 
+        const uint64_t nowMs = SteadyMs();
         int32_t bestFile = -1;
         float bestScore = 0.0f;
         for (const auto& it : sel.items) {
             const Slice& slice = scene_.leaves[it.leaf].lods[it.level];
             if (slice.file < 0 || slice.file == exclude || TileReady(slice.file)) {
+                continue;
+            }
+            if (wide && (size_t)slice.file < lastDecodeMs_.size() &&
+                nowMs - lastDecodeMs_[slice.file] < kPrefetchCooldownMs) {
                 continue;
             }
             const Leaf& leaf = scene_.leaves[it.leaf];
@@ -456,7 +538,10 @@ private:
             pinned_.insert(file);
         }
         dirty_ = true;
-        LOGI("LOD: decoded tile %{public}d (%{public}zu gaussians, %{public}.0f ms)", file, entry->data.size(), ms);
+        LOGI("LOD: decoded tile %{public}d (%{public}zu gaussians, %{public}.0f ms, cache "
+             "%{public}u/%{public}u, %{public}zu files, evicted %{public}llu)",
+            file, entry->data.size(), ms, cacheCount_, cacheBudget_, caches_.size(),
+            (unsigned long long)evictions_);
         EvictLocked();
         return true;
     }
@@ -484,6 +569,7 @@ private:
             }
             cacheCount_ -= (uint32_t)oldest->second->data.size();
             caches_.erase(oldest);
+            evictions_++;
         }
     }
 
@@ -494,27 +580,68 @@ private:
         return caches_.find(file) != caches_.end();
     }
 
+    // Opacity bookkeeping for cross-fades. The pool is the only copy of the
+    // drawn data, so a fade step rescales the block in place; float drift over
+    // <= 4 steps is negligible.
+    void ScaleBlock(uint32_t start, uint32_t count, float factor)
+    {
+        if (count == 0 || start + count > poolTop_) {
+            return;
+        }
+        GpuGaussianData* dst = &buffers_[writeIndex_][start];
+        for (uint32_t i = 0; i < count; i++) {
+            dst[i].opacity *= factor;
+        }
+    }
+
+    void WriteBlock(uint32_t start, const GpuGaussianData* src, uint32_t count, float factor)
+    {
+        GpuGaussianData* dst = &buffers_[writeIndex_][start];
+        for (uint32_t i = 0; i < count; i++) {
+            dst[i] = src[i];
+            dst[i].opacity *= factor;
+        }
+    }
+
     // Fill the write buffer in leaf order (nearest first) and publish prefixes.
     // Rebuilds the drawn set from the current selection. Blocks are owned per leaf
     // in a shared pool: when a leaf's level changes, only its block is rewritten
     // (allocated / reused) and only those slots are uploaded. The rest of the pool
     // is untouched, so nothing "shrinks" and nothing is rebuilt globally.
-    void BuildView(const Camera& cam, bool /*force*/)
+    //
+    // Levels come from one global scale (plan B) and refinement is gated (plan A):
+    // while the camera moves a drawn leaf never switches to a finer level, and
+    // while idle only a few leaves per build may upgrade. Returns true while more
+    // refinement is queued.
+    bool BuildView(const Camera& cam)
     {
         const auto buildBegin = std::chrono::steady_clock::now();
-        if (previousLevels_.size() != scene_.leaves.size()) {
-            previousLevels_.assign(scene_.leaves.size(), (int8_t)-1);
-        }
+        const uint64_t nowMs = SteadyMs();
+        const bool moving = IsMoving(cam);
+        const bool idleTransition = lastBuildMoving_ && !moving;
+
         Selection sel;
         const auto tSel0 = std::chrono::steady_clock::now();
-        SelectVisible(scene_, cam.view, cam.proj, cam.camPos, budget_, previousLevels_.data(), sel);
-        const auto tSel1 = std::chrono::steady_clock::now();
-        uint32_t levelChanges = 0;
-        for (const auto& item : sel.items) {
-            if (previousLevels_[item.leaf] >= 0 && previousLevels_[item.leaf] != (int8_t)item.level) {
-                levelChanges++;
-            }
+        CullVisible(scene_, cam.view, cam.proj, cam.camPos, sel);
+        const float fit = ChooseScale(scene_, sel, budget_);
+        const bool haveScale = lastScale_ > 0.0f;
+        float scale = fit;
+        if (haveScale && moving) {
+            // Fully frozen while the camera moves: re-fitting the scale here
+            // coarsened the near leaves, whose blocks cover the largest part of
+            // the screen -- that was the remaining "whole region jumps". The
+            // apply pass below also freezes every leaf that is already drawn.
+            scale = lastScale_;
+        } else if (haveScale && fit > lastScale_ * kRefineStep) {
+            // Refine at most one global step per build so a large change in the
+            // visible set (e.g. after a turn) is spread over a few hundred
+            // milliseconds instead of one instant LOD change.
+            scale = lastScale_ * kRefineStep;
         }
+        lastScale_ = scale;
+        AssignLevels(scene_, sel, scale);
+        const auto tSel1 = std::chrono::steady_clock::now();
+        const bool scalePending = haveScale && !moving && (fit > scale * (1.0f + 1e-4f));
 
         // If the selection did not change and no tile arrived, there is nothing to
         // do. Rebuilding the live list (~1M entries) and republishing on every
@@ -524,21 +651,207 @@ private:
             for (const auto& it : sel.items) {
                 h = (h ^ ((uint64_t)it.leaf * 16u + (uint64_t)it.level)) * 1099511628211ull;
             }
-            const uint64_t nowMs = (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now().time_since_epoch()).count();
             const bool changed = (h != lastBuiltHash_);
-            const bool throttled = !dirty_ && (nowMs - lastBuildMs_ < 150u);
-            // Never skip while a tile just landed: the *selection* (which leaves
-            // and levels) does not change when a tile finishes decoding, so a hash
-            // check alone would decode tiles and never use them.
-            if (!changed && !dirty_) {
-                return;
+            const bool refining = scalePending || (deferredUpgrades_ > 0) || fadeActive_;
+            if (!changed && !dirty_ && !refining && !idleTransition) {
+                return false;
             }
-            if (throttled && !dirty_) {
-                return;
+            // Camera-driven rebuild throttle. Queued refinement bypasses it (it is
+            // the 120 ms cadence that spreads a decoded tile over several builds).
+            if (!dirty_ && !refining && !idleTransition &&
+                (uint64_t)(nowMs - lastBuildMs_) < 150u) {
+                return false;
             }
             lastBuiltHash_ = h;
             lastBuildMs_ = nowMs;
+        }
+
+        if (writeIndex_ < 0) {
+            writeIndex_ = 0;
+        }
+        dirtyRanges_.clear();
+        // Advance the cross-fades one step per build. This runs before new blocks
+        // are written so a block created in this build starts at the fade-in
+        // opacity and steps on the next one.
+        uint32_t fadeSteps = 0;
+        for (auto f = fadingOut_.begin(); f != fadingOut_.end();) {
+            if (!kCrossFade) {
+                // Delayed free, not an immediate one: the render node may still
+                // be drawing the previous sort order, and that order references
+                // these pool slots. Freeing them right away let the next block
+                // allocation overwrite them, so the stale order drew the wrong
+                // gaussians -- the whole image flickered and blocks looked
+                // damaged. The block is not drawn any more, so the swap itself
+                // is instant.
+                FadeOut& out = f->second;
+                if (out.ttl > 0) {
+                    --out.ttl;
+                    ++f;
+                } else {
+                    FreeBlock(out.start, out.count);
+                    f = fadingOut_.erase(f);
+                }
+                continue;
+            }
+            FadeOut& out = f->second;
+            out.fade *= kFadeOutGain;
+            if (out.fade < kFadeOutEnd || out.start + out.count > poolTop_) {
+                if (out.start + out.count <= poolTop_) {
+                    FreeBlock(out.start, out.count);
+                }
+                f = fadingOut_.erase(f);
+                continue;
+            }
+            ScaleBlock(out.start, out.count, kFadeOutGain);
+            dirtyRanges_.push_back(out.start);
+            dirtyRanges_.push_back(out.count);
+            ++f;
+            fadeSteps++;
+        }
+        bool fadeInActive = false;
+        for (auto& item : leafEntry_) {
+            Entry& e = item.second;
+            if (!kCrossFade) {
+                break;
+            }
+            if (e.fade >= 1.0f || e.count == 0) {
+                continue;
+            }
+            const float next = std::min(1.0f, e.fade * kFadeInGain);
+            ScaleBlock(e.start, e.count, next / e.fade);
+            e.fade = next;
+            dirtyRanges_.push_back(e.start);
+            dirtyRanges_.push_back(e.count);
+            if (next < 1.0f) {
+                fadeInActive = true;
+            }
+            fadeSteps++;
+        }
+
+        // Cache protection: the levels that are about to be drawn *and* the ones
+        // the decoder is fetching toward. Only protecting the drawn level made
+        // PickTile decode a tile for a queued upgrade, watch it get evicted (it
+        // was not protected yet) and decode it again in a loop.
+        auto protectLevels = [&]() {
+            for (const auto& item : sel.items) {
+                const Leaf& leaf = scene_.leaves[item.leaf];
+                const int last = std::min((int)item.level + 1, leaf.levels - 1);
+                for (int lvl = item.level; lvl <= last; lvl++) {
+                    if (leaf.lods[lvl].file >= 0) {
+                        nextSelectionFiles_.insert(leaf.lods[lvl].file);
+                    }
+                }
+            }
+        };
+        nextSelectionFiles_.clear();
+        protectLevels();
+
+        // Apply pass. Score order (largest on-screen leaves first) drives every
+        // quota. Two policies:
+        //   moving: a leaf that is already drawn keeps its level -- no upgrade and
+        //           no coarsening, so nothing on screen can change shape. Only the
+        //           newly visible leaves are coarsened (farthest first) if the
+        //           frozen selection would overflow the pool.
+        //   idle:   move toward the global-scale target a few leaves per build.
+        upgradeOrder_.clear();
+        upgradeOrder_.reserve(sel.items.size());
+        for (uint32_t i = 0; i < (uint32_t)sel.items.size(); i++) {
+            upgradeOrder_.push_back(i);
+        }
+        std::sort(upgradeOrder_.begin(), upgradeOrder_.end(), [&sel](uint32_t a, uint32_t b) {
+            return sel.items[a].score > sel.items[b].score;
+        });
+
+        uint32_t upgradeQuota = kUpgradeLeavesPerBuild;
+        uint32_t coarsenQuota = kCoarsenLeavesPerBuild;
+        uint32_t deferred = 0;
+        uint32_t upgraded = 0;
+        uint32_t coarsened = 0;
+        uint32_t forced = 0;
+
+        if (moving) {
+            uint64_t total = 0;
+            for (auto& it : sel.items) {
+                auto found = leafEntry_.find(it.leaf);
+                const Leaf& leaf = scene_.leaves[it.leaf];
+                if (found != leafEntry_.end() && found->second.level >= 0) {
+                    it.level = (uint8_t)found->second.level;  // frozen
+                } else {
+                    // A newly visible leaf starts at its coarsest level. Its tile
+                    // is always in the pinned base layer, so the region appears
+                    // instantly and uniformly coarse instead of popping in as a
+                    // patchwork of whatever happened to be decoded. New leaves are
+                    // NOT faded in while moving: a turn can add hundreds of blocks
+                    // and rewriting all of them for two builds is what made a drag
+                    // feel like it lagged behind the finger.
+                    it.level = (uint8_t)(leaf.levels - 1);
+                }
+                total += LeafCountAt(scene_, it.leaf, it.level);
+            }
+            // Stay inside the pool: the frozen budget can exceed budget_ for a
+            // while, but the block pool cannot. Coarsen new leaves first (a leaf
+            // that just appeared getting coarser is not a visible replacement),
+            // and drawn leaves only when there is no other way.
+            const uint64_t limit = (uint64_t)(capacity_ / 16u) * 15u;
+            auto coarsenToFit = [&](bool onlyNew) {
+                for (size_t k = upgradeOrder_.size(); k-- > 0 && total > limit;) {
+                    Item& it = sel.items[upgradeOrder_[k]];
+                    const bool drawn = leafEntry_.find(it.leaf) != leafEntry_.end();
+                    if (onlyNew && drawn) {
+                        continue;
+                    }
+                    const Leaf& leaf = scene_.leaves[it.leaf];
+                    while (total > limit && (int)it.level + 1 < leaf.levels) {
+                        total -= leaf.lods[it.level].count;
+                        it.level = (uint8_t)(it.level + 1);
+                        total += leaf.lods[it.level].count;
+                        coarsened++;
+                        if (drawn) {
+                            forced++;
+                        }
+                    }
+                }
+            };
+            coarsenToFit(true);
+            coarsenToFit(false);
+        } else {
+            for (uint32_t idx : upgradeOrder_) {
+                Item& it = sel.items[idx];
+                auto found = leafEntry_.find(it.leaf);
+                if (found == leafEntry_.end() || found->second.level < 0) {
+                    continue;  // new leaf: draw it at the selected level right away
+                }
+                const int drawn = found->second.level;
+                if ((int)it.level < drawn) {
+                    // Only step when the block's own target level is decoded.
+                    // Stepping through intermediate levels (LOD3 -> LOD2 -> LOD1
+                    // as tiles landed) made one leaf cross-fade several times,
+                    // which reads as a small region flickering fine/coarse.
+                    // A missing tile is the decoder's job and sets dirty_ later.
+                    const Leaf& leaf = scene_.leaves[it.leaf];
+                    const int32_t targetFile = leaf.lods[it.level].file;
+                    const bool ready = targetFile >= 0 && TileReady(targetFile);
+                    if (!ready) {
+                        it.level = (uint8_t)drawn;
+                    } else if (upgradeQuota > 0) {
+                        upgradeQuota--;
+                        upgraded++;
+                    } else {
+                        it.level = (uint8_t)drawn;
+                        deferred++;
+                    }
+                } else if ((int)it.level > drawn) {
+                    // Coarsening is staggered as well: on the frame the gesture
+                    // ends the whole budget correction would otherwise land at once.
+                    if (coarsenQuota > 0) {
+                        coarsenQuota--;
+                        coarsened++;
+                    } else {
+                        it.level = (uint8_t)drawn;
+                        deferred++;
+                    }
+                }
+            }
         }
 
         auto resolveLevel = [&](uint32_t leafIndex, int desired) {
@@ -552,45 +865,66 @@ private:
             return -1;
         };
 
-        if (writeIndex_ < 0) {
-            writeIndex_ = 0;
-        }
         ++buildId_;
         selectedLeaves_.clear();
-        selectionFiles_.clear();
         for (const auto& item : sel.items) {
             selectedLeaves_.insert(item.leaf);
-            const Leaf& leaf = scene_.leaves[item.leaf];
-            for (int lvl = item.level; lvl < leaf.levels; lvl++) {
-                if (leaf.lods[lvl].file >= 0) {
-                    selectionFiles_.insert(leaf.lods[lvl].file);
-                }
-            }
         }
-        dirtyRanges_.clear();
+        // Add the levels the quota/camera freeze actually kept (they can be
+        // coarser than the target) and publish the set. Swapped under the cache
+        // lock because decode threads read it from EvictLocked().
+        protectLevels();
+        {
+            std::lock_guard<std::mutex> lock(cacheMutex_);
+            selectionFiles_.swap(nextSelectionFiles_);
+        }
+        victimsReady_ = false;
         uint32_t skippedNoTile = 0;
+        uint32_t fadeInWhileMoving = 0;
         uint32_t replaced = 0;
         uint32_t growFailures = 0;
+        uint32_t levelChanges = 0;
 
         for (const auto& it : sel.items) {
+            const Leaf& leaf = scene_.leaves[it.leaf];
+            auto found = leafEntry_.find(it.leaf);
+            Entry entry = (found != leafEntry_.end()) ? found->second : Entry {};
+            // Already drawing exactly the requested level: keep the block as is.
+            // This check must come BEFORE resolveLevel(), which consults the tile
+            // cache: a tile that is momentarily being re-decoded (or was evicted)
+            // made resolveLevel fall back to a coarser level, the leaf coarsened,
+            // and as soon as the tile came back it upgraded again -- a visible
+            // fine/coarse toggle on whole blocks. The block already holds the data
+            // it needs; the cache is only required when (re)writing a block.
+            if (entry.level >= 0 && entry.level == (int8_t)it.level &&
+                entry.count == LeafCountAt(scene_, it.leaf, it.level) &&
+                entry.start + entry.count <= poolTop_) {
+                entry.lastUse = buildId_;
+                leafEntry_[it.leaf] = entry;
+                continue;
+            }
             const int level = resolveLevel(it.leaf, it.level);
             if (level < 0) {
                 skippedNoTile++;
                 continue;
             }
-            const Slice& slice = scene_.leaves[it.leaf].lods[level];
+            const Slice& slice = leaf.lods[level];
             if (slice.file < 0 || slice.count == 0) {
                 continue;
             }
-            auto found = leafEntry_.find(it.leaf);
-            Entry entry = (found != leafEntry_.end()) ? found->second : Entry {};
             if (entry.level == level && entry.count == slice.count && entry.start + entry.count <= poolTop_) {
                 entry.lastUse = buildId_;
                 leafEntry_[it.leaf] = entry;
                 continue;
             }
+            if (entry.level >= 0 && entry.level != (int8_t)level) {
+                levelChanges++;
+            }
             if (!EnsureTile(slice.file, ++clock_)) {
                 continue;
+            }
+            if ((size_t)slice.file < lastDecodeMs_.size()) {
+                lastDecodeMs_[slice.file] = SteadyMs();
             }
             CacheEntryPtr tile;
             {
@@ -605,38 +939,53 @@ private:
                 continue;
             }
 
-            // Reuse the existing block when it is big enough, otherwise allocate.
+            // A level change always writes a NEW block: the previous block stays
+            // in the pool untouched (and in the live set) while it fades out. The
+            // old order therefore keeps sampling valid data until the sort adopts
+            // the new ranges.
             uint32_t start = 0;
-            bool reused = false;
-            if (entry.count >= slice.count && entry.start + entry.count <= poolTop_) {
-                start = entry.start;
-                reused = true;
-                if (entry.count > slice.count) {
-                    FreeBlock(entry.start + slice.count, entry.count - slice.count);
+            if (!AllocBlock(slice.count, start)) {
+                // Cannot allocate (pool full, everything evictable is selected):
+                // keep the existing block so the leaf stays visible.
+                if (entry.count > 0) {
+                    entry.lastUse = buildId_;
+                    leafEntry_[it.leaf] = entry;
                 }
-            } else {
-                // Growing. Try to allocate the larger block first; only release the
-                // old one once that succeeded. Freeing first and then failing left
-                // the leaf with no block at all, which shows up as a hole in the
-                // picture when the pool is tight.
-                if (!AllocBlock(slice.count, start)) {
-                    // Cannot grow (pool full, everything evictable is selected):
-                    // keep the existing coarser block so the leaf stays visible.
-                    if (entry.count > 0) {
-                        entry.lastUse = buildId_;
-                        leafEntry_[it.leaf] = entry;
+                growFailures++;
+                continue;
+            }
+            if (entry.count > 0 && entry.start + entry.count <= poolTop_) {
+                // Only one fade-out per leaf: drop an older one that is still
+                // fading (it is already at a low opacity by then).
+                if (kCrossFade) {
+                    auto previous = fadingOut_.find(it.leaf);
+                    if (previous != fadingOut_.end()) {
+                        FreeBlock(previous->second.start, previous->second.count);
                     }
-                    growFailures++;
-                    continue;
+                    fadingOut_[it.leaf] =
+                        FadeOut { entry.start, entry.count, entry.level, entry.fade };
+                } else {
+                    auto previous = fadingOut_.find(it.leaf);
+                    if (previous != fadingOut_.end()) {
+                        FreeBlock(previous->second.start, previous->second.count);
+                    }
+                    fadingOut_[it.leaf] =
+                        FadeOut { entry.start, entry.count, entry.level, 1.0f, 2 };
                 }
-                if (entry.count > 0 && entry.start + entry.count <= poolTop_) {
-                    FreeBlock(entry.start, entry.count);
-                }
-                entry = Entry {};
             }
 
-            std::memcpy(&buffers_[writeIndex_][start], &tile->data[slice.offset],
-                (size_t)slice.count * sizeof(GpuGaussianData));
+            // New leaves that show up mid-gesture fade in only up to a cap: a
+            // whole turn's worth would otherwise be rewritten every build on top
+            // of the upload and stall the frame.
+            const float fade0 = !kCrossFade
+                                    ? 1.0f
+                                    : ((moving && fadeInWhileMoving >= kMaxFadeInWhileMoving)
+                                              ? 1.0f
+                                              : kFadeInStart);
+            if (moving && fade0 < 1.0f) {
+                fadeInWhileMoving++;
+            }
+            WriteBlock(start, &tile->data[slice.offset], slice.count, fade0);
             dirtyRanges_.push_back(start);
             dirtyRanges_.push_back(slice.count);
 
@@ -644,10 +993,9 @@ private:
             entry.start = start;
             entry.count = slice.count;
             entry.lastUse = buildId_;
+            entry.fade = fade0;
             leafEntry_[it.leaf] = entry;
-            if (!reused) {
-                replaced++;
-            }
+            replaced++;
         }
 
         const auto tBlocks = std::chrono::steady_clock::now();
@@ -671,12 +1019,14 @@ private:
             liveRanges_.push_back(e.start);
             liveRanges_.push_back(e.count);
             liveTotal += e.count;
+            auto fading = kCrossFade ? fadingOut_.find(it.leaf) : fadingOut_.end();
+            if (fading != fadingOut_.end() && fading->second.start + fading->second.count <= poolTop_) {
+                liveRanges_.push_back(fading->second.start);
+                liveRanges_.push_back(fading->second.count);
+                liveTotal += fading->second.count;
+            }
         }
         liveCount_ = liveTotal;
-
-        for (const auto& it : sel.items) {
-            previousLevels_[it.leaf] = (int8_t)it.level;
-        }
 
         const auto tLive = std::chrono::steady_clock::now();
 
@@ -684,12 +1034,19 @@ private:
         // leave the frustum), so compare a hash of the selection as well.
         uint64_t hash = 1469598103934665603ull ^ (uint64_t)liveCount_;
         for (const auto& it : sel.items) {
-            hash = (hash ^ ((uint64_t)it.leaf * 16u + (uint64_t)it.level)) * 1099511628211ull;
+            auto found = leafEntry_.find(it.leaf);
+            const uint32_t start = found == leafEntry_.end() ? 0u : found->second.start;
+            hash = (hash ^ ((uint64_t)it.leaf * 16u + (uint64_t)start)) * 1099511628211ull;
         }
         lastLiveHash_ = hash;
         const bool liveChanged = liveCount_ != publishLiveCount_ || hash != publishLiveHash_;
+
+        fadeActive_ = fadeInActive || !fadingOut_.empty();
+        const bool refining = deferred > 0 || scalePending || fadeActive_;
+        lastBuildMoving_ = moving;
+        deferredUpgrades_ = deferred;
         if (dirtyRanges_.empty() && !liveChanged) {
-            return;
+            return refining;
         }
         Publish();
         const double buildMs = std::chrono::duration<double, std::milli>(
@@ -700,12 +1057,15 @@ private:
         };
         LOGI("LOD: set %{public}zu live gaussians (pool %{public}u, %{public}u dirty ranges, "
              "%{public}u new blocks, no-tile %{public}u, grow-fail %{public}u, level-chg %{public}u, "
+             "s %{public}.3f, upg %{public}u, down %{public}u, forced %{public}u, fade %{public}u, "
+             "defer %{public}u, "
              "%{public}.0f ms = sel %{public}.0f + "
              "blocks %{public}.0f + live %{public}.0f) gen 0x%{public}x",
             (size_t)liveCount_, poolTop_, (unsigned)(dirtyRanges_.size() / 2), replaced, skippedNoTile,
-            growFailures, levelChanges,
+            growFailures, levelChanges, scale, upgraded, coarsened, forced, fadeSteps, deferred,
             buildMs, msBetween(tSel0, tSel1), msBetween(tSel1, tBlocks), msBetween(tBlocks, tLive),
             publishGeneration_);
+        return refining;
     }
 
     // First-fit block allocation from the free list, then from the bump pointer.
@@ -715,28 +1075,38 @@ private:
             return true;
         }
         // Pool exhausted: release blocks that are not part of this selection,
-        // least recently used first. Membership is a hash set (building it inside
-        // the victim search made every allocation O(entries * selection) and
-        // effectively froze the streamer once the pool filled up).
-        while (true) {
-            auto victim = leafEntry_.end();
+        // least recently used first. The candidate list is built once per build:
+        // scanning every leaf entry for every allocation made a large turn
+        // allocate ~800 blocks in >100 ms (visible hitch).
+        if (!victimsReady_) {
+            victims_.clear();
             for (auto it = leafEntry_.begin(); it != leafEntry_.end(); ++it) {
                 if (it->second.count == 0 || selectedLeaves_.count(it->first) != 0) {
                     continue;
                 }
-                if (victim == leafEntry_.end() || it->second.lastUse < victim->second.lastUse) {
-                    victim = it;
-                }
+                victims_.push_back(Victim { it->second.lastUse, it->first });
             }
-            if (victim == leafEntry_.end()) {
-                return false;
+            std::sort(victims_.begin(), victims_.end(),
+                [](const Victim& a, const Victim& b) { return a.lastUse < b.lastUse; });
+            victimCursor_ = 0;
+            victimsReady_ = true;
+        }
+        while (victimCursor_ < victims_.size()) {
+            const uint32_t leaf = victims_[victimCursor_++].leaf;
+            auto it = leafEntry_.find(leaf);
+            if (it == leafEntry_.end() || it->second.count == 0) {
+                continue;
             }
-            FreeBlock(victim->second.start, victim->second.count);
-            victim->second = Entry {};
+            if (selectedLeaves_.count(leaf) != 0) {
+                continue;
+            }
+            FreeBlock(it->second.start, it->second.count);
+            it->second = Entry {};
             if (TryAlloc(count, start)) {
                 return true;
             }
         }
+        return false;
     }
 
     bool TryAlloc(uint32_t count, uint32_t& start)
@@ -813,11 +1183,25 @@ private:
         uint32_t start = 0;
         uint32_t count = 0;
         uint64_t lastUse = 0;
+        float fade = 1.0f;  // opacity multiplier currently applied to the block
+    };
+
+    struct FadeOut {
+        uint32_t start = 0;
+        uint32_t count = 0;
+        int8_t level = -1;
+        float fade = 1.0f;
+        uint32_t ttl = 2;  // builds to wait before the slots may be reused
     };
 
     struct Block {
         uint32_t start = 0;
         uint32_t size = 0;
+    };
+
+    struct Victim {
+        uint64_t lastUse = 0;
+        uint32_t leaf = 0;
     };
 
     uint32_t publishUploadStart_ = 0;
@@ -828,6 +1212,8 @@ private:
     std::vector<std::pair<int32_t, std::future<bool>>> decodes_;
     int writeIndex_ = -1;
     std::unordered_map<uint32_t, Entry> leafEntry_;  // leaf -> block
+    std::unordered_map<uint32_t, FadeOut> fadingOut_;  // leaf -> block being cross-faded out
+    bool fadeActive_ = false;
     std::vector<Block> freeBlocks_;
     uint32_t poolTop_ = 0;
     std::vector<uint32_t> dirtyRanges_;  // (start, count) pairs
@@ -835,17 +1221,25 @@ private:
     uint32_t liveCount_ = 0;
     std::unordered_set<uint32_t> selectedLeaves_;
     std::unordered_set<int32_t> selectionFiles_;
+    std::unordered_set<int32_t> nextSelectionFiles_;
+    std::vector<Victim> victims_;
+    size_t victimCursor_ = 0;
+    bool victimsReady_ = false;
+    uint64_t evictions_ = 0;
     uint64_t buildId_ = 0;
     uint64_t lastBuiltHash_ = 0;
     uint64_t lastBuildMs_ = 0;
+    float lastScale_ = 0.0f;
+    uint32_t deferredUpgrades_ = 0;
+    bool lastBuildMoving_ = false;
+    std::vector<uint32_t> upgradeOrder_;
+    std::vector<uint64_t> lastDecodeMs_;  // worker-owned decode timestamps
     std::atomic<bool> dirty_ { false };
     int publishedBuffer_ = -1;
     uint32_t publishCount_ = 0;
     uint32_t publishGeneration_ = 0;
     uint32_t consumedGeneration_ = 0;
 
-    std::vector<int8_t> previousLevels_;
-    std::vector<int8_t> lastSelection_;
     std::mutex cacheMutex_;
     std::unordered_map<int32_t, CacheEntryPtr> caches_;
     std::unordered_set<int32_t> decoding_;

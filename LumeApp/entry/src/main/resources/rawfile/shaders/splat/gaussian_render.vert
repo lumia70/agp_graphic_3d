@@ -127,7 +127,11 @@ mat3 quatToMat3(vec4 q) {
 const float LOW_PASS = 0.3;
 
 void main() {
-    uint gaussianIdx = sortedIndices[uint(gl_VertexIndex) / 6u];
+    // Instanced: one quad per gaussian, six vertices per instance. Indexing the
+    // sorted order by the instance cuts the vertex shader invocations 6x compared
+    // to drawing visibleCount*6 vertices (that stage dominated the frame on the
+    // LOD scene, ~1.4M gaussians).
+    uint gaussianIdx = sortedIndices[uint(gl_InstanceIndex)];
 
     // Sentinel padding entry — skip (stale-frame safety)
     if (gaussianIdx == 0xFFFFFFFFu) {

@@ -61,6 +61,9 @@ extern __attribute__((visibility("default"))) const uint32_t* g_gaussianLiveRang
 extern __attribute__((visibility("default"))) uint32_t g_gaussianLiveRangeCount;
 extern __attribute__((visibility("default"))) const uint32_t* g_gaussianDirtyRanges;
 extern __attribute__((visibility("default"))) uint32_t g_gaussianDirtyRangeCount;
+// 1 for pool/LOD scenes: the app only ever patches blocks, so an empty dirty
+// range list means "no data changed", never "rewrite the whole pool".
+extern __attribute__((visibility("default"))) uint32_t g_gaussianPoolMode;
 
 extern __attribute__((visibility("default"))) float g_gaussianBackground[4];
 extern __attribute__((visibility("default"))) bool g_gaussianDataReady;

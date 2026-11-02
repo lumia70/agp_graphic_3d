@@ -305,51 +305,34 @@ inline bool AabbOutside(const float planes[6][4], const Leaf& leaf)
     return false;
 }
 
-// Level for a fresh leaf (no previous selection).
-inline int PickLevel(const Scene& scene, float dist)
+// Level for a distance with a global budget scale: the scene's LOD distances are
+// multiplied by one scalar, so the whole scene moves between levels together
+// instead of leaves being upgraded one by one by an importance sort. Flipping a
+// leaf only happens when its distance crosses scale * distances[k], which is a
+// thin shell in space -- much less visible than an arbitrary budget-driven
+// "these 300 leaves upgrade now".
+inline int PickLevelAt(const Scene& scene, float dist, float scale)
 {
     for (int level = 0; level < scene.levelCount; level++) {
-        if (dist < scene.distances[level]) {
+        if (dist < scene.distances[level] * scale) {
             return level;
         }
     }
     return scene.levelCount - 1;
 }
 
-// Sticky level selection: keep the level a leaf already has unless the distance
-// clearly moved into another band (15% hysteresis). Re-deriving the level from
-// distance every frame made whole blocks jump between LODs while rotating, which
-// reads as the picture flickering, because only one level per leaf is drawn.
-inline int PickLevelHysteresis(const Scene& scene, float dist, int previous)
+inline float LeafRadius(const Leaf& leaf)
 {
-    if (previous < 0 || previous >= scene.levelCount) {
-        return PickLevel(scene, dist);
-    }
-    const float kHysteresis = 1.15f;
-    // Coarser (previous+1) only when clearly beyond the current threshold.
-    const float currentMax = scene.distances[previous];
-    if (dist < currentMax * kHysteresis) {
-        // Still inside the current level (with margin): go finer only when
-        // clearly below the finer threshold.
-        if (previous > 0) {
-            const float finerMax = scene.distances[previous - 1];
-            if (dist < finerMax / kHysteresis) {
-                return previous - 1;
-            }
-        }
-        return previous;
-    }
-    // Coarse enough for the next level?
-    if (previous + 1 < scene.levelCount) {
-        return PickLevel(scene, dist);
-    }
-    return previous;
+    const float ex = leaf.bmax[0] - leaf.bmin[0];
+    const float ey = leaf.bmax[1] - leaf.bmin[1];
+    const float ez = leaf.bmax[2] - leaf.bmin[2];
+    return 0.5f * std::sqrt(ex * ex + ey * ey + ez * ez);
 }
 
-// Frustum cull + per-leaf distance LOD, then coarsen the farthest leaves until
-// the gaussian budget is met.
-inline void SelectVisible(const Scene& scene, const float view[16], const float proj[16],
-    const float camPos[3], uint32_t budget, const int8_t* previousLevels, Selection& out)
+// Frustum cull + distance only; levels are assigned once the global scale is
+// known (see AssignLevels).
+inline void CullVisible(const Scene& scene, const float view[16], const float proj[16],
+    const float camPos[3], Selection& out)
 {
     out.items.clear();
     out.total = 0;
@@ -383,115 +366,98 @@ inline void SelectVisible(const Scene& scene, const float view[16], const float 
         const float dist = DistanceToAabb(camPos, leaf);
         Item item;
         item.leaf = i;
-        if (previousLevels && previousLevels[i] >= 0) {
-            // Sticky: keep the level the leaf already has. The budget pass below
-            // is the only thing that changes it, driven by real overshoot.
-            int level = previousLevels[i];
-            if (level >= leaf.levels) {
-                level = leaf.levels - 1;
-            }
-            item.level = (uint8_t)level;
-        } else {
-            item.level = (uint8_t)PickLevelHysteresis(scene, dist, -1);
-        }
         item.dist = dist;
+        // Apparent size (bound radius / distance). Used only to order the idle
+        // refinement quota, not to pick levels.
+        item.score = LeafRadius(leaf) / std::max(dist, 0.001f);
         out.items.push_back(item);
     }
 
-    // Importance = apparent size (bound radius / distance). Budget allocation
-    // works on this order: the most "expensive on screen" leaves get the finest
-    // levels the budget allows, the least important ones are coarsened first.
-    for (auto& it : out.items) {
-        const Leaf& leaf = scene.leaves[it.leaf];
-        const float ex = leaf.bmax[0] - leaf.bmin[0];
-        const float ey = leaf.bmax[1] - leaf.bmin[1];
-        const float ez = leaf.bmax[2] - leaf.bmin[2];
-        const float radius = 0.5f * std::sqrt(ex * ex + ey * ey + ez * ez);
-        it.score = radius / std::max(it.dist, 0.001f);
-    }
-    std::sort(out.items.begin(), out.items.end(),
-        [](const Item& a, const Item& b) { return a.score > b.score; });
-
-    uint32_t total = 0;
-    for (const auto& it : out.items) {
-        total += scene.leaves[it.leaf].lods[it.level].count;
-    }
-
-    if (budget > 0) {
-        // 1) Over budget: coarsen the least important leaves first; a leaf that
-        //    cannot fit at any level is dropped for this frame.
-        if (total > budget) {
-            for (size_t i = out.items.size(); i-- > 0 && total > budget;) {
-                Item& it = out.items[i];
-                const Leaf& leaf = scene.leaves[it.leaf];
-                total -= leaf.lods[it.level].count;
-                bool placed = false;
-                for (int level = it.level + 1; level < leaf.levels; level++) {
-                    const uint32_t count = leaf.lods[level].count;
-                    if (total + count <= budget) {
-                        it.level = (uint8_t)level;
-                        total += count;
-                        placed = true;
-                        break;
-                    }
-                }
-                if (!placed) {
-                    it.level = 0xFF;
-                }
-            }
-            out.items.erase(std::remove_if(out.items.begin(), out.items.end(),
-                                [](const Item& it) { return it.level == 0xFF; }),
-                out.items.end());
-        } else {
-            // 2) Under budget: spend the leftover on the most important leaves,
-            //    upgrading them one level at a time while they fit.
-            bool upgraded = true;
-            while (upgraded) {
-                upgraded = false;
-                for (auto& it : out.items) {
-                    if (it.level == 0) {
-                        continue;  // already the finest
-                    }
-                    const Leaf& leaf = scene.leaves[it.leaf];
-                    const uint32_t current = leaf.lods[it.level].count;
-                    const uint32_t finer = leaf.lods[it.level - 1].count;
-                    if (finer <= current) {
-                        continue;
-                    }
-                    const uint32_t delta = finer - current;
-                    if (total + delta <= budget) {
-                        it.level = (uint8_t)(it.level - 1);
-                        total += delta;
-                        upgraded = true;
-                    }
-                }
-            }
-        }
-        total = 0;
-        for (const auto& it : out.items) {
-            total += scene.leaves[it.leaf].lods[it.level].count;
-        }
-    }
-
-    // Assembly order: nearest first, so refinement appears from the foreground
-    // outwards instead of in arbitrary importance blocks.
+    // Assembly order: nearest first, so blocks are allocated (and refinement
+    // consumed) from the foreground outwards.
     std::sort(out.items.begin(), out.items.end(),
         [](const Item& a, const Item& b) { return a.dist < b.dist; });
+}
 
-    out.total = total;
+inline uint32_t LeafCountAt(const Scene& scene, uint32_t leafIndex, int level)
+{
+    const Leaf& leaf = scene.leaves[leafIndex];
+    if (level >= leaf.levels) {
+        level = leaf.levels - 1;
+    }
+    if (level < 0) {
+        level = 0;
+    }
+    return leaf.lods[level].count;
+}
+
+// Gaussians the selection would draw at a given scale.
+inline uint32_t ScaleCost(const Scene& scene, const Selection& sel, float scale)
+{
+    uint64_t total = 0;
+    for (const auto& it : sel.items) {
+        total += LeafCountAt(scene, it.leaf, PickLevelAt(scene, it.dist, scale));
+    }
+    return (uint32_t)std::min<uint64_t>(total, 0xFFFFFFFFull);
+}
+
+// Per-leaf levels + totals for a given global scale.
+inline void AssignLevels(const Scene& scene, Selection& out, float scale)
+{
     for (auto& v : out.perLevelGaussians) {
         v = 0;
     }
     for (auto& v : out.perLevelLeaves) {
         v = 0;
     }
-    for (const auto& it : out.items) {
-        const uint32_t count = scene.leaves[it.leaf].lods[it.level].count;
-        if (it.level < 8) {
-            out.perLevelGaussians[it.level] += count;
-            out.perLevelLeaves[it.level]++;
+    uint32_t total = 0;
+    for (auto& it : out.items) {
+        const Leaf& leaf = scene.leaves[it.leaf];
+        int level = PickLevelAt(scene, it.dist, scale);
+        if (level >= leaf.levels) {
+            level = leaf.levels - 1;
+        }
+        if (level < 0) {
+            level = 0;
+        }
+        it.level = (uint8_t)level;
+        const uint32_t count = leaf.lods[level].count;
+        total += count;
+        out.perLevelGaussians[level] += count;
+        out.perLevelLeaves[level]++;
+    }
+    out.total = total;
+}
+
+// Largest global scale whose selection fits the budget. The cost is monotone in
+// the scale (a larger scale makes every threshold larger, so leaves land on
+// finer levels), so a bisection on log2 finds it in ~20 passes over the visible
+// leaves. playcanvas/gsplat-unified does the same with a ln(distance) histogram;
+// with per-leaf LOD distances available a direct search is simpler and exact.
+inline float ChooseScale(const Scene& scene, const Selection& sel, uint32_t budget)
+{
+    constexpr float kMinScale = 1.0f / 32.0f;
+    constexpr float kMaxScale = 64.0f;
+    if (sel.items.empty()) {
+        return 1.0f;
+    }
+    if (budget == 0 || ScaleCost(scene, sel, kMinScale) > budget) {
+        return kMinScale;  // even the coarsest levels overshoot: nothing to spend
+    }
+    if (ScaleCost(scene, sel, kMaxScale) <= budget) {
+        return kMaxScale;  // everything can be at its finest level
+    }
+    float lo = std::log2(kMinScale);  // fits
+    float hi = std::log2(kMaxScale);  // does not fit
+    for (int i = 0; i < 20; i++) {
+        const float mid = 0.5f * (lo + hi);
+        if (ScaleCost(scene, sel, std::exp2(mid)) <= budget) {
+            lo = mid;
+        } else {
+            hi = mid;
         }
     }
+    return std::exp2(lo);
 }
 
 } // namespace lod
