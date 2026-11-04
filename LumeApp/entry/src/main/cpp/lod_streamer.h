@@ -1036,6 +1036,36 @@ private:
             replaced++;
         }
 
+        // Merge touching dirty ranges before publishing. A big turn produces
+        // ~1000 one-block ranges; each costs the node a memcpy plus a
+        // cull-record fill, and publishes measured 50-120 ms. The gap tolerance
+        // is 0 on purpose: the upload cost is the number of bytes copied into the
+        // host-visible pool, not the range count, so merging across gaps would
+        // copy more, not less.
+        if (dirtyRanges_.size() >= 8) {
+            mergedDirty_.clear();
+            dirtyPairs_.clear();
+            for (size_t i = 0; i + 1 < dirtyRanges_.size(); i += 2) {
+                dirtyPairs_.push_back(DirtyRange { dirtyRanges_[i], dirtyRanges_[i + 1] });
+            }
+            std::sort(dirtyPairs_.begin(), dirtyPairs_.end(),
+                [](const DirtyRange& a, const DirtyRange& b) { return a.start < b.start; });
+            for (const DirtyRange& r : dirtyPairs_) {
+                if (!mergedDirty_.empty()) {
+                    const uint32_t lastStart = mergedDirty_[mergedDirty_.size() - 2];
+                    const uint32_t lastEnd = lastStart + mergedDirty_.back();
+                    if (r.start >= lastStart && r.start <= lastEnd) {
+                        const uint32_t end = std::max(lastEnd, r.start + r.count);
+                        mergedDirty_.back() = end - lastStart;
+                        continue;
+                    }
+                }
+                mergedDirty_.push_back(r.start);
+                mergedDirty_.push_back(r.count);
+            }
+            dirtyRanges_.swap(mergedDirty_);
+        }
+
         const auto tBlocks = std::chrono::steady_clock::now();
 
         // Live list = the gaussians of the selected leaves only (no duplicates).
@@ -1262,6 +1292,11 @@ private:
         uint32_t trans[8][8] = {};
     };
 
+    struct DirtyRange {
+        uint32_t start = 0;
+        uint32_t count = 0;
+    };
+
     struct FadeOut {
         uint32_t start = 0;
         uint32_t count = 0;
@@ -1295,6 +1330,8 @@ private:
     std::vector<Block> freeBlocks_;
     uint32_t poolTop_ = 0;
     std::vector<uint32_t> dirtyRanges_;  // (start, count) pairs
+    std::vector<uint32_t> mergedDirty_;  // coalescing scratch
+    std::vector<DirtyRange> dirtyPairs_; // coalescing scratch
     std::vector<uint32_t> liveRanges_;  // (start, count) pairs of the drawn set
     uint32_t liveCount_ = 0;
     std::unordered_set<uint32_t> selectedLeaves_;
