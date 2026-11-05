@@ -66,6 +66,10 @@ add_library(LumeEngine SHARED
     ${LUME_ENGINE_DIR}/src/version.cpp
 
     # -- OHOS NDK platform sources (rawfile + filesystem + platform init) --
+    # Upstream dropped the NAPI-based "ohos_ndk" platform implementation in
+    # favour of the full-tree "ohos" one (C++ ResourceManager, not shippable
+    # against the app SDK). The app keeps the NDK implementation, restored
+    # verbatim from the pre-sync tree; only library_ohos.cpp is shared.
     ${LUME_ENGINE_DIR}/src/os/ohos/library_ohos.cpp
     ${LUME_ENGINE_DIR}/src/os/ohos_ndk/logger_output_ndk.cpp
     ${LUME_ENGINE_DIR}/src/os/ohos_ndk/ohos_file_ndk.cpp
@@ -406,6 +410,7 @@ add_library(LumeRender SHARED
     ${LUME_RENDER_DIR}/src/plugin/static_plugin.cpp
     ${LUME_RENDER_DIR}/src/plugin/static_registry.cpp
     ${LUME_RENDER_DIR}/src/util/json.cpp
+    ${LUME_RENDER_DIR}/src/util/native_fence_fd.cpp
     ${LUME_RENDER_DIR}/src/datastore/render_data_store_default_acceleration_structure_staging.cpp
     ${LUME_RENDER_DIR}/src/datastore/render_data_store_default_gpu_resource_data_copy.cpp
     ${LUME_RENDER_DIR}/src/datastore/render_data_store_default_staging.cpp
