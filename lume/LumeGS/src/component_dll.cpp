@@ -25,6 +25,7 @@
 #include <core/ecs/intf_ecs.h>
 #include <core/ecs/intf_system.h>
 #include <core/intf_engine.h>
+#include <core/image/intf_image_loader_manager.h>
 #include <core/io/intf_file_manager.h>
 #include <core/plugin/intf_plugin.h>
 #include <core/plugin/intf_plugin_decl.h>
@@ -36,7 +37,6 @@
 #include <render/intf_render_context.h>
 #include <meta/interface/intf_object_registry.h>
 
-#include "gaussian_splatting/gs_node.h"
 #include "loader/gs_loader.h"
 #include "plugin_gs/ecs/components/gs_component.h"
 #include "plugin_gs/ecs/components/gs_configuration_component.h"
@@ -70,7 +70,7 @@
 #include "util/gs_picking.h"
 
 #ifdef __OHOS_PLATFORM__
-#include "webp/image_loader_webp.h"
+// TODO(LumeApp): ImageKit WebP loader replaces the libwebp one.
 #endif
 
 // Rofs Data.
@@ -103,8 +103,6 @@ static constexpr CORE_NS::IImageLoaderManager::ImageLoaderTypeInfo WEBP_LOADER {
     { CORE_NS::IImageLoaderManager::ImageLoaderTypeInfo::UID },
     nullptr,
     BASE_NS::Uid { "4171ec62-57ec-47be-bcd2-0d481e27ce69" },
-    WebPPlugin::CreateImageLoaderWebP,
-    WebPPlugin::IMAGE_TYPES,
 };
 #endif
 } // namespace
@@ -584,7 +582,6 @@ PluginToken RegisterInterfaces(IPluginRegister& pluginRegistry)
 #ifdef __OHOS_PLATFORM__
     pluginRegistry.RegisterTypeInfo(WEBP_LOADER);
 #endif
-    META_NS::GetObjectRegistry().RegisterObjectType<GS_ADDON_NS::GSNode>();
     return &pluginRegistry;
 }
 
@@ -608,7 +605,6 @@ void UnregisterInterfaces(PluginToken token)
     for (const auto& info : gRenderDataStores) {
         pluginRegistry.UnregisterTypeInfo(info);
     }
-    META_NS::GetObjectRegistry().UnregisterObjectType<GS_ADDON_NS::GSNode>();
 }
 } // namespace GS
 

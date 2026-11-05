@@ -1890,7 +1890,7 @@ void GltfAOSLoading(size_t ii, const size_t allChannel, std::shared_ptr<const st
             int degree;
             int coef;
             int b = -1;
-            if (sscanf_s(attributeNames[i].c_str() + 23u, "SH_DEGREE_%d_COEF_%d", &degree, &coef) == 2u) {
+            if (sscanf(attributeNames[i].c_str() + 23u, "SH_DEGREE_%d_COEF_%d", &degree, &coef) == 2u) {
                 b = degree * degree + coef;
             }
             if (b >= 0 && b < static_cast<int>(GS_NUM_HARMONICS)) {
@@ -1925,7 +1925,7 @@ void GltfSOALoading(size_t ii, std::shared_ptr<const std::vector<uint8_t>>& unco
             int degree;
             int coef;
             int b = -1;
-            if (sscanf_s(attributeNames[i].c_str() + 23u, "SH_DEGREE_%d_COEF_%d", &degree, &coef) == 2u) {
+            if (sscanf(attributeNames[i].c_str() + 23u, "SH_DEGREE_%d_COEF_%d", &degree, &coef) == 2u) {
                 b = degree * degree + coef;
             }
             if (b >= 0 && b < static_cast<int>(GS_NUM_HARMONICS)) {
@@ -1950,7 +1950,7 @@ uint32_t GetAttributeChannle(std::string name)
     } else if (name.compare(0, 23u, "KHR_gaussian_splatting:") == 0) {
         int degree;
         int coef;
-        if (sscanf_s(name.c_str() + 23u, "SH_DEGREE_%d_COEF_%d", &degree, &coef) == 2) {
+        if (sscanf(name.c_str() + 23u, "SH_DEGREE_%d_COEF_%d", &degree, &coef) == 2) {
             return 3u;
         }
     }

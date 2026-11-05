@@ -619,6 +619,99 @@ target_link_libraries(LumeRender PUBLIC
     libhilog_ndk.z.so
 )
 
+
+# ---------- LumeGS (official Gaussian splatting plugin, shared library) ----------
+set(LUME_GS_DIR ${ENGINE_ROOT}/LumeGS)
+add_library(LumeGS SHARED
+    ${LUME_GS_DIR}/src/component_dll.cpp
+    ${LUME_GS_DIR}/src/components/gs_component.cpp
+    ${LUME_GS_DIR}/src/components/gs_configuration_component.cpp
+    ${LUME_GS_DIR}/src/components/gs_tiling_component.cpp
+    ${LUME_GS_DIR}/src/components/gs_effect_component.cpp
+    ${LUME_GS_DIR}/src/data/sog_parsing.cpp
+    ${LUME_GS_DIR}/src/data/glb_parsing.cpp
+    ${LUME_GS_DIR}/src/decoder/gs_decoder.cpp
+    ${LUME_GS_DIR}/src/loader/gs_loader.cpp
+    ${LUME_GS_DIR}/src/loader/ai_edit_loader.cpp
+    ${LUME_GS_DIR}/src/loader/gs_importer.cpp
+    ${LUME_GS_DIR}/src/loader/spatial_codec_loader.cpp
+    ${LUME_GS_DIR}/src/loader/xengine_loader.cpp
+    ${LUME_GS_DIR}/src/render/render_data_store_default_gs.cpp
+    ${LUME_GS_DIR}/src/render/render_data_store_gs_edit.cpp
+    ${LUME_GS_DIR}/src/render/render_data_store_gs_floater_v2_1.cpp
+    ${LUME_GS_DIR}/src/render/render_node_gs_render.cpp
+    ${LUME_GS_DIR}/src/render/render_node_gs_floater_v2_1.cpp
+    ${LUME_GS_DIR}/src/render/gsedit/gs_editor.cpp
+    ${LUME_GS_DIR}/src/render/gsedit/gsedit_shader_action_executor.cpp
+    ${LUME_GS_DIR}/src/render/gsedit/gsedit_shader_default_actions.cpp
+    ${LUME_GS_DIR}/src/render/GsAIEdit/render_data_store_gs_ai_edit.cpp
+    ${LUME_GS_DIR}/src/render/GsAIEdit/render_node_gs_ai_edit_render.cpp
+    ${LUME_GS_DIR}/src/render/coloredit/render_effects_coloredit_node.cpp
+    ${LUME_GS_DIR}/src/render/comic/render_effects_comic_node.cpp
+    ${LUME_GS_DIR}/src/render/obradinn/render_effects_obradinn_node.cpp
+    ${LUME_GS_DIR}/src/render/retro/render_effects_retro_node.cpp
+    ${LUME_GS_DIR}/src/render/watercolor/render_effects_watercolor_node.cpp
+    ${LUME_GS_DIR}/src/systems/gs_system.cpp
+    ${LUME_GS_DIR}/src/systems/gs_tiling_system.cpp
+    ${LUME_GS_DIR}/src/systems/gs_edit_system.cpp
+    ${LUME_GS_DIR}/src/systems/gs_ai_edit_system.cpp
+    ${LUME_GS_DIR}/src/systems/gs_effects_system.cpp
+    ${LUME_GS_DIR}/src/util/gs_loading.cpp
+    ${LUME_GS_DIR}/src/util/gs_picking.cpp
+    ${LUME_GS_DIR}/src/util/gs_serialization.cpp
+    ${LUME_GS_DIR}/src/util/gs_vertex_blob.cpp
+    ${LUME_GS_DIR}/version.cpp
+    ${ENGINE_ROOT}/LumeEngine/api/core/property_tools/property_data.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/generated/gs_rofs_embed.cpp
+)
+
+target_include_directories(LumeGS
+    PUBLIC
+        ${LUME_GS_DIR}/api
+    PRIVATE
+        ${LUME_GS_DIR}/src
+        ${LUME_GS_DIR}/assets
+        ${LUME_GS_DIR}/api/plugin_gs
+        ${LUME_GS_DIR}/src/loader
+        ${LUME_GS_DIR}/src/render
+        ${LUME_GS_DIR}/src/loader/spatial_codec_api
+        ${LUME_GS_DIR}/src/loader/xengine_api
+        ${ENGINE_ROOT}/LumeEngine/ecshelper
+        ${CMAKE_CURRENT_SOURCE_DIR}/shims
+)
+
+target_compile_definitions(LumeGS PRIVATE
+    CORE_PLUGIN=1
+)
+
+target_compile_options(LumeGS PRIVATE
+    -fno-exceptions
+    -fno-rtti
+    -fvisibility=hidden
+    -fvisibility-inlines-hidden
+    -Wno-unused-function
+    -Wno-unused-parameter
+    -Wno-unused-variable
+    -Wno-sign-compare
+    -Wno-missing-field-initializers
+    -Wno-c++11-narrowing
+)
+
+target_link_libraries(LumeGS PUBLIC
+    LumeEngine
+    LumeBase
+    LumeMeta
+    LumeRender
+    Lume_3D
+    securec_shim
+    z
+    libhilog_ndk.z.so
+    libnative_window.so
+    libnative_buffer.so
+    libimage_source.so
+    libpixelmap.so
+)
+
 # ---------- lumeapp: application .so linking all shared engine libs ----------
 add_library(lumeapp SHARED
     render_main.cpp
@@ -665,5 +758,6 @@ add_custom_command(TARGET lumeapp POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:LumeRender> ${LIBS_DIR}/
     COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:Lume_3D> ${LIBS_DIR}/
     COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:LumeMeta> ${LIBS_DIR}/
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:LumeGS> ${LIBS_DIR}/
     COMMENT "Copying all shared libraries to entry/libs for HAP packaging"
 )
