@@ -1,0 +1,26 @@
+#version 460 core
+#extension GL_ARB_separate_shader_objects : enable
+#extension GL_ARB_shading_language_420pack : enable
+#define V21_COMPUTE_SHADER 1
+#define V21_PROFILE_RADIX 1
+#include "common/v2_1_bindings.glsl"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+shared uint localCounts[256];
+
+void main()
+{
+    uint localId = gl_LocalInvocationID.x;
+    uint groupId = gl_WorkGroupID.x;
+    uint id = gl_GlobalInvocationID.x;
+    localCounts[localId] = 0u;
+    barrier();
+    if (id < pushData.mode) {
+        bool scratchInput = ((pushData.round / 8u) & 1u) != 0u;
+        uint key = scratchInput ? sortScratch[id].orderedDepthKey : sortEntries[id].orderedDepthKey;
+        uint bucket = (key >> pushData.round) & 255u;
+        atomicAdd(localCounts[bucket], 1u);
+    }
+    barrier();
+    histogramBins[groupId * 256u + localId].count = localCounts[localId];
+}

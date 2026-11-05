@@ -1,0 +1,36 @@
+#version 460 core
+#extension GL_ARB_separate_shader_objects : enable
+#extension GL_ARB_shading_language_420pack : enable
+#define V21_COMPUTE_SHADER 1
+#define V21_PROFILE_CLEAR_MAIN 1
+#include "common/v2_1_bindings.glsl"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+void main()
+{
+    uint id = gl_GlobalInvocationID.x;
+    if (pushData.mode == 0u) {
+        if (id < v21.counts.x) {
+            states[id] = V21GaussianState(0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u,
+                V21_INVALID_ID, V21_INVALID_ID, uintBitsToFloat(0x7fc00000u), 0u);
+            analysis[id] = V21GaussianAnalysis(
+                V21Evidence(0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u),
+                V21Features(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0));
+        }
+        return;
+    }
+    if (id < v21.counts.x) {
+        states[id].currentDepthMask = 0u;
+        states[id].currentSeedMask = 0u;
+        states[id].currentPropagatedMask = 0u;
+        states[id].hashNext = V21_INVALID_ID;
+        states[id].score = 0.0;
+        states[id].protectionMask = 0u;
+        analysis[id] = V21GaussianAnalysis(
+            V21Evidence(0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u),
+            V21Features(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0));
+    }
+}

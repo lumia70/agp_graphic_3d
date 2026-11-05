@@ -1,0 +1,359 @@
+# Copyright (c) 2025 Huawei Device Co., Ltd.
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import("//build/ohos.gni")
+import("//foundation/graphic/graphic_3d/lume/lume_config.gni")
+
+declare_args() {
+  GS_EMBEDDED_ASSETS_ENABLED = true
+  GS_ROFS = "gsrofs"
+}
+
+config("gs_api") {
+  include_dirs = []
+
+  defines = []
+
+  if (BUILDTYPE == "Release") {
+    defines += [ "PLUGIN_LOG_NO_DEBUG=0" ]
+  }
+
+  if (BUILDTYPE == "MinSizeRel") {
+    defines += [ "PLUGIN_LOG_NO_DEBUG=0" ]
+  }
+
+  if (BUILDTYPE == "RelWithDebInfo") {
+    defines += [ "PLUGIN_LOG_NO_DEBUG=0" ]
+  }
+
+  if (LUME_OHOS_BUILD) {
+    defines += [ "__OHOS_PLATFORM__" ]
+    defines += [ "__OHOS_PLATFORM_PARSING_CAMERA_POSE_ENABLED__" ]
+  }
+
+  cflags = [
+    "-O2",
+    "-flto=thin",
+    "-Wno-nullability-completeness",
+    "-Wno-ignored-qualifiers",
+    "-Wno-switch",
+    "-Wno-unused-variable",
+    "-Wno-unused-private-field",
+    "-Wno-unused-function",
+    "-Wno-unused-lambda-capture",
+    "-Wno-unused-but-set-variable",
+    "-Wno-overloaded-virtual",
+  ]
+}
+
+config("gs_config") {
+  if (GS_EMBEDDED_ASSETS_ENABLED) {
+    defines = [
+      "GS_EMBEDDED_ASSETS_ENABLED=1",
+      "CORE_PLUGIN=1",
+    ]
+  }
+
+  defines += [ "RENDER_PUBLIC=__attribute__((visibility(\"default\")))" ]
+
+  ldflags = [ "-Wl,--undefined=AGPRender_StaticPlugin" ]
+
+  cflags = [
+    "-Wno-nullability-completeness",
+    "-Wno-ignored-qualifiers",
+    "-Wno-switch",
+    "-Wno-header-hygiene",
+    "-Wno-inconsistent-missing-override",
+    "-Wno-unused-variable",
+  ]
+
+  defines += [
+    "RENDER_HAS_GLES_BACKEND=1",
+    "RENDER_HAS_VULKAN_BACKEND=1",
+    "VMA_STATS_STRING_ENABLED=0",
+    "VMA_STATIC_VULKAN_FUNCTIONS=0",
+  ]
+}
+
+lume_compile_shader("gs_compile_shader") {
+  script = "${LUME_CORE_PATH}/tools/CompilerShader.sh"
+  outputs = [ "$target_gen_dir" ]
+  tool_path = "$target_gen_dir/../LumeBinaryCompile/LumeShaderCompiler"
+  dest_gen_path = "$target_gen_dir/assets"
+  asset_path = rebase_path("./assets/app", root_build_dir)
+  shader_path = "${dest_gen_path}/shaders"
+  include_path = rebase_path("${LUME_CORE3D_PATH}/api", root_build_dir)
+  render_include_path = rebase_path("${LUME_RENDER_PATH}/api", root_build_dir)
+  compileShader_deps =
+      [ "${LUME_BINARY_PATH}/LumeShaderCompiler:lume_binary_shader_compile" ]
+  if (ohos_indep_compiler_enable) {
+    tool_path = "//prebuilts/graphics_3d/AGPBinaryCompile"
+    compileShader_deps -= [
+      "${LUME_BINARY_PATH}/LumeShaderCompiler:lume_binary_shader_compile",
+    ]
+  }
+}
+
+lume_rofs("gs_rofs") {
+  output_obj = ""
+  if (target_cpu == "arm") {
+    output_obj = "${GS_ROFS}_32.o"
+  }
+
+  if (target_cpu == "arm64") {
+    output_obj = "${GS_ROFS}_64.o"
+  }
+
+  if (target_cpu == "x86") {
+    output_obj = "${GS_ROFS}_x32.o"
+  }
+
+  if (target_cpu == "x86_64") {
+    output_obj = "${GS_ROFS}_x64.o"
+  }
+
+  outputs = "${target_gen_dir}/assets/${output_obj}"
+
+  tool_path = "$target_gen_dir/../LumeBinaryCompile/lumeassetcompiler"
+  root = "/"
+  bin_name = "GS_BIN"
+  size_name = "GS_BIN_SIZE"
+  base_name = GS_ROFS
+  script = "${LUME_CORE_PATH}/tools/CompilerAsset.sh"
+  copy_path = "$target_gen_dir/assets"
+  compileShader_deps = [
+    ":gs_compile_shader",
+    "${LUME_BINARY_PATH}/lumeassetcompiler:lume_binary_assets_compile",
+  ]
+  if (ohos_indep_compiler_enable) {
+    tool_path = "//prebuilts/graphics_3d/AGPBinaryCompile/"
+    compileShader_deps -= [
+      "${LUME_BINARY_PATH}/lumeassetcompiler:lume_binary_assets_compile",
+    ]
+  }
+  file_extension = "\".spv;.json;.lsb;.shader;.shadergs;.shadervid;.shaderpl;.rng;.gles\""
+}
+
+source_set("gs_rofs_obj") {
+  output_obj = ""
+  if (target_cpu == "arm") {
+    output_obj = "${GS_ROFS}_32.o"
+  }
+
+  if (target_cpu == "arm64") {
+    output_obj = "${GS_ROFS}_64.o"
+  }
+
+  if (target_cpu == "x86") {
+    output_obj = "${GS_ROFS}_x32.o"
+  }
+
+  if (target_cpu == "x86_64") {
+    output_obj = "${GS_ROFS}_x64.o"
+  }
+
+  sources = [ "${target_gen_dir}/assets/${output_obj}" ]
+  deps = [ ":gs_rofs" ]
+}
+
+ohos_source_set("3d_gs_src") {
+  branch_protector_ret = "pac_ret"
+
+  sources = [
+    "src/component_dll.cpp",
+    "src/components/gs_component.cpp",
+    "src/render/render_data_store_default_gs.cpp",
+    "src/render/render_data_store_gs_floater_v2_1.cpp",
+    "src/render/render_node_gs_render.cpp",
+    "src/render/render_node_gs_floater_v2_1.cpp",
+    "src/render/GsAIEdit/render_data_store_gs_ai_edit.cpp",
+    "src/render/GsAIEdit/render_node_gs_ai_edit_render.cpp",
+    "src/render/render_data_store_gs_edit.cpp",
+    "src/systems/gs_system.cpp",
+    "version.cpp",
+    "src/decoder/gs_decoder.cpp",
+    "src/loader/gs_loader.cpp",
+    "src/loader/gs_importer.cpp",
+    "src/loader/spatial_codec_loader.cpp",
+    "src/loader/xengine_loader.cpp",
+    "src/util/gs_picking.cpp",
+    "src/util/gs_loading.cpp",
+    "src/util/gs_serialization.cpp",
+    "src/util/gs_vertex_blob.cpp",
+    "src/components/gs_tiling_component.cpp",
+    "src/systems/gs_tiling_system.cpp",
+    "src/data/sog_parsing.cpp",
+    "src/data/glb_parsing.cpp",
+    "src/components/gs_effect_component.cpp",
+    "src/render/retro/render_effects_retro_node.cpp",
+    "src/render/comic/render_effects_comic_node.cpp",
+    "src/render/watercolor/render_effects_watercolor_node.cpp",
+    "src/render/obradinn/render_effects_obradinn_node.cpp",
+    "src/render/coloredit/render_effects_coloredit_node.cpp",
+    "src/render/gsedit/gs_editor.cpp",
+    "src/render/gsedit/gsedit_shader_action_executor.cpp",
+    "src/render/gsedit/gsedit_shader_default_actions.cpp",
+    "src/systems/gs_edit_system.cpp",
+    "src/systems/gs_ai_edit_system.cpp",
+    "src/systems/gs_effects_system.cpp",
+    "src/components/gs_configuration_component.cpp",
+    "src/webp/image_loader_webp.cpp",
+    "src/webp/image_loader_webp.h",
+    "src/gsedit/gs_node.cpp",
+    "${LUME_CORE_PATH}/api/core/property_tools/property_data.cpp"
+  ]
+  include_dirs = [
+    "api",
+    "api/plugin_gs/ecs/components",
+    "api/plugin_gs/ecs/systems",
+    "api/plugin_gs/util",
+    "src/loader/xengine_api",
+    "assets",
+    "api/plugin_gs/render",
+    "api/plugin_gs",
+    "assets",
+    "src",
+    "src/loader",
+    "src/loader/spatial_codec_api",
+    "src/loader/xengine_api",
+    "assets",
+    "src/render",
+  ]
+
+  configs = [
+    ":gs_api",
+    ":gs_config",
+  ]
+
+  deps = [
+    "${LUME_CORE_PATH}:AGPEcshelperApi",
+    "${LUME_CORE_PATH}:AGPBaseApi",
+    "${LUME_CORE_PATH}:AGPEngineApi",
+    "${LUME_CORE3D_PATH}:AGP3DApi",
+    "${LUME_RENDER_PATH}:AGPRenderApi",
+    "${LUME_META_PATH}:AGPMetaApi",
+    "${LUME_SCENE_PATH}:AGPSceneApi",
+  ]
+  if (GS_EMBEDDED_ASSETS_ENABLED) {
+    deps += [ ":gs_rofs_obj" ]
+  }
+  external_deps = [
+    "c_utils:utils",
+    "hilog:libhilog",
+    "hitrace:hitrace_meter",
+    "graphic_2d:EGL",
+    "graphic_2d:GLESv3",
+    "vulkan-headers:vulkan_headers",
+    "zlib:shared_libz",
+    "egl:libEGL",
+    "skia:libwebpm133",
+    "node:node_header_notice",
+  ]
+
+  defines = []
+
+  part_name = "graphic_3d"
+  subsystem_name = "graphic"
+}
+
+ohos_source_set("3d_gs_ai_edit_loader") {
+  branch_protector_ret = "pac_ret"
+
+  sources = [
+    "src/loader/ai_edit_loader.cpp",
+  ]
+
+  include_dirs = [
+    "api",
+    "api/plugin_gs/ecs/components",
+    "api/plugin_gs/ecs/systems",
+    "api/plugin_gs/util",
+    "src/loader/xengine_api",
+    "assets",
+    "api/plugin_gs/render",
+    "api/plugin_gs",
+    "assets",
+    "src",
+    "src/loader",
+    "src/loader/spatial_codec_api",
+    "src/loader/xengine_api",
+    "assets",
+    "src/render",
+  ]
+
+  configs = [
+    ":gs_api",
+    ":gs_config",
+  ]
+
+  deps = [
+    "${LUME_CORE_PATH}:AGPEcshelperApi",
+    "${LUME_CORE_PATH}:AGPBaseApi",
+    "${LUME_CORE_PATH}:AGPEngineApi",
+    "${LUME_CORE3D_PATH}:AGP3DApi",
+    "${LUME_RENDER_PATH}:AGPRenderApi",
+    "${LUME_META_PATH}:AGPMetaApi",
+    "${LUME_SCENE_PATH}:AGPSceneApi",
+  ]
+  if (GS_EMBEDDED_ASSETS_ENABLED) {
+    deps += [ ":gs_rofs_obj" ]
+  }
+  external_deps = [
+    "c_utils:utils",
+    "hilog:libhilog",
+    "hitrace:hitrace_meter",
+    "graphic_2d:EGL",
+    "graphic_2d:GLESv3",
+    "vulkan-headers:vulkan_headers",
+    "zlib:shared_libz",
+    "egl:libEGL",
+    "skia:libwebpm133",
+    "node:node_header_notice",
+  ]
+
+  part_name = "graphic_3d"
+  subsystem_name = "graphic"
+}
+
+config("gs_api_public") {
+  include_dirs = [
+    "api",
+    "api/plugin_gs",
+    "api/plugin_gs/ecs/components",
+    "api/plugin_gs/ecs/systems",
+    "api/plugin_gs/render",
+    "api/plugin_gs/util",
+    "src/loader/xengine_api",
+    "assets",
+  ]
+}
+
+ohos_shared_library("libPluginGS") {
+  branch_protector_ret = "pac_ret"
+
+  public_configs = [
+    ":gs_api_public",
+  ]
+
+  deps = [
+    ":3d_gs_src",
+    ":3d_gs_ai_edit_loader",
+  ]
+  version_script = "libPluginGS.versionscript"
+  ldflags = [
+    "-Wl,--undefined=_ZN4Core17GetPluginRegisterEv",
+  ]
+  relative_install_dir = "graphics3d"
+  part_name = "graphic_3d"
+  subsystem_name = "graphic"
+}

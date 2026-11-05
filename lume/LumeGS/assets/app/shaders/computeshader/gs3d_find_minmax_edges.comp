@@ -1,0 +1,95 @@
+#version 460 core
+#extension GL_ARB_separate_shader_objects : enable
+#extension GL_ARB_shading_language_420pack : enable
+
+#include "common/gs_struct_common.h"
+
+layout(set = 0, binding = 0, r8) readonly restrict uniform image2D uEdgeTex;
+layout(set = 0, binding = 1) uniform sampler2D uDepthTex;
+
+layout(set = 0, binding = 2, std430) restrict buffer outMinmaxEdges
+{
+    GsEdgesBufferLayout edgeBuffer;
+};
+
+layout(push_constant, std430) uniform uPostProcessPushConstant
+{
+    GsEdgeMinMaxPushConstantStruct uPc;
+};
+
+const float THRESHOLD = 0.25;
+
+vec3 ReconstructWorldPos(vec2 uv, float ndcDepth)
+{
+    vec4 clip = vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, ndcDepth, 1.0);
+    vec4 world = uPc.invViewProj * clip;
+    return world.xyz / world.w;
+}
+
+vec4 SampleAt(ivec2 px, ivec2 imageDim)
+{
+    float d = texelFetch(uDepthTex, px, 0).r;
+    vec2 puv = (vec2(px) + 0.5) / vec2(imageDim);
+    return vec4(ReconstructWorldPos(puv, d), d);
+}
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+void main()
+{
+    if (uPc.isFirstPass > 0.5f) {
+        if (gl_LocalInvocationIndex == 0u) {
+            edgeBuffer.minX = 0x7FFFFFFF;
+            edgeBuffer.minY = 0x7FFFFFFF;
+            edgeBuffer.maxX = -1;
+            edgeBuffer.maxY = -1;
+        }
+        return;
+    }
+
+    const ivec2 imageDim = imageSize(uEdgeTex);
+    const ivec2 uv = ivec2(gl_GlobalInvocationID.xy);
+    const int kernelSize = 1;
+    if (uv.x < kernelSize || uv.y < kernelSize || uv.x >= imageDim.x - kernelSize || uv.y >= imageDim.y - kernelSize) {
+        return;
+    }
+
+    float sum = 0.0;
+    for (int y = 0 /*-kernelSize*/; y <= kernelSize; y++) {
+        for (int x = 0 /*-kernelSize*/; x <= kernelSize; x++) {
+            sum += imageLoad(uEdgeTex, uv + ivec2(x, y)).r;
+        }
+    }
+
+    const float kernelArea = 4; // float((2 * kernelSize + 1) * (2 * kernelSize + 1));
+    float mean = sum / kernelArea;
+    if (mean >= THRESHOLD) {
+        return;
+    }
+
+    float depthNdc = texelFetch(uDepthTex, uv, 0).r;
+    vec2 pixelUv = (vec2(uv) + 0.5) / vec2(imageDim);
+    vec3 world = ReconstructWorldPos(pixelUv, depthNdc);
+
+    // Sampling from prefiltered depth
+    // Reconstruct position with an offset pointing always inside the point of interest
+    const vec2 innwardOffsetFraction = vec2(0.005, 0.009); // ~8 px on 1600x900
+    const int inwardOffset = int(float(min(imageDim.x, imageDim.y)) * innwardOffsetFraction);
+
+    int old = atomicMin(edgeBuffer.minX, uv.x);
+    if (uv.x < old) {
+        edgeBuffer.worldMinX = SampleAt(ivec2(uv.x + inwardOffset, uv.y), imageDim);
+    }
+    old = atomicMin(edgeBuffer.minY, uv.y);
+    if (uv.y < old) {
+        edgeBuffer.worldMinY = SampleAt(ivec2(uv.x, uv.y + inwardOffset), imageDim);
+    }
+    old = atomicMax(edgeBuffer.maxX, uv.x);
+    if (uv.x > old) {
+        edgeBuffer.worldMaxX = SampleAt(ivec2(uv.x - inwardOffset, uv.y), imageDim);
+    }
+    old = atomicMax(edgeBuffer.maxY, uv.y);
+    if (uv.y > old) {
+        edgeBuffer.worldMaxY = SampleAt(ivec2(uv.x, uv.y - inwardOffset), imageDim);
+    }
+}

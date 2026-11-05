@@ -304,15 +304,15 @@ void SwapchainMln::CreateSwapchain(const SwapchainCreateInfo& createInfo)
     MlnDisplaySurfaceFormat surfaceFormat{};
     surfaceFormat.format = ToMlnFormat(desc_.format);
     surfaceFormat.colorSpace = selectedColorSpace;
+    const uint32_t desiredImageCount = (createInfo.swapchainImageCountOverride > 0u)
+                                   ? createInfo.swapchainImageCountOverride
+                                   : config.swapchainImageCount;
 
     // Clamp minImageCount to [caps.minImageCount, caps.maxImageCount]
-    uint32_t imageCount = config.swapchainImageCount;
-    if (imageCount < caps.minImageCount) {
-        imageCount = caps.minImageCount;
-    }
-    if (caps.maxImageCount > 0 && imageCount > caps.maxImageCount) {
-        imageCount = caps.maxImageCount;
-    }
+    const uint32_t imageCount = (caps.maxImageCount == 0)
+                                    ? (Math::max(caps.minImageCount, desiredImageCount))
+                                    : (Math::min(caps.maxImageCount,
+                                    Math::max(caps.minImageCount, desiredImageCount)));
 
     MlnSwapchainDescriptor scDesc{};
     scDesc.extensionCount = 0;

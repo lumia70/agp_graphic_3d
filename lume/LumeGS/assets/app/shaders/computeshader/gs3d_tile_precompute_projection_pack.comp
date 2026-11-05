@@ -1,0 +1,236 @@
+#version 460 core
+#extension GL_ARB_separate_shader_objects : enable
+#extension GL_ARB_shading_language_420pack : enable
+
+// includes
+#include "3d/shaders/common/3d_dm_structures_common.h"
+#include "common/gs_struct_common.h"
+#include "common/gs_common.h"
+
+layout(set = 0, binding = 0, std430) readonly restrict buffer inGSData {
+    GsSplatDataTilePacked referenceGSData[];
+};
+
+layout(set = 0, binding = 1, std430) readonly restrict buffer sortingBuffer1
+{
+    SortKeyIndex sortKeyData[];
+};
+
+layout(set = 0, binding = 2, std430) writeonly restrict buffer outGsDataPacked
+{
+    uvec4 gsPackedDataBuf[];
+};
+
+layout(set = 0, binding = 3, std140) readonly uniform uCameraMatrices
+{
+    GsCameraUboStruct cameraUbo;
+};
+
+layout(set = 0, binding = 4, std140) readonly uniform uGSDynamicDataBuffer
+{
+    GsDynamicDataStruct gsDynamicDatas[GS_MAX_NUM_GS_OBJECTS];
+};
+
+layout(set = 0, binding = 5, r32f) writeonly restrict uniform image2D uDepthStoreTex;
+
+layout(set = 0, binding = 6, std430) writeonly restrict buffer outGsViewZData {
+    float gsViewZDataBuf[];
+};
+
+layout(set = 0, binding = 7, std430) buffer outDrawDispatch
+{
+    GsIndirectDrawDispatch indirectDrawDispatch;
+};
+
+layout(push_constant, std430) uniform uGsMetadata {
+    GsTilePrecomputePushConstantStruct uPc;
+};
+
+#define PACK_OPACITY(colorPacked, opacity) ((colorPacked & 0xFFFFFF00) | uint(opacity * 255.0f))
+
+vec3 ComputeCov2D(const vec3 mean, const float focalX, const float focalY, const mat4 viewMat, const vec3 covA, const vec3 covB)
+{
+    const vec4 t = viewMat * vec4(mean, 1.0f);
+    const float invZ = 1.0f / t.z;
+    const float invZ2 = invZ * invZ;
+
+    // Jacobian matrix
+    const mat3 J = mat3(
+        focalX * invZ, 0.0f, -(focalX * t.x) * invZ2,
+        0.0f, -focalY * invZ, (focalY * t.y) * invZ2,
+        0.0f, 0.0f, 0.0f
+    );
+
+    const mat3 W = transpose(mat3(viewMat));
+    const mat3 T = W * J;
+
+    const mat3 Vrk = mat3(
+        covA.x, covA.y, covA.z,
+        covA.y, covB.x, covB.y,
+        covA.z, covB.y, covB.z);
+
+    const mat3 cov = transpose(T) * Vrk * T;
+    return vec3(cov[0][0] + 0.3f, cov[0][1], cov[1][1] + 0.3f);
+}
+
+vec2 GetJitterOffset(const uint jitterIndex, const float width, const float height) {
+    const float invWidth = 1.0f / width;
+    const float invHeight = 1.0f / height;
+
+    const float jx = float(jitterIndex & 1) * GS_JITTER_AMOUNT * invWidth;
+    const float jy = float(jitterIndex >> 1) * GS_JITTER_AMOUNT * invHeight;
+    return vec2(jx, jy);
+}
+
+// a piece-wise triangle-step function
+#define GS_SCALER(x) (x <= 0.5f ? (x * 0.5f + 0.75f) : (x <= 0.7f ? (x + 0.5f) : (x * 0.16666667f + 1.0833333f)))
+
+#define ELLIPSE_CIRCULARITY(minorAxis, majorAxis) (minorAxis / max(majorAxis, 1e-6))
+
+layout(local_size_x = GS_PROCESS_DATA_TGS, local_size_y = 1, local_size_z = 1) in;
+void main()
+{
+    const uint elementId = gl_GlobalInvocationID.x;
+    if (elementId >= indirectDrawDispatch.instanceCount) {
+        return;
+    }
+
+    const uint gaussianId = sortKeyData[elementId].gsIndex;
+
+    const int gsIndex = int(uPc.gsObjectIndex);
+
+    const vec2 viewportSize = uPc.viewportSize;
+    const float width = viewportSize.x;
+    const float height = viewportSize.y;
+
+    const uint jitterIndex = uPc.jitterIndex;
+    const vec2 jitterOffset = GetJitterOffset(jitterIndex, width, height);
+
+    const mat4 worldMatrix = gsDynamicDatas[gsIndex].worldMat;
+    const mat4 viewMat = cameraUbo.view;
+    mat4 projMat = cameraUbo.proj;
+
+    // jitter the projection matrix for multi-frame accumulation
+    projMat[2].xy += jitterOffset;
+
+    const mat4 viewProjMat = projMat * viewMat;
+
+    const float fullWidth = width * uPc.renderScaleFactor;
+    const float fullHeight = height * uPc.renderScaleFactor;
+
+    const float invRenderScaleFactor = 1.0f / uPc.renderScaleFactor;
+
+    const float focalX = abs(projMat[0][0]) * fullWidth  * 0.5f;
+    const float focalY = abs(projMat[1][1]) * fullHeight * 0.5f;
+
+    const GsSplatDataTilePacked gsData = referenceGSData[gaussianId];
+
+    const vec4 positionWorld = worldMatrix * vec4(gsData.positionOpacityPacked.xyz, 1.0f);
+    const vec3 splatWorld = positionWorld.xyz;
+    const vec4 splatScreenPoint = viewProjMat * vec4(splatWorld, 1.0f);
+
+    const float invW = 1.0f / splatScreenPoint.w;
+    vec3 splatProjected = splatScreenPoint.xyz * invW;
+
+    bool isCulled = false;
+
+    const bool computeDepthPass = gsDynamicDatas[gsIndex].computeDepthPass == 1;
+
+    float gaussianOpacity = gsData.positionOpacityPacked.w;
+    const bool isRenderPoints = gaussianOpacity < 0.0f;
+    gaussianOpacity = abs(gaussianOpacity);
+
+    // Multiply by either 0 or 1 as a workaround for handling covA.rg being used as the point size.
+    vec4 covAUnpack = vec4(unpackHalf2x16(gsData.covColorPacked.x).xy, unpackHalf2x16(gsData.covColorPacked.y).xy);
+    covAUnpack = sign(covAUnpack) * covAUnpack * covAUnpack;
+    vec2 covBUnpack = vec2(unpackHalf2x16(gsData.covColorPacked.z).xy);
+    covBUnpack = sign(covBUnpack) * covBUnpack * covBUnpack;
+
+    vec3 covA = covAUnpack.rgb * (gaussianOpacity == 0.0f ? 0.0f : 1.0f);
+    vec3 covB = vec3(covAUnpack.a, covBUnpack.rg) * (gaussianOpacity == 0.0f ? 0.0f : 1.0f);
+
+    const bool enabled = gsDynamicDatas[gsIndex].enabled == 1u;
+    if (!enabled) {
+        isCulled = true;
+        gsPackedDataBuf[elementId] = uvec4(0);
+        return;
+    }
+
+    const vec3 cov = ComputeCov2D(gsData.positionOpacityPacked.xyz, focalX, focalY, viewMat * worldMatrix, covA, covB);
+
+    const float mid = (cov.x + cov.z) * 0.5f;
+    const float radius = length(vec2((cov.x - cov.z) * 0.5f, cov.y));
+    const float lambda1 = mid + radius;
+    const float lambda2 = mid - radius;
+
+    const vec2 diagonalVector = normalize(vec2(cov.y, lambda1 - cov.x)) * (2.0f * invRenderScaleFactor);
+
+    float sqrtLambda1 = sqrt(lambda1);
+    float sqrtLambda2 = sqrt(lambda2);
+
+    if (uPc.renderScaleFactor > 1.001f)
+    {
+        // prevent small splat aliasing
+
+        const float RADIUS_CLAMP_SIZE = mix(0.3f, 0.5f, gaussianOpacity);
+
+        const float pixelSize = 1.0f / invRenderScaleFactor;
+        const float minRadius = RADIUS_CLAMP_SIZE * pixelSize;
+
+        const float finalLambda1 = max(sqrtLambda1, minRadius);
+        const float finalLambda2 = max(sqrtLambda2, minRadius);
+
+        const float maxOriginalRadius = max(sqrtLambda1, sqrtLambda2);
+        const float compensation = maxOriginalRadius / max(finalLambda1, finalLambda2);
+
+        gaussianOpacity *= compensation;
+        sqrtLambda1 = finalLambda1;
+        sqrtLambda2 = finalLambda2;
+    }
+
+    // give more expansion weight to more circular splats
+    const float shapeScaler = ELLIPSE_CIRCULARITY(min(sqrtLambda1, sqrtLambda2), max(sqrtLambda1, sqrtLambda2));
+    const float opacityScaler = mix(1.0f, GS_SCALER(gaussianOpacity), shapeScaler);
+
+    vec2 majorAxis = min(opacityScaler * uPc.covarianceStddev * sqrtLambda1, MAX_SCREEN_SPLAT_SIZE) * diagonalVector;
+    const vec2 perpDiagonalVector = vec2(diagonalVector.y, -diagonalVector.x);
+    vec2 minorAxis = min(opacityScaler * uPc.covarianceStddev * sqrtLambda2, MAX_SCREEN_SPLAT_SIZE) * perpDiagonalVector;
+
+    if (isRenderPoints) {
+        // point size as (width, height) is encoded in the covA.rg
+        majorAxis = vec2(covA.r, 0);
+        minorAxis = vec2(0, -covA.g);
+    }
+
+    const uint screenPos = packHalf2x16(splatProjected.xy);
+    const uint colorPacked = PACK_OPACITY(gsData.covColorPacked.a, gaussianOpacity);
+
+    const vec2 invViewport = 1.0f / uPc.viewportSize;
+    majorAxis *= invViewport;
+    minorAxis *= invViewport;
+
+    const uvec2 axisPacked = uvec2(
+        packHalf2x16(majorAxis),
+        packHalf2x16(minorAxis)
+    );
+
+    const uvec4 dataFinalPacked = uvec4(
+        screenPos,
+        colorPacked,
+        axisPacked.x,
+        axisPacked.y
+    );
+
+    if (gsDynamicDatas[gsIndex].frameGenerationEnabled == 1) {
+        gsViewZDataBuf[elementId] = (viewMat * vec4(splatWorld, 1.0f)).z;
+        isCulled = gaussianOpacity < FLOATER_MAX_OPACITY;
+    }
+
+    gsPackedDataBuf[elementId] = isCulled ? uvec4(0) : dataFinalPacked;
+
+    if (computeDepthPass) {
+        const uint globalElementId = elementId + uPc.elementOffset;
+        const ivec2 depthUv = ivec2(globalElementId % GS_DATA_STORE_TEX_SIZE, globalElementId / GS_DATA_STORE_TEX_SIZE);
+        imageStore(uDepthStoreTex, depthUv, vec4(splatProjected.z, 0, 0, 0));
+    }
+}

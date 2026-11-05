@@ -1,0 +1,92 @@
+#version 460 core
+#extension GL_ARB_separate_shader_objects : enable
+#extension GL_ARB_shading_language_420pack : enable
+#define V21_COMPUTE_SHADER 1
+#define V21_PROFILE_CLEAR_AUX 1
+#include "common/v2_1_bindings.glsl"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+void main()
+{
+    uint id = gl_GlobalInvocationID.x;
+    if (pushData.mode == 1u) {
+        if (id < V21_SH_DIMENSIONS * V21_HISTOGRAM_BINS) {
+            histogramBins[id].count = 0u;
+        }
+        return;
+    }
+    if (pushData.mode == 0u) {
+        if (id < v21.peel.w) {
+            hashBuckets[id].head = V21_INVALID_ID;
+        }
+        if (id < V21_SH_DIMENSIONS * V21_HISTOGRAM_BINS) {
+            histogramBins[id].count = 0u;
+        }
+        if (id < V21_SH_DIMENSIONS) {
+            shRobustStats[id] = V21ShRobustStats(0xffffffffu, 0u, 0.0, 1.0);
+        }
+        if (id == 0u) {
+            globals = V21GlobalCounters(0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u,
+                0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u);
+        }
+        if (id < 8u) {
+            progressRecords[id] = V21ProgressRecord(V21_INVALID_ID, 0u, 0u, 0u,
+                0u, 0u, 0u, 0u, 0u, 0u, V21_STOP_NONE, 0u, 0u, 0u, 0u);
+        }
+        return;
+    }
+    if (pushData.mode == 3u) {
+        // Camera-only reset: rebuild all camera-dependent statistics while
+        // retaining the scene-level cumulative mask/list counters.
+        if (id < v21.peel.w) {
+            hashBuckets[id].head = V21_INVALID_ID;
+        }
+        if (id < V21_SH_DIMENSIONS * V21_HISTOGRAM_BINS) {
+            histogramBins[id].count = 0u;
+        }
+        if (id < V21_SH_DIMENSIONS) {
+            shRobustStats[id] = V21ShRobustStats(0xffffffffu, 0u, 0.0, 1.0);
+        }
+        if (id == 0u) {
+            globals.compactCount = 0u;
+            globals.proposedCount = 0u;
+            globals.appliedThisPeel = 0u;
+            globals.applyCurrentPeel = 0u;
+            globals.currentStrongPixels = 0u;
+            globals.initialStrongPixels = 0u;
+            globals.peakProposedCount = 0u;
+            globals.smallBatchStreak = 0u;
+            globals.stopReason = V21_STOP_NONE;
+            globals.committedPeels = 0u;
+            globals.roiCount = 0u;
+            globals.proposedOwnerPixels = 0u;
+            globals.protectedCount = 0u;
+            globals.proposedPixelCoverageQ = 0u;
+            globals.stableProtectedCount = 0u;
+            globals.thinProtectedCount = 0u;
+            globals.edgeProtectedCount = 0u;
+        }
+        if (id < 8u) {
+            progressRecords[id] = V21ProgressRecord(V21_INVALID_ID, 0u, 0u, 0u,
+                0u, 0u, 0u, 0u, 0u, 0u, V21_STOP_NONE, 0u, 0u, 0u, 0u);
+        }
+        return;
+    }
+    if (id < v21.peel.w) {
+        hashBuckets[id].head = V21_INVALID_ID;
+    }
+    if (id == 0u) {
+        globals.compactCount = 0u;
+        globals.proposedCount = 0u;
+        globals.appliedThisPeel = 0u;
+        globals.applyCurrentPeel = 0u;
+        globals.currentStrongPixels = 0u;
+        globals.proposedOwnerPixels = 0u;
+        globals.protectedCount = 0u;
+        globals.proposedPixelCoverageQ = 0u;
+        globals.stableProtectedCount = 0u;
+        globals.thinProtectedCount = 0u;
+        globals.edgeProtectedCount = 0u;
+    }
+}

@@ -1,0 +1,45 @@
+#version 460 core
+#extension GL_ARB_separate_shader_objects : enable
+#extension GL_ARB_shading_language_420pack : enable
+
+// includes
+#include "3d/shaders/common/3d_dm_structures_common.h"
+#include "common/gs_struct_common.h"
+#include "common/gs_common.h"
+#include "common/gs_edit_common.h"
+
+
+layout(set = 0, binding = 0, std430) restrict buffer indirectDispatchCounterBuffer {
+    // counter and indirect args to keep track of splat counts during editing
+    IndirectEditDispatchCounterBuffer indirectCounter;
+};
+
+layout(set = 0, binding = 1, std430) restrict buffer selectionIndexBuffer
+{
+    // indices for selecting splats, write in selection shaders, read everywhere else
+    uint selectionMask[];
+};
+
+layout(push_constant, std430) uniform uEditPushConstant {
+    GsEditIndirectPushConstantData uPc;
+};
+
+layout(local_size_x = GS_EDIT_WORKGROUP_SIZE, local_size_y = 1, local_size_z = 1) in;
+void main()
+{
+    if (gl_GlobalInvocationID.x == 0) {
+        const uint numSplats = uPc.numInitialSplats == 0 ? indirectCounter.counter : uPc.numInitialSplats;
+        indirectCounter.x = (numSplats + GS_EDIT_WORKGROUP_SIZE - 1) / GS_EDIT_WORKGROUP_SIZE;
+        indirectCounter.y = 1;
+        indirectCounter.z = 1;
+
+        indirectCounter.prevCounter = numSplats;
+        // selection passes: preserve the count, modifying passes: reset to 0
+        indirectCounter.counter = (uPc.indexClearValue != 0xFFFFffff) ? numSplats : 0u;
+
+        // reset selection index counter if the next pass is a selection pass
+        if (uPc.indexClearValue != 0xFFFFffff) {
+            selectionMask[0] = uPc.indexClearValue;
+        }
+    }
+}

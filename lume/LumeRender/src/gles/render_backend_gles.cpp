@@ -46,6 +46,7 @@
 #include "nodecontext/render_command_list.h"
 #include "nodecontext/render_node_graph_node_store.h"  // RenderCommandFrameData
 #include "util/log.h"
+#include "util/native_fence_fd.h"
 #include "util/render_frame_util.h"
 
 #define IS_BIT(value, bit) ((((value) & (bit)) == (bit)) ? true : false)
@@ -827,6 +828,38 @@ constexpr GLbitfield CommonBarrierBits(AccessFlags accessFlags, RenderHandleType
     // GL_ATOMIC_COUNTER_BARRIER_BIT is not used at the moment
     return barriers;
 }
+
+IRenderFrameUtil::WaitStatus GetWaitStatus(const DeviceGLES::NativeFenceWait result)
+{
+    switch (result) {
+        case DeviceGLES::NativeFenceWait::QUEUED:
+            return IRenderFrameUtil::WaitStatus::WAITED;
+        case DeviceGLES::NativeFenceWait::CPU_WAITED:
+            return IRenderFrameUtil::WaitStatus::CPU_WAITED;
+        default:
+            return IRenderFrameUtil::WaitStatus::IMPORT_FAILED;
+    }
+}
+
+void WaitExternalNativeFences(DeviceGLES& device, array_view<IRenderFrameUtil::WaitData> waitData)
+{
+    for (auto& ref : waitData) {
+        if (ref.nativeFenceFd < 0) {
+            continue;
+        }
+        // hand the fdsan ownership of the fd to the driver before importing it
+        ExchangeNativeFenceFdOwnership(ref.nativeFenceFd, false);
+        const auto result = device.WaitPlatformNativeFenceFd(ref.nativeFenceFd);
+        if (result == DeviceGLES::NativeFenceWait::UNSUPPORTED) {
+            // take the fdsan ownership back before the CPU wait closes the fd
+            ExchangeNativeFenceFdOwnership(ref.nativeFenceFd, true);
+            CpuWaitNativeFence(ref);
+            continue;
+        }
+        ref.nativeFenceFd = -1;  // EGL owns it now
+        ref.status = GetWaitStatus(result);
+    }
+}
 }  // namespace
 
 RenderBackendGLES::RenderBackendGLES(Device& device, GpuResourceManager& gpuResourceManager)
@@ -959,6 +992,11 @@ void RenderBackendGLES::Render(
 #endif
     presentationInfo_ = {};
 
+    // before any of this frame's work is queued, with the context current as eglWaitSyncKHR requires
+    if (renderCommandFrameData.renderFrameUtil && renderCommandFrameData.renderFrameUtil->HasGpuWaits()) {
+        WaitExternalNativeFences(device_, renderCommandFrameData.renderFrameUtil->GetGpuWaitData());
+    }
+
     if (device_.HasSwapchain() && (!backBufferConfig.swapchainData.empty())) {
         for (const auto& swapData : backBufferConfig.swapchainData) {
             if (const auto* swp = static_cast<const SwapchainGLES*>(device_.GetSwapchain(swapData.handle))) {
@@ -1027,12 +1065,21 @@ void RenderBackendGLES::RenderProcessEndCommandLists(
                     if (const auto* gs = (const GpuSemaphoreGles*)externalSemaphores[sigIdx].get(); gs) {
                         auto& plat = const_cast<GpuSemaphorePlatformDataGles&>(gs->GetPlatformData());
                         // NOTE: currently could create only one GPU sync
-                        GLsync sync = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
-                        plat.sync = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(sync));
+                        // only a native fence sync can be exported as an fd
+                        const auto fence = device_.CreatePlatformGpuFence();
+                        if (fence.nativeFence) {
+                            plat.sync = fence.handle;
+                        } else {
+                            GLsync sync = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+                            plat.sync = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(sync));
+                        }
+                        plat.nativeFence = fence.nativeFence;
                         externalSignals[sigIdx].gpuSignalResourceHandle = plat.sync;
-                        externalSignals[sigIdx].signaled = true;
+                        // nothing to wait on when creating the sync failed
+                        externalSignals[sigIdx].signaled = (plat.sync != 0);
 
-                        // NOTE: client is expected to add code for the wait with glClientWaitSync(sync, X, 0)
+                        // NOTE: the handle is an EGLSyncKHR with native fence sync support and a GLsync
+                        // otherwise. Clients must branch on DevicePlatformDataGLES::hasNativeFenceSyncExt.
                     }
                 }
             }

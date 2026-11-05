@@ -417,13 +417,16 @@ vec3 CalculateLighting(ShadingData sd, const uint materialFlags)
                 }
             }
 
-            const float lightAngleScale = uLightData.lights[currLightIdx].spotLightParams.x;
-            const float lightAngleOffset = uLightData.lights[currLightIdx].spotLightParams.y;
+            // one load each: the pair of scalars below come from the same vec4
+            const vec4 spotParams = uLightData.lights[currLightIdx].spotLightParams;
+            const vec4 lightDir = uLightData.lights[currLightIdx].dir;
+            const float lightAngleScale = spotParams.x;
+            const float lightAngleOffset = spotParams.y;
             // See: https://github.com/KhronosGroup/glTF/tree/master/extensions/2.0/Khronos/KHR_lights_punctual
-            const float cd = dot(uLightData.lights[currLightIdx].dir.xyz, -L);
+            const float cd = dot(lightDir.xyz, -L);
             const float angularAttenuation = clamp(cd * lightAngleScale + lightAngleOffset, 0.0, 1.0);
 
-            const float range = uLightData.lights[currLightIdx].dir.w;
+            const float range = lightDir.w;
             const float attenuation = max(min(1.0 - pow(dist / range, 4.0), 1.0), 0.0) / (dist * dist);
             color += CalculateLight(currLightIdx, materialDiffuseBRDF, L, NoL, sd, materialFlags) *
                      (angularAttenuation * angularAttenuation * attenuation) * shadowCoeff;
@@ -457,12 +460,14 @@ vec3 CalculateLighting(ShadingData sd, const uint materialFlags)
             const float dist = length(pointToLight);
             const vec3 L = pointToLight / dist;
             const float NoL = clamp(dot(sd.N, L), 0.0, 1.0);
-            const float range = uLightData.lights[currLightIdx].dir.w;
-            const float attenuation = max(min(1.0 - pow(dist / range, 4.0), 1.0), 0.0) / (dist * dist);
+            // whole vec4: CalculateRectAreaLight reads .xyz, so both resolve to one load
+            const vec4 lightDir = uLightData.lights[currLightIdx].dir;
+            const float range = lightDir.w;
+            // range window only: the solid angle in CalculateRectAreaLight already falls off with distance
+            const float attenuation = max(min(1.0 - pow(dist / range, 4.0), 1.0), 0.0);
             // NOTE: could check for NoL > 0.0 and NoV > 0.0
             color += CalculateRectAreaLight(
-                         currLightIdx, materialDiffuseBRDF, vec3(0.05), sd.N, sd.V, sd.pos.xyz, sd.alpha2) *
-                     attenuation;
+                currLightIdx, materialDiffuseBRDF, sd.f0.xyz, sd.N, sd.V, sd.pos.xyz, sd.alpha2) * attenuation;
         }
     }
 
@@ -552,13 +557,16 @@ vec3 CalculateLighting(
                 }
             }
 
-            const float lightAngleScale = uLightData.lights[currLightIdx].spotLightParams.x;
-            const float lightAngleOffset = uLightData.lights[currLightIdx].spotLightParams.y;
+            // one load each: the pair of scalars below come from the same vec4
+            const vec4 spotParams = uLightData.lights[currLightIdx].spotLightParams;
+            const vec4 lightDir = uLightData.lights[currLightIdx].dir;
+            const float lightAngleScale = spotParams.x;
+            const float lightAngleOffset = spotParams.y;
             // See: https://github.com/KhronosGroup/glTF/tree/master/extensions/2.0/Khronos/KHR_lights_punctual
-            const float cd = dot(uLightData.lights[currLightIdx].dir.xyz, -L);
+            const float cd = dot(lightDir.xyz, -L);
             const float angularAttenuation = clamp(cd * lightAngleScale + lightAngleOffset, 0.0, 1.0);
 
-            const float range = uLightData.lights[currLightIdx].dir.w;
+            const float range = lightDir.w;
             const float attenuation = max(min(1.0 - pow(dist / range, 4.0), 1.0), 0.0) / (dist * dist);
             color += CalculateLight(currLightIdx, materialDiffuseBRDF, L, NoL, sd, ccsv, ssv, materialFlags) *
                      (angularAttenuation * angularAttenuation * attenuation) * shadowCoeff;
@@ -592,12 +600,14 @@ vec3 CalculateLighting(
             const float dist = length(pointToLight);
             const vec3 L = pointToLight / dist;
             const float NoL = clamp(dot(sd.N, L), 0.0, 1.0);
-            const float range = uLightData.lights[currLightIdx].dir.w;
-            const float attenuation = max(min(1.0 - pow(dist / range, 4.0), 1.0), 0.0) / (dist * dist);
+            // whole vec4: CalculateRectAreaLight reads .xyz, so both resolve to one load
+            const vec4 lightDir = uLightData.lights[currLightIdx].dir;
+            const float range = lightDir.w;
+            // range window only: the solid angle in CalculateRectAreaLight already falls off with distance
+            const float attenuation = max(min(1.0 - pow(dist / range, 4.0), 1.0), 0.0);
             // NOTE: could check for NoL > 0.0 and NoV > 0.0
             color += CalculateRectAreaLight(
-                         currLightIdx, materialDiffuseBRDF, vec3(0.05), sd.N, sd.V, sd.pos.xyz, sd.alpha2) *
-                     attenuation;
+                currLightIdx, materialDiffuseBRDF, sd.f0.xyz, sd.N, sd.V, sd.pos.xyz, sd.alpha2) * attenuation;
         }
     }
     return color;
@@ -739,13 +749,16 @@ vec3 CalculateLighting(ShadingData sd, AnisotropicShadingVariables asv, Clearcoa
                 }
             }
 
-            const float lightAngleScale = uLightData.lights[currLightIdx].spotLightParams.x;
-            const float lightAngleOffset = uLightData.lights[currLightIdx].spotLightParams.y;
+            // one load each: the pair of scalars below come from the same vec4
+            const vec4 spotParams = uLightData.lights[currLightIdx].spotLightParams;
+            const vec4 lightDir = uLightData.lights[currLightIdx].dir;
+            const float lightAngleScale = spotParams.x;
+            const float lightAngleOffset = spotParams.y;
             // See: https://github.com/KhronosGroup/glTF/tree/master/extensions/2.0/Khronos/KHR_lights_punctual
-            const float cd = dot(uLightData.lights[currLightIdx].dir.xyz, -L);
+            const float cd = dot(lightDir.xyz, -L);
             const float angularAttenuation = clamp(cd * lightAngleScale + lightAngleOffset, 0.0, 1.0);
 
-            const float range = uLightData.lights[currLightIdx].dir.w;
+            const float range = lightDir.w;
             const float attenuation = max(min(1.0 - pow(dist / range, 4.0), 1.0), 0.0) / (dist * dist);
             color += CalculateLight(currLightIdx, materialDiffuseBRDF, L, NoL, sd, asv, ccsv, ssv, materialFlags) *
                      (angularAttenuation * angularAttenuation * attenuation) * shadowCoeff;
@@ -779,12 +792,14 @@ vec3 CalculateLighting(ShadingData sd, AnisotropicShadingVariables asv, Clearcoa
             const float dist = length(pointToLight);
             const vec3 L = pointToLight / dist;
             const float NoL = clamp(dot(sd.N, L), 0.0, 1.0);
-            const float range = uLightData.lights[currLightIdx].dir.w;
-            const float attenuation = max(min(1.0 - pow(dist / range, 4.0), 1.0), 0.0) / (dist * dist);
+            // whole vec4: CalculateRectAreaLight reads .xyz, so both resolve to one load
+            const vec4 lightDir = uLightData.lights[currLightIdx].dir;
+            const float range = lightDir.w;
+            // range window only: the solid angle in CalculateRectAreaLight already falls off with distance
+            const float attenuation = max(min(1.0 - pow(dist / range, 4.0), 1.0), 0.0);
             // NOTE: could check for NoL > 0.0 and NoV > 0.0
             color += CalculateRectAreaLight(
-                         currLightIdx, materialDiffuseBRDF, vec3(0.05), sd.N, sd.V, sd.pos.xyz, sd.alpha2) *
-                     attenuation;
+                currLightIdx, materialDiffuseBRDF, sd.f0.xyz, sd.N, sd.V, sd.pos.xyz, sd.alpha2) * attenuation;
         }
     }
 
@@ -907,13 +922,16 @@ vec3 CalculateLighting(ShadingData sd, SubsurfaceScatterShadingVariables sssv, c
                 }
             }
 
-            const float lightAngleScale = uLightData.lights[currLightIdx].spotLightParams.x;
-            const float lightAngleOffset = uLightData.lights[currLightIdx].spotLightParams.y;
+            // one load each: the pair of scalars below come from the same vec4
+            const vec4 spotParams = uLightData.lights[currLightIdx].spotLightParams;
+            const vec4 lightDir = uLightData.lights[currLightIdx].dir;
+            const float lightAngleScale = spotParams.x;
+            const float lightAngleOffset = spotParams.y;
             // See: https://github.com/KhronosGroup/glTF/tree/master/extensions/2.0/Khronos/KHR_lights_punctual
-            const float cd = dot(uLightData.lights[currLightIdx].dir.xyz, -L);
+            const float cd = dot(lightDir.xyz, -L);
             const float angularAttenuation = clamp(cd * lightAngleScale + lightAngleOffset, 0.0, 1.0);
 
-            const float range = uLightData.lights[currLightIdx].dir.w;
+            const float range = lightDir.w;
             const float attenuation = max(min(1.0 - pow(dist / range, 4.0), 1.0), 0.0) / (dist * dist);
             color += CalculateLight(currLightIdx, materialDiffuseBRDF, L, NoL, sd, sssv, materialFlags) *
                      (angularAttenuation * angularAttenuation * attenuation) * shadowCoeff;
@@ -946,13 +964,14 @@ vec3 CalculateLighting(ShadingData sd, SubsurfaceScatterShadingVariables sssv, c
             const float dist = length(pointToLight);
             const vec3 L = pointToLight / dist;
             const float NoL = clamp(dot(sd.N, L), 0.0, 1.0);
-            const float range = uLightData.lights[currLightIdx].dir.w;
-            const float attenuation = max(min(1.0 - pow(dist / range, 4.0), 1.0), 0.0) / (dist * dist);
-            const vec3 spec = vec3(0.05);
+            // whole vec4: CalculateRectAreaLight reads .xyz, so both resolve to one load
+            const vec4 lightDir = uLightData.lights[currLightIdx].dir;
+            const float range = lightDir.w;
+            // range window only: the solid angle in CalculateRectAreaLight already falls off with distance
+            const float attenuation = max(min(1.0 - pow(dist / range, 4.0), 1.0), 0.0);
             // NOTE: could check for NoL > 0.0 and NoV > 0.0
-            color +=
-                CalculateRectAreaLight(currLightIdx, materialDiffuseBRDF, spec, sd.N, sd.V, sd.pos.xyz, sd.alpha2) *
-                attenuation;
+            color += CalculateRectAreaLight(
+                currLightIdx, materialDiffuseBRDF, sd.f0.xyz, sd.N, sd.V, sd.pos.xyz, sd.alpha2) * attenuation;
         }
     }
     return color;
@@ -1123,13 +1142,15 @@ vec3 CalculateLightingInplace(ShadingDataInplace sd, ClearcoatShadingVariables c
                     }
                 }
 
-                const float lightAngleScale = uLightData.lights[lightIdx].spotLightParams.x;
-                const float lightAngleOffset = uLightData.lights[lightIdx].spotLightParams.y;
+                const vec4 spotParams = uLightData.lights[lightIdx].spotLightParams;
+                const vec4 lightDir = uLightData.lights[lightIdx].dir;
+                const float lightAngleScale = spotParams.x;
+                const float lightAngleOffset = spotParams.y;
                 // See: https://github.com/KhronosGroup/glTF/tree/master/extensions/2.0/Khronos/KHR_lights_punctual
-                const float cd = dot(uLightData.lights[lightIdx].dir.xyz, -L);
+                const float cd = dot(lightDir.xyz, -L);
                 const float angularAttenuation = clamp(cd * lightAngleScale + lightAngleOffset, 0.0, 1.0);
 
-                const float range = uLightData.lights[lightIdx].dir.w;
+                const float range = lightDir.w;
                 const float attenuation = max(min(1.0 - pow(dist / range, 4.0), 1.0), 0.0) / (dist * dist);
                 color += CalculateLightInplace(lightIdx, materialDiffuseBRDF, L, NoL, sd, ccsv, ssv) *
                          (angularAttenuation * angularAttenuation * attenuation) * shadowCoeff;
@@ -1190,12 +1211,13 @@ vec3 CalculateLightingInplace(ShadingDataInplace sd, ClearcoatShadingVariables c
                 const float dist = length(pointToLight);
                 const vec3 L = pointToLight / dist;
                 const float NoL = clamp(dot(sd.N, L), 0.0, 1.0);
-                const float range = uLightData.lights[lightIdx].dir.w;
-                const float attenuation = max(min(1.0 - pow(dist / range, 4.0), 1.0), 0.0) / (dist * dist);
+                const vec4 lightDir = uLightData.lights[lightIdx].dir;
+                const float range = lightDir.w;
+                // range window only: the solid angle in CalculateRectAreaLight already falls off with distance
+                const float attenuation = max(min(1.0 - pow(dist / range, 4.0), 1.0), 0.0);
                 // NOTE: could check for NoL > 0.0 and NoV > 0.0
                 color += CalculateRectAreaLight(
-                             lightIdx, materialDiffuseBRDF, vec3(0.05), sd.N, sd.V, sd.pos.xyz, sd.alpha2) *
-                         attenuation;
+                    lightIdx, materialDiffuseBRDF, sd.f0.xyz, sd.N, sd.V, sd.pos.xyz, sd.alpha2) * attenuation;
             }
         }
     }

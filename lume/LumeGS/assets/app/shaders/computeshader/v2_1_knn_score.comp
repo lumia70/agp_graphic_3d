@@ -1,0 +1,136 @@
+#version 460 core
+#extension GL_ARB_separate_shader_objects : enable
+#define V21_COMPUTE_SHADER 1
+#define V21_PROFILE_KNN 1
+#include "common/v2_1_bindings.glsl"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+bool StructuralEdge(uint a, uint b, float distance3d)
+{
+    if (a == b || b >= v21.counts.x || states[b].cumulativeMask != 0u ||
+        projected[b].centerDepth.w < 0.5) {
+        return false;
+    }
+    float scaleLimit = v21.graph0.y * (projected[a].extentScale.z + projected[b].extentScale.z) + v21.graph0.z;
+    if (distance3d > min(v21.graph0.x, scaleLimit)) {
+        return false;
+    }
+    float screenDistance = distance(projected[a].centerDepth.xy, projected[b].centerDepth.xy);
+    float screenLimit = v21.graph1.x * (projected[a].extentScale.w + projected[b].extentScale.w) + v21.graph1.y;
+    float relativeDepth = abs(projected[a].centerDepth.z - projected[b].centerDepth.z) /
+        max(min(projected[a].centerDepth.z, projected[b].centerDepth.z), 1.0e-6);
+    return screenDistance <= screenLimit && relativeDepth <= v21.graph0.w;
+}
+
+void InsertNearest(uint candidate, float distanceValue, inout uint ids[16], inout float distances[16])
+{
+    if (distanceValue >= distances[15]) {
+        return;
+    }
+    uint position = 15u;
+    while (position > 0u && distanceValue < distances[position - 1u]) {
+        distances[position] = distances[position - 1u];
+        ids[position] = ids[position - 1u];
+        --position;
+    }
+    distances[position] = distanceValue;
+    ids[position] = candidate;
+}
+
+void main()
+{
+    uint compactIndex = gl_GlobalInvocationID.x;
+    if (compactIndex >= globals.compactCount) {
+        return;
+    }
+    uint id = compactEntries[compactIndex].weakGaussianIndex;
+    vec3 position = V21Position(id);
+    ivec3 cell = V21Cell(position);
+    uint nearestIds[16];
+    float nearestDistances[16];
+    uint structuralSupport = 0u;
+    uint stableSupport = 0u;
+    for (uint index = 0u; index < 16u; ++index) {
+        nearestIds[index] = V21_INVALID_ID;
+        nearestDistances[index] = 3.4028234e38;
+    }
+    for (int dz = -1; dz <= 1; ++dz) {
+        for (int dy = -1; dy <= 1; ++dy) {
+            for (int dx = -1; dx <= 1; ++dx) {
+                ivec3 queryCell = cell + ivec3(dx, dy, dz);
+                uint neighbor = hashBuckets[V21HashCell(queryCell)].head;
+                uint visits = 0u;
+                while (neighbor != V21_INVALID_ID && visits < 512u) {
+                    uint next = states[neighbor].hashNext;
+                    if (neighbor != id && all(equal(V21Cell(V21Position(neighbor)), queryCell))) {
+                        float distanceValue = distance(position, V21Position(neighbor));
+                        if (StructuralEdge(id, neighbor, distanceValue)) {
+                            structuralSupport = min(structuralSupport + 1u, 0xffffu);
+                            if (analysis[neighbor].features.weakEvidence < 0.5) {
+                                stableSupport = min(stableSupport + 1u, 0xffffu);
+                            } else {
+                                InsertNearest(neighbor, distanceValue, nearestIds, nearestDistances);
+                            }
+                        }
+                    }
+                    neighbor = next;
+                    ++visits;
+                }
+            }
+        }
+    }
+    float nearest = nearestIds[0] == V21_INVALID_ID ? v21.graph0.x : nearestDistances[0];
+    float localScale = max(projected[id].extentScale.z, 1.0e-5);
+    float isolation = clamp((nearest - (3.0 * localScale + v21.graph0.z)) /
+        max(v21.graph0.x - (3.0 * localScale + v21.graph0.z), 1.0e-5), 0.0, 1.0);
+    analysis[id].features.isolation = isolation;
+    analysis[id].features.structuralSupport = float(structuralSupport);
+    analysis[id].features.stableSupport = float(stableSupport);
+
+    uint protectionMask = 0u;
+    if (stableSupport >= uint(v21.protection0.x)) {
+        protectionMask |= V21_PROTECT_STABLE_SURFACE;
+        atomicAdd(globals.stableProtectedCount, 1u);
+    }
+    if (analysis[id].features.thinness >= v21.protection0.y &&
+        structuralSupport >= uint(v21.protection0.z)) {
+        protectionMask |= V21_PROTECT_THIN_STRUCTURE;
+        atomicAdd(globals.thinProtectedCount, 1u);
+    }
+    if (analysis[id].features.edgeStrength >= v21.protection0.w &&
+        stableSupport >= uint(v21.protection1.x)) {
+        protectionMask |= V21_PROTECT_DEPTH_EDGE;
+        atomicAdd(globals.edgeProtectedCount, 1u);
+    }
+    states[id].protectionMask = protectionMask;
+    if (protectionMask != 0u) {
+        atomicAdd(globals.protectedCount, 1u);
+    }
+
+    V21Evidence item = analysis[id].evidence;
+    float firstPurity = analysis[id].features.firstPurity;
+    float alphaPurity = analysis[id].features.alphaPurity;
+    float meanGap = analysis[id].features.meanGap;
+    float front = analysis[id].features.frontSuspension;
+    float anomaly = clamp((meanGap - v21.discAlphaGap.z) /
+        max(v21.discAlphaGap.w - v21.discAlphaGap.z, 1.0e-6), 0.0, 1.0);
+    float frontScore = clamp(front / max(v21.discAlphaGap.w, 1.0e-6), 0.0, 1.0);
+    float rawScore = v21.weights0.x * anomaly + v21.weights0.y * firstPurity +
+        v21.weights0.z * alphaPurity + v21.weights0.w * frontScore + v21.weights1.x * isolation;
+    float supportConfidence = clamp(log(1.0 + float(item.anomalyPixels)) / log(49.0), 0.0, 1.0);
+    float detailFactor = 1.0 - v21.weights1.y * analysis[id].features.detailProtection;
+    float score = clamp(rawScore * (0.55 + 0.45 * supportConfidence) * detailFactor, 0.0, 1.0);
+    analysis[id].features.depthScore = score;
+    states[id].score = score;
+
+    bool depthCandidate = protectionMask == 0u && score >= v21.weights1.z &&
+        item.anomalyPixels >= uint(v21.candidate1.x) &&
+        firstPurity >= v21.candidate0.x && alphaPurity >= v21.candidate0.y &&
+        meanGap >= v21.candidate0.z && front >= v21.candidate0.w;
+    states[id].currentDepthMask = depthCandidate ? 1u : 0u;
+    bool seed = depthCandidate && protectionMask == 0u && score >= v21.seed0.x && firstPurity >= v21.seed0.y &&
+        alphaPurity >= v21.seed0.z && meanGap >= v21.seed0.w && front >= v21.seed1.x &&
+        item.anomalyPixels >= uint(v21.seed1.y) && analysis[id].features.detailProtection <= v21.seed1.z;
+    states[id].currentSeedMask = seed ? 1u : 0u;
+}

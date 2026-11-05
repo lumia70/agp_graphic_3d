@@ -118,6 +118,8 @@ public:
 
     BASE_NS::array_view<const RENDER_NS::RenderHandleReference> GetRenderNodeGraphs() const override;
 
+    uint32_t GetDroppedCameraCount() const override;
+
     struct DefaultMaterialShaderData {
         struct SingleShaderData {
             CORE_NS::EntityReference shader;

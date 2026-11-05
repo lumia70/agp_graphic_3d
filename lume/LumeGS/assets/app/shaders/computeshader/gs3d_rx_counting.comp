@@ -1,0 +1,59 @@
+#version 460 core
+#extension GL_ARB_separate_shader_objects : enable
+#extension GL_ARB_shading_language_420pack : enable
+
+#include "common/gs_common.h"
+#include "common/gs_struct_common.h"
+#define LUME_GS_EDIT_LAYOUT 0
+#include "common/gs_edit_common.h"
+
+layout(set = 0, binding = 0, std430) buffer sortingBuffer0
+{
+    SortKeyIndex sortKeyData0[];
+};
+
+layout(set = 0, binding = 1, std430) buffer sortingBuffer1
+{
+    SortKeyIndex sortKeyData1[];
+};
+
+layout(set = 0, binding = 2, std430) buffer countingBuffer
+{
+    uint histogram[]; // size of RADIX_SORT_BINS * numWorkgroups
+};
+
+layout(set = 0, binding = 3, std430) readonly restrict buffer indirectDispatchCounterBuffer
+{
+    IndirectEditDispatchCounterBuffer indirectCounter;
+};
+
+layout(push_constant, std430) uniform uPushConstant
+{
+    GsRadixSortPushConstantStruct uPc;
+};
+
+layout(local_size_x = RADIX_SORT_BINS, local_size_y = 1, local_size_z = 1) in;
+void main()
+{
+    const uint localId = gl_LocalInvocationID.x;
+    const uint workGroupId = gl_WorkGroupID.x;
+
+    histogram[RADIX_SORT_BINS * workGroupId + localId] = 0;
+    barrier();
+
+    const int pass = int(uPc.bytePosition * 8);
+    const bool pingPongBuffer = (uPc.bytePosition % 2 == 0);
+    const uint blockStart = workGroupId * NUM_BLOCKS_PER_GROUP_RADIX * RADIX_SORT_BINS;
+
+    const uint numGs = (uPc.useIndirectDispatch != 0u) ? indirectCounter.counter : uPc.numGs;
+
+    for (uint ii = 0; ii < NUM_BLOCKS_PER_GROUP_RADIX; ii++) {
+        const uint elementId = blockStart + ii * RADIX_SORT_BINS + localId;
+
+        const uint value = (elementId < numGs) ? (pingPongBuffer ? sortKeyData0[elementId].key : sortKeyData1[elementId].key) : 0xFFFFffff;
+        const uint bin = bitfieldExtract(value, pass, 8);
+
+        atomicAdd(histogram[RADIX_SORT_BINS * workGroupId + bin], 1u);
+    }
+}
+

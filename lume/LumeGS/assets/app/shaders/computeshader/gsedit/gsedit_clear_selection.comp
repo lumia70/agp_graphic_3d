@@ -1,0 +1,31 @@
+#version 460 core
+#extension GL_ARB_separate_shader_objects : enable
+#extension GL_ARB_shading_language_420pack : enable
+
+// includes
+#include "3d/shaders/common/3d_dm_structures_common.h"
+#include "common/gs_struct_common.h"
+#include "common/gs_common.h"
+
+#include "common/gs_edit_common.h"
+
+layout(set = 0, binding = 0, std430) restrict buffer selectionIndexBuffer
+{
+    // mask for selecting splats, write in selection shaders, read everywhere else
+    uint selectionMask[];
+};
+
+layout(local_size_x = GS_EDIT_WORKGROUP_SIZE, local_size_y = 1, local_size_z = 1) in;
+void main()
+{
+    const uint globalId = gl_GlobalInvocationID.x;
+    if (globalId > selectionMask.length()) {
+        return;
+    }
+
+    if (globalId == 0) {
+        selectionMask[0] = 0u;
+    }
+
+    selectionMask[globalId + 1u] = 0u;
+}

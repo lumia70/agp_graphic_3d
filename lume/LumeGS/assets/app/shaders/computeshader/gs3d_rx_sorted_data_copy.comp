@@ -1,0 +1,73 @@
+#version 460 core
+#extension GL_ARB_separate_shader_objects : enable
+#extension GL_ARB_shading_language_420pack : enable
+
+// includes
+#include "3d/shaders/common/3d_dm_structures_common.h"
+#include "common/gs_struct_common.h"
+#include "common/gs_common.h"
+#define LUME_GS_EDIT_LAYOUT 0
+#include "common/gs_edit_common.h"
+
+layout(set = 0, binding = 0, std430) writeonly restrict buffer indexBufferBuffer {
+    uint indexBuffer[];
+};
+
+layout(set = 0, binding = 1, std430) readonly restrict buffer inSortedIndices {
+    SortKeyIndex keyIndices[];
+};
+
+layout(set = 0, binding = 2, std430) writeonly restrict buffer outDrawDispatch {
+    GsIndirectDrawDispatch indirectDrawDispatch;
+};
+
+layout(set = 0, binding = 3, std430) readonly restrict buffer indirectDispatchCounterBuffer
+{
+    IndirectEditDispatchCounterBuffer indirectCounter;
+};
+
+layout(push_constant, std430) uniform uGsMetadata {
+    vec4 sortMetadata;
+};
+
+layout(local_size_x = GS_PROCESS_DATA_TGS, local_size_y = 1, local_size_z = 1) in;
+void main()
+{
+    const uint localId = gl_LocalInvocationID.x;
+    const uint workGroupId = gl_WorkGroupID.x;
+    const uint numGs = (uint(sortMetadata.y) != 0u) ? indirectCounter.counter : uint(sortMetadata.x);
+
+    uint maxElementId = 0;
+    uint maxDispatchx = 0;
+
+    for (int ii = 0; ii < NUM_BLOCKS_PER_GROUP; ii++) {
+        const uint elementId = workGroupId * NUM_BLOCKS_PER_GROUP * GS_PROCESS_DATA_TGS + ii * GS_PROCESS_DATA_TGS + localId;
+
+        if (elementId == 0) {
+            indirectDrawDispatch.vertexCount = 4;
+            indirectDrawDispatch.instanceCount = 0;
+            indirectDrawDispatch.firstVertex = 0;
+            indirectDrawDispatch.firstInstance = 0;
+
+            indirectDrawDispatch.x = 0;
+            indirectDrawDispatch.y = 1;
+            indirectDrawDispatch.z = 1;
+        }
+
+        if (elementId >= numGs || elementId > GS_DATA_STORE_TEX_SIZE * GS_DATA_STORE_TEX_SIZE) {
+            continue;
+        }
+
+        const SortKeyIndex keyIndex = keyIndices[elementId];
+
+        if (keyIndex.key != 0xFFFFffff) {
+            maxElementId = elementId + 1;
+            maxDispatchx = (elementId + GS_PROCESS_DATA_TGS) / GS_PROCESS_DATA_TGS;
+        }
+
+        indexBuffer[elementId] = keyIndex.gsIndex;
+    }
+
+    atomicMax(indirectDrawDispatch.instanceCount, maxElementId);
+    atomicMax(indirectDrawDispatch.x, maxDispatchx);
+}

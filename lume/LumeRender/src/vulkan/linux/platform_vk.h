@@ -39,6 +39,11 @@ inline PlatformDeviceExtensions GetEnabledPlatformDeviceExtensions(
     return {};
 }
 
+inline const void* GetExportableSemaphoreCreateInfoPNext(const PlatformDeviceExtensions& /* platformDeviceExt */)
+{
+    return nullptr;
+}
+
 bool CanDevicePresent(VkInstance instance, VkPhysicalDevice device, uint32_t queuefamily);
 
 const char* GetPlatformSurfaceName();

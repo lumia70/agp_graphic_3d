@@ -264,6 +264,14 @@ public:
     virtual bool IsSphereInsideCameraFrustum(
         const CORE_NS::IEcs& ecs, CORE_NS::Entity cameraEntity, BASE_NS::Math::Vec3 center, float radius) const = 0;
 
+    /** Get the number of cameras dropped during the last IEcs::Update.
+     * The engine sets this flag when AddCamera or ProcessShadowCamera drops a camera.
+     * Call after IEcs::Update.
+     * @param ecs Entity component system instance.
+     * @return Dropped camera count. 0 means no cameras were dropped.
+     */
+    virtual uint32_t GetDroppedCameraCount(const CORE_NS::IEcs& ecs) const = 0;
+
 protected:
     ISceneUtil() = default;
     virtual ~ISceneUtil() = default;

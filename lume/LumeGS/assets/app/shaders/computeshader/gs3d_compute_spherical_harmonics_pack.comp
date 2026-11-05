@@ -1,0 +1,85 @@
+#version 460 core
+#extension GL_ARB_separate_shader_objects : enable
+#extension GL_ARB_shading_language_420pack : enable
+#extension GL_EXT_nonuniform_qualifier : require
+
+// includes
+#include "3d/shaders/common/3d_dm_structures_common.h"
+#include "common/gs_struct_common.h"
+#include "common/gs_common.h"
+#include "common/gs_spherical_harmonics_common.h"
+
+layout(set = 0, binding = 0, std430) restrict buffer inGSData {
+    GsSplatDataPacked referenceGSData[];
+};
+
+uvec2 unpackUint2X16(uint v) {
+    return uvec2(v & 0xFFFFu, (v >> 16) & 0xFFFFu);
+}
+
+layout(local_size_x = GS_PROCESS_DATA_TGS, local_size_y = 1, local_size_z = 1) in;
+void main()
+{
+    const uint globalId = gl_GlobalInvocationID.x;
+    const uint baseOffset = uPc.baseOffset;
+    const uint numGs = uPc.numGsTotal;
+    const uint elementId = baseOffset + globalId;
+
+    const int gsIndex = GetGsObjectIndex(elementId);
+    if (gsIndex < 0 || elementId > numGs) {
+        return;
+    }
+
+    const uint shDegree = gsDynamicDatas[gsIndex].shDegree;
+    if (shDegree <= 0) {
+        return;
+    }
+
+    const bool enabled = gsDynamicDatas[gsIndex].enabled == 1u;
+    if (!enabled) {
+        return;
+    }
+
+    const mat4 worldMatrix = gsDynamicDatas[gsIndex].worldMat;
+
+    const GsSplatDataPacked gsData = referenceGSData[elementId];
+    const vec4 positionOpacity = vec4(unpackHalf2x16(gsData.positionOpacityPacked.x).xy, unpackHalf2x16(gsData.positionOpacityPacked.y).xy);
+    const uvec2 astcOffsetColor = unpackUint2X16(gsData.astcOffsetColor.x);
+
+    // cull
+    {
+        const vec4 clip = (cameraUbo.proj * cameraUbo.view) * (worldMatrix * vec4(positionOpacity.xyz, 1.0f));
+        if (clip.z < 0.0f || abs(clip.x) > abs(clip.w) || abs(clip.y) > abs(clip.w) || abs(clip.z) > abs(clip.w)) {
+            return;
+        }
+    }
+
+    const vec3 cameraPos = inverse(cameraUbo.view * worldMatrix)[3].xyz;
+    const vec3 viewDir = normalize(positionOpacity.xyz - cameraPos);
+
+    // 0th degree, base color
+    vec3 colorSH = vec3(0.0f);
+
+    if (gsDynamicDatas[gsIndex].codecVersion < 1) {
+        const uint shId = elementId - gsDynamicDatas[gsIndex].startOffset + gsDynamicDatas[gsIndex].startShOffset;
+        const GsHarmonicsData shData = harmonicsData[shId];
+
+        colorSH = GetSHColor(viewDir, shData, shDegree);
+
+    } else if (gsDynamicDatas[gsIndex].codecVersion == 2) {
+        const ivec2 shOffset = ivec2(astcOffsetColor.x/4u, astcOffsetColor.y/4u);
+        const vec3 normalizedDc = unpackUnorm4x8(gsData.astcOffsetColor.y).abg;
+
+        colorSH = GetAstcSHColorV2(viewDir, shOffset, normalizedDc, gsIndex, shDegree, astcOffsetColor.x%4*4+astcOffsetColor.y%4);
+    } else {
+        const ivec2 shOffset = ivec2(astcOffsetColor.x, astcOffsetColor.y);
+        const vec3 normalizedDc = unpackUnorm4x8(gsData.astcOffsetColor.y).abg;
+
+        colorSH = GetAstcSHColor(viewDir, shOffset, normalizedDc, gsIndex, shDegree);
+    }
+
+    colorSH = clamp(colorSH, vec3(0), vec3(1));
+
+    const uint colorPacked = packUnorm4x8(vec4(positionOpacity.w, colorSH.bgr));
+    referenceGSData[elementId].covColorPacked = uvec4(gsData.covColorPacked.xyz, colorPacked);
+}

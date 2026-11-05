@@ -26,8 +26,10 @@ RENDER_BEGIN_NAMESPACE()
 class Device;
 class DeviceGLES;
 struct GpuSemaphorePlatformDataGles final {
-    // GLsync object
+    // GLsync object, or an EGLSyncKHR when nativeFence is true
     uint64_t sync{0};
+    // selects the matching destroy call, so it must match how sync was created
+    bool nativeFence{false};
 };
 
 class GpuSemaphoreGles final : public GpuSemaphore {

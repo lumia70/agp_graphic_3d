@@ -21,16 +21,18 @@
 #include <render/namespace.h>
 
 #include "device/device.h"
+#include "vulkan/device_vk.h"
 #include "vulkan/validate_vk.h"
 
 RENDER_BEGIN_NAMESPACE()
 GpuSemaphoreVk::GpuSemaphoreVk(Device& device) : device_(device)
 {
     constexpr VkSemaphoreCreateFlags semaphoreCreateFlags{0};
-    constexpr VkSemaphoreCreateInfo semaphoreCreateInfo{
-        VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,  // sType
-        nullptr,                                  // pNext
-        semaphoreCreateFlags,                     // flags
+    // exportable as a sync fd where supported, so the signal can be handed out as a release fence
+    const VkSemaphoreCreateInfo semaphoreCreateInfo{
+        VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,                                                    // sType
+        GetExportableSemaphoreCreateInfoPNext(((DeviceVk&)device_).GetPlatformDeviceExtensions()),  // pNext
+        semaphoreCreateFlags,                                                                       // flags
     };
 
     const VkDevice vkDev = ((const DevicePlatformDataVk&)device_.GetPlatformData()).device;
@@ -38,6 +40,7 @@ GpuSemaphoreVk::GpuSemaphoreVk(Device& device) : device_(device)
         &semaphoreCreateInfo,                    // pCreateInfo
         nullptr,                                 // pAllocator
         &plat_.semaphore));                      // pSemaphore
+    plat_.exportable = (semaphoreCreateInfo.pNext != nullptr) && (plat_.semaphore != VK_NULL_HANDLE);
 }
 
 GpuSemaphoreVk::GpuSemaphoreVk(Device& device, const uint64_t handle) : device_(device), ownsResources_(false)

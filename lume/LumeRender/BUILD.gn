@@ -319,6 +319,8 @@ ohos_source_set("lume_render_src") {
     "src/util/json_util.h",
     "src/util/linear_allocator.h",
     "src/util/log.h",
+    "src/util/native_fence_fd.cpp",
+    "src/util/native_fence_fd.h",
     "src/util/property_util.cpp",
     "src/util/property_util.h",
     "src/util/render_frame_util.cpp",

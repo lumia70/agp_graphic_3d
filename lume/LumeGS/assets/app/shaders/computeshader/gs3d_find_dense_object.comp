@@ -1,0 +1,145 @@
+#version 460 core
+#extension GL_ARB_separate_shader_objects : enable
+#extension GL_ARB_shading_language_420pack : enable
+
+// includes (assuming same structure definitions as original)
+#include "3d/shaders/common/3d_dm_structures_common.h"
+#include "common/gs_struct_common.h"
+#include "common/gs_common.h"
+
+layout(set = 0, binding = 0, std430) readonly restrict buffer inGSData {
+    GsSplatData referenceGSData[];
+};
+
+layout(set = 0, binding = 1, std430) readonly restrict buffer inSortedIndices {
+    uint sortedIndices[];
+};
+
+layout(set = 0, binding = 2, std140) readonly uniform uGSDynamicDataBuffer
+{
+    GsDynamicDataStruct gsDynamicDatas[GS_MAX_NUM_GS_OBJECTS];
+};
+
+layout(set = 0, binding = 3, std430) restrict buffer ObjectHitOutput {
+    GsObjectHitResult hitResult;
+};
+
+layout(set = 0, binding = 4, std140) readonly uniform uCameraMatrices
+{
+    GsCameraUboStruct cameraUbo;
+};
+
+layout(push_constant, std430) uniform DenseObjectPushConstants {
+    GsDenseObjectPushConstantStruct uPc;
+};
+
+#define OPACITY_THRESHOLD (10.0f / 256.0f)
+#define POWER_ITERATIONS 2u
+
+uint GetGsIndex(const uint elementId) {
+    for (uint ii = 0; ii < uPc.numGsObjects; ii++) {
+        if (elementId >= gsDynamicDatas[ii].startOffset && elementId < gsDynamicDatas[ii].endOffset) {
+            return ii;
+        }
+    }
+    return 0;
+}
+
+float MaxSplatExtentWorld(const vec3 covA, const vec3 covB, const mat4 worldMatrix, const float stdDevMultiplier)
+{
+    const mat3 covMat = mat3(
+        covA.x, covA.y, covA.z,
+        covA.y, covB.x, covB.y,
+        covA.z, covB.y, covB.z
+    );
+
+    const mat3 jacobian = mat3(worldMatrix);
+
+    // covariance to world space
+    const mat3 covWorld = jacobian * covMat * transpose(jacobian);
+
+    // power iteration
+    vec3 vv = vec3(1.0f, 0.0f, 0.0f);
+    for (int ii = 0; ii < POWER_ITERATIONS; ii++) {
+        vv = normalize(covWorld * vv);
+    }
+
+    const float maxEigenvalue = dot(vv, covWorld * vv);
+    return sqrt(maxEigenvalue) * stdDevMultiplier;
+}
+
+bool RayIntersectCircle(const vec3 rayOrigin, const vec3 rayDir, const vec3 splatCenter, const float radius, out float rayDistance) {
+    const vec3 toCenter = splatCenter - rayOrigin;
+    
+    // project ray direction onto the center vector
+    const float denominator = dot(rayDir, toCenter);
+    
+    if (denominator <= 0.0) {
+        // ray is parallel
+        return false;
+    }
+    
+    const float tt = dot(toCenter, toCenter) / denominator;
+    const vec3 intersectionPoint = rayOrigin + tt * rayDir;
+    
+    // check if point is inside the circle
+    const vec3 diff = intersectionPoint - splatCenter;
+    const float diffDistSq = dot(diff, diff);
+    
+    if (diffDistSq <= radius * radius) {
+        rayDistance = tt;
+        return true;
+    }
+    
+    return false;
+}
+
+layout(local_size_x = GS_DENSE_OBJECT_TGS, local_size_y = 1, local_size_z = 1) in;
+void main() {
+    if (uPc.stage == 0u) {
+        if (gl_GlobalInvocationID.x == 0u) {
+            hitResult.minDistanceUint = 0xFFFFFFFFu;
+        }
+        return;
+    }
+
+    const uint elementId = gl_GlobalInvocationID.x;
+    if (elementId >= sortedIndices.length()) {
+        return;
+    }
+    
+    const uint splatIndex = sortedIndices[elementId];
+    const GsSplatData gsData = referenceGSData[splatIndex];
+    
+    if (gsData.positionOpacity.w < OPACITY_THRESHOLD) {
+        return;
+    }
+    
+    const uint gsIndex = GetGsIndex(splatIndex);
+    
+    if (gsDynamicDatas[gsIndex].enabled != 1u) {
+        return;
+    }
+    
+    const mat4 worldMatrix = gsDynamicDatas[gsIndex].worldMat;
+    const vec4 positionWorld = worldMatrix * vec4(gsData.positionOpacity.xyz, 1.0f);
+    const vec3 splatWorldPos = positionWorld.xyz;
+    const vec4 splatScreenPoint = cameraUbo.viewProj * vec4(splatWorldPos, 1.0f);
+
+    // frustum culling
+    const vec3 absSp = abs(splatScreenPoint.xyz);
+    if (splatScreenPoint.z < 0.0f || absSp.x > splatScreenPoint.w || absSp.y > splatScreenPoint.w || absSp.z > splatScreenPoint.w) {
+        return;
+    }
+
+    const float maxExtent = MaxSplatExtentWorld(gsData.covAScale.rgb, gsData.covBColorPacked.rgb, worldMatrix, 1.0f);
+    
+    float hitDistance;
+    const uint distanceUint = floatBitsToUint(hitDistance);
+    uint old = atomicMin(hitResult.minDistanceUint, distanceUint);
+    if (RayIntersectCircle(uPc.rayOrigin, uPc.rayDirection, splatWorldPos, maxExtent, hitDistance)) {
+        if (old > distanceUint) {
+            hitResult.worldPos = splatWorldPos;
+        }
+    }
+}

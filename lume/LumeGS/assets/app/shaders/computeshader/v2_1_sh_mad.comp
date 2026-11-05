@@ -1,0 +1,31 @@
+#version 460 core
+#extension GL_ARB_separate_shader_objects : enable
+#extension GL_ARB_shading_language_420pack : enable
+#define V21_COMPUTE_SHADER 1
+#define V21_PROFILE_SH_RESOLVE 1
+#include "common/v2_1_bindings.glsl"
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+void main()
+{
+    uint dimension = gl_GlobalInvocationID.x;
+    if (dimension >= V21_SH_DIMENSIONS) {
+        return;
+    }
+    uint roiCount = globals.roiCount;
+    uint target = (roiCount + 1u) / 2u;
+    uint running = 0u;
+    uint madBin = 0u;
+    bool found = false;
+    for (uint bin = 0u; bin < V21_HISTOGRAM_BINS; ++bin) {
+        running += histogramBins[dimension * V21_HISTOGRAM_BINS + bin].count;
+        if (running >= target && !found) {
+            madBin = bin;
+            found = true;
+        }
+    }
+    float maximumDeviation = shRobustStats[dimension].mad;
+    float rawMad = maximumDeviation * (float(madBin) + 0.5) / 256.0;
+    shRobustStats[dimension].mad = max(1.0e-5, 1.4826 * rawMad);
+}

@@ -1,0 +1,85 @@
+#version 460 core
+#extension GL_ARB_separate_shader_objects : enable
+#define V21_COMPUTE_SHADER 1
+#define V21_PROFILE_FOOTPRINT 1
+#include "common/v2_1_bindings.glsl"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+float WeightedDepthAt(ivec2 coordinate, out bool valid)
+{
+    ivec2 size = ivec2(v21.counts.yz);
+    coordinate = clamp(coordinate, ivec2(0), size - ivec2(1));
+    vec4 accumulated = texelFetch(weightedAccumulatorTexture, coordinate, 0);
+    valid = accumulated.g >= v21.sampleGates.w;
+    float normalizedDepth = accumulated.r / max(accumulated.g, 1.0e-6);
+    return v21.principalNearFar.z + normalizedDepth * (v21.principalNearFar.w - v21.principalNearFar.z);
+}
+
+void main()
+{
+    uint id = gl_GlobalInvocationID.x;
+    if (id >= v21.counts.x || states[id].cumulativeMask != 0u ||
+        projected[id].centerDepth.w < 0.5) {
+        return;
+    }
+    V21ProjectedGaussian gaussian = projected[id];
+    vec2 axis0 = gaussian.axes.xy;
+    vec2 axis1 = gaussian.axes.zw;
+    vec2 offsets[9] = vec2[9](vec2(0.0), axis0, -axis0, 2.0 * axis0, -2.0 * axis0,
+        axis1, -axis1, 2.0 * axis1, -2.0 * axis1);
+    float frontValues[9];
+    uint validCount = 0u;
+    uint frontCount = 0u;
+    float centerFront = 0.0;
+    for (uint sampleIndex = 0u; sampleIndex < 9u; ++sampleIndex) {
+        ivec2 coordinate = ivec2(round(gaussian.centerDepth.xy + offsets[sampleIndex]));
+        bool valid;
+        float surfaceDepth = WeightedDepthAt(coordinate, valid);
+        float front = valid ? max(surfaceDepth - gaussian.centerDepth.z, 0.0) / max(surfaceDepth, 1.0e-6) : 0.0;
+        frontValues[sampleIndex] = front;
+        validCount += valid ? 1u : 0u;
+        frontCount += (valid && front >= v21.sampleGates.z) ? 1u : 0u;
+        if (sampleIndex == 0u) {
+            centerFront = front;
+        }
+    }
+    for (uint outer = 0u; outer < 9u; ++outer) {
+        for (uint inner = outer + 1u; inner < 9u; ++inner) {
+            if (frontValues[inner] < frontValues[outer]) {
+                float temporary = frontValues[outer];
+                frontValues[outer] = frontValues[inner];
+                frontValues[inner] = temporary;
+            }
+        }
+    }
+    float q75 = frontValues[6u];
+    analysis[id].evidence.validFootprintSamples = validCount;
+    analysis[id].evidence.frontFootprintSamples = frontCount;
+    analysis[id].features.frontSuspension = max(centerFront, q75);
+    analysis[id].features.footprintFrontQ75 = q75;
+
+    bool leftValid;
+    bool rightValid;
+    bool downValid;
+    bool upValid;
+    ivec2 center = ivec2(round(gaussian.centerDepth.xy));
+    float left = WeightedDepthAt(center + ivec2(-2, 0), leftValid);
+    float right = WeightedDepthAt(center + ivec2(2, 0), rightValid);
+    float down = WeightedDepthAt(center + ivec2(0, -2), downValid);
+    float up = WeightedDepthAt(center + ivec2(0, 2), upValid);
+    float minimumDepth = min(min(left, right), min(down, up));
+    float maximumDepth = max(max(left, right), max(down, up));
+    float edge = (leftValid && rightValid && downValid && upValid) ?
+        clamp((maximumDepth - minimumDepth) / max(maximumDepth, 1.0e-6), 0.0, 1.0) : 0.0;
+    float sigmaMaximum = max(length(axis0), length(axis1));
+    float sigmaMinimum = min(length(axis0), length(axis1));
+    float thinness = 1.0 - sigmaMinimum / max(sigmaMaximum, 1.0e-5);
+    analysis[id].features.edgeStrength = edge;
+    analysis[id].features.thinness = thinness;
+    // v1 multiplied this value by attachedSurface, which made protection
+    // vanish before a Gaussian could satisfy the front-suspension candidate
+    // gate. v2.1 keeps edge/thin evidence independent of floater depth;
+    // neighborhood support in KNN decides whether it becomes a hard guard.
+    analysis[id].features.detailProtection = clamp(0.55 * edge + 0.45 * thinness, 0.0, 1.0);
+}

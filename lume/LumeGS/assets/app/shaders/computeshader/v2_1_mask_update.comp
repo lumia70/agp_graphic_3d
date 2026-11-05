@@ -1,0 +1,143 @@
+#version 460 core
+#extension GL_ARB_separate_shader_objects : enable
+#define V21_COMPUTE_SHADER 1
+#define V21_PROFILE_MASK 1
+#include "common/v2_1_bindings.glsl"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+void DecideCurrentPeel()
+{
+    uint pixelCount = max(1u, v21.counts.y * v21.counts.z);
+    float pixelCoverage = clamp(float(globals.proposedOwnerPixels) / float(pixelCount), 0.0, 1.0);
+    globals.proposedPixelCoverageQ = uint(round(pixelCoverage * float(V21_METRIC_SCALE)));
+
+    if (pushData.round == 0u) {
+        globals.initialStrongPixels = globals.currentStrongPixels;
+    }
+    globals.peakProposedCount = max(globals.peakProposedCount, globals.proposedCount);
+    globals.applyCurrentPeel = 0u;
+
+    // A previous GPU decision is terminal. Delayed CPU observation may submit
+    // a few extra graph frames, but none of them is allowed to mutate the mask.
+    if (globals.stopReason != V21_STOP_NONE) {
+        return;
+    }
+
+    uint gaussianLimit = max(1u, uint(floor(v21.candidate1.y * float(globals.roiCount))));
+    bool gaussianSafe = globals.cumulativeCount + globals.proposedCount <= gaussianLimit;
+    bool pixelSafe = pixelCoverage <= v21.adaptive0.z;
+    uint minimumPeels = uint(v21.adaptive0.w);
+
+    if (globals.proposedCount == 0u) {
+        globals.stopReason = V21_STOP_ZERO_PROPOSAL;
+        return;
+    }
+    if (!gaussianSafe || !pixelSafe) {
+        globals.stopReason = V21_STOP_PROTECTION_LIMIT;
+        return;
+    }
+    if (globals.committedPeels >= minimumPeels && globals.initialStrongPixels > 0u &&
+        float(globals.currentStrongPixels) <=
+            v21.adaptive0.x * float(globals.initialStrongPixels)) {
+        globals.stopReason = V21_STOP_RESIDUAL_CLEARED;
+        return;
+    }
+
+    bool smallBatch = globals.peakProposedCount > 0u &&
+        float(globals.proposedCount) <= v21.adaptive0.y * float(globals.peakProposedCount);
+    if (smallBatch) {
+        uint nextStreak = globals.smallBatchStreak + 1u;
+        globals.smallBatchStreak = nextStreak;
+        if (globals.committedPeels >= minimumPeels &&
+            nextStreak >= max(1u, uint(v21.protection1.y))) {
+            globals.stopReason = V21_STOP_SMALL_BATCH_CONVERGED;
+            return;
+        }
+    } else {
+        globals.smallBatchStreak = 0u;
+    }
+
+    globals.applyCurrentPeel = 1u;
+    // The final permitted layer is committed, then the persistent stop flag
+    // prevents any asynchronous overshoot while the CPU reads the progress ring.
+    if (globals.committedPeels + 1u >= v21.peel.y) {
+        globals.stopReason = V21_STOP_MAX_PEELS;
+    }
+}
+
+void PublishProgress()
+{
+    if (globals.applyCurrentPeel != 0u && globals.appliedThisPeel != 0u) {
+        globals.committedPeels += 1u;
+    }
+    uint index = pushData.round & 7u;
+    progressRecords[index].committedPeels = globals.committedPeels;
+    progressRecords[index].newCandidateCount = globals.appliedThisPeel;
+    progressRecords[index].proposedCount = globals.proposedCount;
+    progressRecords[index].cumulativeCount = globals.cumulativeCount;
+    progressRecords[index].currentStrongPixels = globals.currentStrongPixels;
+    progressRecords[index].initialStrongPixels = globals.initialStrongPixels;
+    progressRecords[index].peakProposedCount = globals.peakProposedCount;
+    progressRecords[index].proposedPixelCoverageQ = globals.proposedPixelCoverageQ;
+    progressRecords[index].protectedCount = globals.protectedCount;
+    progressRecords[index].stopReason = globals.stopReason;
+    progressRecords[index].applyCurrentPeel = globals.applyCurrentPeel;
+    progressRecords[index].stableProtectedCount = globals.stableProtectedCount;
+    progressRecords[index].thinProtectedCount = globals.thinProtectedCount;
+    progressRecords[index].edgeProtectedCount = globals.edgeProtectedCount;
+    memoryBarrierBuffer();
+    // Completion is deliberately the final store in the coherent record.
+    progressRecords[index].completedRound = pushData.round;
+}
+
+void main()
+{
+    uint id = gl_GlobalInvocationID.x;
+    if (pushData.mode == 3u) {
+        if (id == 0u) {
+            DecideCurrentPeel();
+        }
+        return;
+    }
+    if (pushData.mode == 2u) {
+        if (id == 0u) {
+            PublishProgress();
+        }
+        return;
+    }
+    if (id >= v21.counts.x) {
+        return;
+    }
+
+    bool depth = states[id].currentDepthMask != 0u;
+    bool propagated = states[id].currentPropagatedMask != 0u;
+    bool proposed = states[id].protectionMask == 0u && (depth || propagated);
+    if (pushData.mode == 0u) {
+        if (globals.stopReason == V21_STOP_NONE && proposed && states[id].cumulativeMask == 0u) {
+            atomicAdd(globals.proposedCount, 1u);
+            atomicAdd(globals.proposedOwnerPixels, analysis[id].evidence.ownerPixels);
+        }
+        return;
+    }
+
+    if (globals.applyCurrentPeel == 0u || !proposed || states[id].cumulativeMask != 0u) {
+        return;
+    }
+    states[id].cumulativeMask = 1u;
+    if (depth) {
+        states[id].depthCandidateMask = 1u;
+    }
+    if (states[id].currentSeedMask != 0u) {
+        states[id].seedMask = 1u;
+    }
+    if (propagated) {
+        states[id].propagatedMask = 1u;
+    }
+    states[id].candidateSource = depth ? 1u : 2u;
+    states[id].peelRound = globals.committedPeels + 1u;
+    uint outputIndex = atomicAdd(globals.candidateListCount, 1u);
+    compactEntries[outputIndex].candidateStableId = gl_GlobalInvocationID.x;
+    atomicAdd(globals.cumulativeCount, 1u);
+    atomicAdd(globals.appliedThisPeel, 1u);
+}

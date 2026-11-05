@@ -97,7 +97,7 @@ Generally one render command list will generate one vulkan command buffer.
 class RenderBackendVk final : public RenderBackend {
 public:
     RenderBackendVk(Device& dev, GpuResourceManager& gpuResourceManager, CORE_NS::ITaskQueue* queue);
-    ~RenderBackendVk() override = default;
+    ~RenderBackendVk() override;
 
     void Render(RenderCommandFrameData& renderCommandFrameData,
         const RenderBackendBackBufferConfiguration& backBufferConfig) override;
@@ -293,6 +293,15 @@ private:
         BASE_NS::vector<PresentationInfo> infos;
     };
     PresentationData presentationData_;
+
+    // imported native fences, kept alive until the device has finished with their submission
+    struct ExternalWaitSemaphores {
+        uint64_t frameIndex{0};
+        BASE_NS::vector<VkSemaphore> semaphores;
+    };
+    BASE_NS::vector<ExternalWaitSemaphores> externalWaitSemaphores_;
+    void ProcessExternalWaitSemaphoreDestroy();
+    BASE_NS::vector<VkSemaphore> ImportExternalWaitSemaphores(RenderCommandFrameData& renderCommandFrameData);
 
     // process backend commands for all positions
     BASE_NS::vector<ProcessBackendCommand> processBackendCommands_;

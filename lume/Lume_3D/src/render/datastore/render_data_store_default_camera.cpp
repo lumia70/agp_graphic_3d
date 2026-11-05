@@ -42,6 +42,7 @@ void RenderDataStoreDefaultCamera::Clear()
     environments_.clear();
 
     hasBlendEnvironments_ = false;
+    droppedCameraCount_ = 0;
 }
 
 void RenderDataStoreDefaultCamera::Ref()
@@ -80,12 +81,23 @@ void RenderDataStoreDefaultCamera::AddCamera(const RenderCamera& camera)
 #endif
         cameras_.push_back(camera);
     } else {
+        droppedCameraCount_++;
 #if (CORE3D_VALIDATION_ENABLED == 1)
         PLUGIN_LOG_ONCE_W("drop_camera_count_full",
             "CORE3D_VALIDATION: camera dropped (max count: %u)",
             DefaultMaterialCameraConstants::MAX_CAMERA_COUNT);
 #endif
     }
+}
+
+void RenderDataStoreDefaultCamera::NotifyDroppedCamera()
+{
+    droppedCameraCount_++;
+}
+
+uint32_t RenderDataStoreDefaultCamera::GetDroppedCameraCount() const
+{
+    return droppedCameraCount_;
 }
 
 void RenderDataStoreDefaultCamera::AddEnvironment(const RenderCamera::Environment& environment)

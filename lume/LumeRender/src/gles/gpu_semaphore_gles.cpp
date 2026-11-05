@@ -43,10 +43,18 @@ GpuSemaphoreGles::~GpuSemaphoreGles()
 {
     if (ownsResources_ && plat_.sync) {
         PLUGIN_ASSERT(device_.IsActive());
-        auto sync = reinterpret_cast<GLsync>(plat_.sync);
-        glDeleteSync(sync);
+        if (plat_.nativeFence) {
+            DeviceGLES::PlatformGpuFence fence;
+            fence.handle = plat_.sync;
+            fence.nativeFence = true;
+            device_.DestroyPlatformGpuFence(fence);
+        } else {
+            auto sync = reinterpret_cast<GLsync>(plat_.sync);
+            glDeleteSync(sync);
+        }
     }
     plat_.sync = 0;
+    plat_.nativeFence = false;
 }
 
 uint64_t GpuSemaphoreGles::GetHandle() const

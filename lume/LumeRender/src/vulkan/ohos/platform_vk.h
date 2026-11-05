@@ -28,6 +28,8 @@ RENDER_BEGIN_NAMESPACE()
 struct PlatformDeviceExtensions {
     // hardware buffers supported
     bool externalMemoryHardwareBuffer{false};
+    // semaphores can be exported as a POSIX sync fd (native fence)
+    bool externalSemaphoreFd{false};
 };
 
 struct PlatformExtFunctions {
@@ -35,6 +37,17 @@ struct PlatformExtFunctions {
     PFN_vkGetNativeBufferPropertiesOHOS vkGetNativeBufferPropertiesOHOS{nullptr};
     PFN_vkGetMemoryNativeBufferOHOS vkGetMemoryNativeBufferOHOS{nullptr};
 };
+
+// pNext for a semaphore exportable as a sync fd, or nullptr when unsupported. Points to static storage.
+inline const void* GetExportableSemaphoreCreateInfoPNext(const PlatformDeviceExtensions& platformDeviceExtensions)
+{
+    static constexpr VkExportSemaphoreCreateInfo EXPORT_SEMAPHORE_CREATE_INFO{
+        VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO,  // sType
+        nullptr,                                         // pNext
+        VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT,   // handleTypes
+    };
+    return platformDeviceExtensions.externalSemaphoreFd ? &EXPORT_SEMAPHORE_CREATE_INFO : nullptr;
+}
 
 void GetPlatformDeviceExtensions(BASE_NS::vector<BASE_NS::string_view>& extensions);
 

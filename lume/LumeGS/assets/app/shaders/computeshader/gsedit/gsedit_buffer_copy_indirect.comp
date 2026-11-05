@@ -1,0 +1,38 @@
+#version 460 core
+#extension GL_ARB_separate_shader_objects : enable
+#extension GL_ARB_shading_language_420pack : enable
+
+// includes
+#include "3d/shaders/common/3d_dm_structures_common.h"
+#include "common/gs_struct_common.h"
+#include "common/gs_common.h"
+
+#define LUME_GS_EDIT_LAYOUT 0
+#include "common/gs_edit_common.h"
+
+layout(set = 0, binding = 0, std430) restrict buffer dstBuffer
+{
+    GsSplatData dstGsData[];
+};
+
+layout(set = 0, binding = 1, std430) restrict buffer srcBuffer
+{
+    GsSplatData srcGsData[];
+};
+
+layout(set = 0, binding = 2, std430) restrict buffer indirectDispatchCounterBuffer
+{
+    IndirectEditDispatchCounterBuffer indirectCounter;
+};
+
+layout(local_size_x = GS_EDIT_WORKGROUP_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+void main()
+{
+    const uint globalId = gl_GlobalInvocationID.x;
+    if (globalId >= indirectCounter.counter) {
+        return;
+    }
+    dstGsData[globalId + 1] = srcGsData[globalId];
+    atomicAdd(dstGsData[0].astcOffsetColor.x, 1u);
+}

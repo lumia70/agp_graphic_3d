@@ -97,6 +97,158 @@ UNIT_TEST_F(API_ScenePluginLightComponentTest, Functions, testing::ext::TestSize
     TestILightFunctions(interface_cast<ILight>(object));
 }
 
+/**
+ * @tc.name: Type_Directional
+ * @tc.desc: Verify LightComponent Type property read/write with DIRECTIONAL.
+ * @tc.type: FUNC
+ */
+UNIT_TEST_F(API_ScenePluginLightComponentTest, Type_Directional, testing::ext::TestSize.Level1)
+{
+    auto scene = CreateEmptyScene();
+    auto node = scene->CreateNode("//test", ClassId::LightNode).GetResult();
+    SetComponent(node, "LightComponent");
+
+    // Default type is DIRECTIONAL, pre-set to SPOT so TestEngineProperty can verify DIRECTIONAL differs from old.
+    auto p = GetProperty<LightType>("Type");
+    ASSERT_TRUE(p);
+    p->SetValue(LightType::SPOT);
+    UpdateComponentMembers();
+
+    TestEngineProperty<LightType>("Type", LightType::DIRECTIONAL, nativeComponent.type);
+}
+
+/**
+ * @tc.name: Type_Point
+ * @tc.desc: Verify LightComponent Type property read/write with POINT.
+ * @tc.type: FUNC
+ */
+UNIT_TEST_F(API_ScenePluginLightComponentTest, Type_Point, testing::ext::TestSize.Level1)
+{
+    auto scene = CreateEmptyScene();
+    auto node = scene->CreateNode("//test", ClassId::LightNode).GetResult();
+    SetComponent(node, "LightComponent");
+
+    TestEngineProperty<LightType>("Type", LightType::POINT, nativeComponent.type);
+}
+
+/**
+ * @tc.name: Type_Rect
+ * @tc.desc: Verify LightComponent Type property read/write with RECT.
+ * @tc.type: FUNC
+ */
+UNIT_TEST_F(API_ScenePluginLightComponentTest, Type_Rect, testing::ext::TestSize.Level1)
+{
+    auto scene = CreateEmptyScene();
+    auto node = scene->CreateNode("//test", ClassId::LightNode).GetResult();
+    SetComponent(node, "LightComponent");
+
+    TestEngineProperty<LightType>("Type", LightType::RECT, nativeComponent.type);
+}
+
+/**
+ * @tc.name: PointLightRange_SetValue
+ * @tc.desc: Verify PointLight Range property read/write with normal value.
+ * @tc.type: FUNC
+ */
+UNIT_TEST_F(API_ScenePluginLightComponentTest, PointLightRange_SetValue, testing::ext::TestSize.Level1)
+{
+    auto scene = CreateEmptyScene();
+    auto node = scene->CreateNode("//test", ClassId::LightNode).GetResult();
+    SetComponent(node, "LightComponent");
+
+    TestEngineProperty<float>("Range", 10.0f, nativeComponent.range);
+}
+
+/**
+ * @tc.name: RectLight_Width_SetValue
+ * @tc.desc: Verify RectLight RectWidth property read/write with normal value.
+ * @tc.type: FUNC
+ */
+UNIT_TEST_F(API_ScenePluginLightComponentTest, RectLight_Width_SetValue, testing::ext::TestSize.Level1)
+{
+    auto scene = CreateEmptyScene();
+    auto node = scene->CreateNode("//test", ClassId::LightNode).GetResult();
+    SetComponent(node, "LightComponent");
+
+    TestEngineProperty<float>("RectWidth", 2.0f, nativeComponent.rectLight.width);
+}
+
+/**
+ * @tc.name: RectLight_Width_SetZero
+ * @tc.desc: Verify RectLight RectWidth property read/write with value zero.
+ * @tc.type: FUNC
+ */
+UNIT_TEST_F(API_ScenePluginLightComponentTest, RectLight_Width_SetZero, testing::ext::TestSize.Level1)
+{
+    auto scene = CreateEmptyScene();
+    auto node = scene->CreateNode("//test", ClassId::LightNode).GetResult();
+    SetComponent(node, "LightComponent");
+
+    TestEngineProperty<float>("RectWidth", 0.0f, nativeComponent.rectLight.width);
+}
+
+/**
+ * @tc.name: RectLight_Height_SetValue
+ * @tc.desc: Verify RectLight RectHeight property read/write with normal value.
+ * @tc.type: FUNC
+ */
+UNIT_TEST_F(API_ScenePluginLightComponentTest, RectLight_Height_SetValue, testing::ext::TestSize.Level1)
+{
+    auto scene = CreateEmptyScene();
+    auto node = scene->CreateNode("//test", ClassId::LightNode).GetResult();
+    SetComponent(node, "LightComponent");
+
+    TestEngineProperty<float>("RectHeight", 3.0f, nativeComponent.rectLight.height);
+}
+
+/**
+ * @tc.name: RectLight_Height_SetZero
+ * @tc.desc: Verify RectLight RectHeight property read/write with value zero.
+ * @tc.type: FUNC
+ */
+UNIT_TEST_F(API_ScenePluginLightComponentTest, RectLight_Height_SetZero, testing::ext::TestSize.Level1)
+{
+    auto scene = CreateEmptyScene();
+    auto node = scene->CreateNode("//test", ClassId::LightNode).GetResult();
+    SetComponent(node, "LightComponent");
+
+    TestEngineProperty<float>("RectHeight", 0.0f, nativeComponent.rectLight.height);
+}
+
+/**
+ * @tc.name: RectLight_TwoSided_SetTrue
+ * @tc.desc: Verify RectLight RectTwoSided property set to true.
+ * @tc.type: FUNC
+ */
+UNIT_TEST_F(API_ScenePluginLightComponentTest, RectLight_TwoSided_SetTrue, testing::ext::TestSize.Level1)
+{
+    auto scene = CreateEmptyScene();
+    auto node = scene->CreateNode("//test", ClassId::LightNode).GetResult();
+    SetComponent(node, "LightComponent");
+
+    TestEngineProperty<bool>("RectTwoSided", true, nativeComponent.rectLight.twoSided);
+}
+
+/**
+ * @tc.name: RectLight_TwoSided_SetFalse
+ * @tc.desc: Verify RectLight RectTwoSided property set to false.
+ * @tc.type: FUNC
+ */
+UNIT_TEST_F(API_ScenePluginLightComponentTest, RectLight_TwoSided_SetFalse, testing::ext::TestSize.Level1)
+{
+    auto scene = CreateEmptyScene();
+    auto node = scene->CreateNode("//test", ClassId::LightNode).GetResult();
+    SetComponent(node, "LightComponent");
+
+    // Default twoSided is false, pre-set to true so TestEngineProperty can verify false differs from old.
+    auto p = GetProperty<bool>("RectTwoSided");
+    ASSERT_TRUE(p);
+    p->SetValue(true);
+    UpdateComponentMembers();
+
+    TestEngineProperty<bool>("RectTwoSided", false, nativeComponent.rectLight.twoSided);
+}
+
 }  // namespace UTest
 
 SCENE_END_NAMESPACE()

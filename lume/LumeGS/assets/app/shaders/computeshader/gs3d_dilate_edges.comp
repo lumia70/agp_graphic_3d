@@ -1,0 +1,43 @@
+#version 460 core
+#extension GL_ARB_separate_shader_objects : enable
+#extension GL_ARB_shading_language_420pack : enable
+
+layout(set = 0, binding = 0, r8) readonly restrict uniform image2D uEdgeIn;
+layout(set = 0, binding = 1, r8) writeonly restrict uniform image2D uEdgeOut;
+
+const int DILATE_RADIUS = 3;
+const float DILATE_THRESHOLD = 0.4;
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+void main()
+{
+    const ivec2 imageDim = imageSize(uEdgeIn);
+    const ivec2 uv = ivec2(gl_GlobalInvocationID.xy);
+    if (uv.x >= imageDim.x || uv.y >= imageDim.y) {
+        return;
+    }
+
+    float value = imageLoad(uEdgeIn, uv).r;
+
+    for (int y = -DILATE_RADIUS; y <= DILATE_RADIUS; y++) {
+        for (int x = -DILATE_RADIUS; x <= DILATE_RADIUS; x++) {
+            if (x == 0 && y == 0) {
+                continue;
+            }
+
+            ivec2 pixel = uv + ivec2(x, y);
+            if (pixel.x < 0 || pixel.y < 0 || pixel.x >= imageDim.x || pixel.y >= imageDim.y) {
+                continue;
+            }
+
+            if (imageLoad(uEdgeIn, pixel).r >= DILATE_THRESHOLD) {
+                value = 1.0;
+                y = DILATE_RADIUS + 1;
+                x = DILATE_RADIUS + 1;
+            }
+        }
+    }
+
+    imageStore(uEdgeOut, uv, vec4(value));
+}

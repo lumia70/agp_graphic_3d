@@ -143,6 +143,143 @@ UNIT_TEST(API_RenderDataStoreDefaultLight, GetAddLightTest, testing::ext::TestSi
 }
 
 /**
+ * @tc.name: AddRectLightTest
+ * @tc.desc: Verify that a rect light can be added via AddLight and is counted correctly.
+ * @tc.type: FUNC
+ */
+UNIT_TEST(API_RenderDataStoreDefaultLight, AddRectLightTest, testing::ext::TestSize.Level1)
+{
+    UTest::TestContext* testContext = UTest::GetTestContext();
+    auto renderContext = testContext->renderContext;
+
+    auto& dsManager = renderContext->GetRenderDataStoreManager();
+    constexpr BASE_NS::string_view dataStoreName = "DataStoreDefaultLight0";
+    auto dataStore = dsManager.Create(IRenderDataStoreDefaultLight::UID, dataStoreName.data());
+    ASSERT_TRUE(dataStore);
+    auto dataStoreDefaultLight = static_cast<IRenderDataStoreDefaultLight*>(dataStore.get());
+    
+    {
+        RenderLight light;
+        light.color = {1.0f, 1.0f, 1.0f, 1.0f};
+        light.lightUsageFlags = RenderLight::LIGHT_USAGE_RECT_LIGHT_BIT;
+        light.id = 0u;
+        dataStoreDefaultLight->AddLight(light);
+    }
+    {
+        auto lights = dataStoreDefaultLight->GetLights();
+        ASSERT_EQ(1u, lights.size());
+        EXPECT_EQ(RenderLight::LIGHT_USAGE_RECT_LIGHT_BIT, lights[0].lightUsageFlags);
+    }
+    {
+        auto counts = dataStoreDefaultLight->GetLightCounts();
+        EXPECT_EQ(1u, counts.rect);
+        EXPECT_EQ(0u, counts.directional);
+        EXPECT_EQ(0u, counts.spot);
+        EXPECT_EQ(0u, counts.point);
+    }
+
+    dataStore.reset();
+    renderContext->GetRenderer().RenderFrame({});
+    EXPECT_FALSE(dsManager.GetRenderDataStore(dataStoreName));
+}
+
+/**
+ * @tc.name: MixedLightsMaxCountTest
+ * @tc.desc: Verify that mixed light types are correctly truncated at MAX_LIGHT_COUNT
+ * @tc.type: FUNC
+ */
+UNIT_TEST(API_RenderDataStoreDefaultLight, MixedLightsMaxCountTest, testing::ext::TestSize.Level1)
+{
+    UTest::TestContext* testContext = UTest::GetTestContext();
+    auto renderContext = testContext->renderContext;
+
+    auto& dsManager = renderContext->GetRenderDataStoreManager();
+    constexpr BASE_NS::string_view dataStoreName = "DataStoreDefaultLight0";
+    auto dataStore = dsManager.Create(IRenderDataStoreDefaultLight::UID, dataStoreName.data());
+    ASSERT_TRUE(dataStore);
+    auto dataStoreDefaultLight = static_cast<IRenderDataStoreDefaultLight*>(dataStore.get());
+
+    // Add 30 point lights
+    for (uint32_t i = 0; i < 30u; ++i) {
+        RenderLight light;
+        light.color = {1.0f, 1.0f, 1.0f, 1.0f};
+        light.lightUsageFlags = RenderLight::LIGHT_USAGE_POINT_LIGHT_BIT;
+        dataStoreDefaultLight->AddLight(light);
+    }
+    // Add 30 rect lights
+    for (uint32_t i = 0; i < 30u; ++i) {
+        RenderLight light;
+        light.color = {1.0f, 1.0f, 1.0f, 1.0f};
+        light.lightUsageFlags = RenderLight::LIGHT_USAGE_RECT_LIGHT_BIT;
+        dataStoreDefaultLight->AddLight(light);
+    }
+    // Add 10 directional lights (total would be 70, exceeds MAX_LIGHT_COUNT of 64)
+    for (uint32_t i = 0; i < 10u; ++i) {
+        RenderLight light;
+        light.color = {1.0f, 1.0f, 1.0f, 1.0f};
+        light.lightUsageFlags = RenderLight::LIGHT_USAGE_DIRECTIONAL_LIGHT_BIT;
+        dataStoreDefaultLight->AddLight(light);
+    }
+
+    {
+        auto lights = dataStoreDefaultLight->GetLights();
+        EXPECT_EQ(DefaultMaterialLightingConstants::MAX_LIGHT_COUNT, lights.size());
+    }
+    {
+        auto counts = dataStoreDefaultLight->GetLightCounts();
+        const uint32_t total = counts.directional + counts.spot + counts.point + counts.rect;
+        EXPECT_EQ(DefaultMaterialLightingConstants::MAX_LIGHT_COUNT, total);
+        EXPECT_EQ(30u, counts.point);
+        EXPECT_EQ(30u, counts.rect);
+        EXPECT_EQ(4u, counts.directional);
+    }
+
+    dataStore.reset();
+    renderContext->GetRenderer().RenderFrame({});
+    EXPECT_FALSE(dsManager.GetRenderDataStore(dataStoreName));
+}
+
+/**
+ * @tc.name: AllRectLightsMaxCountTest
+ * @tc.desc: Verify that mixed light types are correctly truncated at MAX_LIGHT_COUNT
+ * @tc.type: FUNC
+ */
+UNIT_TEST(API_RenderDataStoreDefaultLight, AllRectLightsMaxCountTest, testing::ext::TestSize.Level1)
+{
+    UTest::TestContext* testContext = UTest::GetTestContext();
+    auto renderContext = testContext->renderContext;
+
+    auto& dsManager = renderContext->GetRenderDataStoreManager();
+    constexpr BASE_NS::string_view dataStoreName = "DataStoreDefaultLight0";
+    auto dataStore = dsManager.Create(IRenderDataStoreDefaultLight::UID, dataStoreName.data());
+    ASSERT_TRUE(dataStore);
+    auto dataStoreDefaultLight = static_cast<IRenderDataStoreDefaultLight*>(dataStore.get());
+
+    for (uint32_t i = 0; i < DefaultMaterialLightingConstants::MAX_LIGHT_COUNT + 5u; ++i) {
+        RenderLight light;
+        light.color = {1.0f, 1.0f, 1.0f, 1.0f};
+        light.lightUsageFlags = RenderLight::LIGHT_USAGE_RECT_LIGHT_BIT;
+        dataStoreDefaultLight->AddLight(light);
+    }
+
+    {
+        auto lights = dataStoreDefaultLight->GetLights();
+        EXPECT_EQ(DefaultMaterialLightingConstants::MAX_LIGHT_COUNT, lights.size());
+    }
+    {
+        auto counts = dataStoreDefaultLight->GetLightCounts();
+        EXPECT_EQ(DefaultMaterialLightingConstants::MAX_LIGHT_COUNT, counts.rect);
+        EXPECT_EQ(0u, counts.directional);
+        EXPECT_EQ(0u, counts.spot);
+        EXPECT_EQ(0u, counts.point);
+    }
+
+    dataStore.reset();
+    renderContext->GetRenderer().RenderFrame({});
+    EXPECT_FALSE(dsManager.GetRenderDataStore(dataStoreName));
+}
+
+/**
  * @tc.name: ShadowAtlasOverflowClearsShadowBit
  * @tc.desc: When more shadow-casting lights are added than the shadow atlas can hold (MAX_SHADOW_COUNT),
  *           the over-capacity lights must be kept but have their shadow usage bit cleared. Leaving the

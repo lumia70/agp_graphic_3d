@@ -32,7 +32,6 @@
 #include "node/render_node_shader_passes_generic.h"
 #include "node/render_node_single_post_process.h"
 #include "node/render_node_staging.h"
-#include "node/render_node_gaussian_splatting.h"
 #include "nodecontext/render_node_manager.h"
 
 using namespace CORE_NS;
@@ -68,6 +67,5 @@ void RegisterCoreRenderNodes(RenderNodeManager& renderNodeManager)
     renderNodeManager.AddRenderNodeFactory(FillRenderNodeType<RenderNodeDefaultAccelerationStructureStaging>());
     renderNodeManager.AddRenderNodeFactory(FillRenderNodeType<RenderNodeRenderPostProcessesGeneric>());
     renderNodeManager.AddRenderNodeFactory(FillRenderNodeType<RenderNodeQueueTransfer>());
-    renderNodeManager.AddRenderNodeFactory(FillRenderNodeType<RenderNodeGaussianSplatting>());
 }
 RENDER_END_NAMESPACE()

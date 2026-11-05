@@ -18,6 +18,9 @@
 
 const float M_PI = 3.14159265358;
 
+// Epsilon for the roL grazing-angle guard in CalculateRectAreaLight.
+const float AREA_LIGHT_EPSILON = 0.001;
+
 // Adapted from https://alextardif.com/arealights.html
 
 float RectangleSolidAngle(vec3 p, vec3 v0, vec3 v1, vec3 v2, vec3 v3)
@@ -56,13 +59,17 @@ vec3 CalculateRectAreaLight(uint lightIdx, vec3 diff, vec3 spec, vec3 N, vec3 V,
     const vec3 yDirHalf = uLightData.lights[lightIdx].spotLightParams.xyz * 0.5;
 
     const vec3 lPos = uLightData.lights[lightIdx].pos.xyz;
-    const vec3 lDir = cross(xDirHalf, yDirHalf);
+    const vec3 lDirRaw = cross(xDirHalf, yDirHalf);
     const vec3 rDir = mix(N, reflect(-V, N), 1 - alpha2);
 
-    float faceCheck = dot(lPos - P, -lDir);
-    if (faceCheck > 0.0) {
+    const uint lightFlags = uLightData.lights[lightIdx].flags.x;
+    const bool twoSided = (lightFlags & CORE_LIGHT_USAGE_TWO_SIDED_LIGHT_BIT) == CORE_LIGHT_USAGE_TWO_SIDED_LIGHT_BIT;
+    const float faceCheck = dot(lPos - P, -lDirRaw);
+    if (!twoSided && faceCheck > 0.0) {
         return vec3(0.0, 0.0, 0.0);
     }
+    // Flip plane normal for two-sided back-face shading.
+    const vec3 lDir = (faceCheck > 0.0) ? -lDirRaw : lDirRaw;
 
     const vec3 v0 = (lPos - xDirHalf + yDirHalf) - P;
     const vec3 v1 = (lPos - xDirHalf - yDirHalf) - P;
@@ -73,28 +80,27 @@ vec3 CalculateRectAreaLight(uint lightIdx, vec3 diff, vec3 spec, vec3 N, vec3 V,
     const float yLen = length(yDirHalf);
     const float sAngle = RectangleSolidAngle(P, v0, v1, v2, v3);
 
-    const float noL = sAngle * 0.2 *
-                      (Saturate(dot(normalize(v0 - P), N)) + Saturate(dot(normalize(v1 - P), N)) +
-                          Saturate(dot(normalize(v2 - P), N)) + Saturate(dot(normalize(v3 - P), N)) +
-                          Saturate(dot(normalize(lPos - P), N)));
-
-    const vec3 intPos = P + rDir * TracePlane(P, rDir, lPos, lDir);
-    const vec3 intVec = intPos - lPos;
-    const vec2 intDist = vec2(dot(intVec, xDirHalf) / xLen, dot(intVec, yDirHalf) / yLen);
-    const vec2 nearRect = vec2(clamp(intDist.x, -xLen, xLen), clamp(intDist.y, -yLen, yLen));
+    const float noL =
+        sAngle * 0.2 *
+        (Saturate(dot(normalize(v0), N)) + Saturate(dot(normalize(v1), N)) + Saturate(dot(normalize(v2), N)) +
+            Saturate(dot(normalize(v3), N)) + Saturate(dot(normalize(lPos - P), N)));
 
     vec3 specularFactor = vec3(0, 0, 0);
-    vec3 diffuseFactor = diff / M_PI;
+    // diff is the Lambert BRDF (albedo / pi) and noL the cosine-weighted solid angle, so no further 1 / pi
+    vec3 diffuseFactor = diff * noL;
 
-    float roL = dot(rDir, lDir);
-    if (roL > 0.0) {
+    // Epsilon guards TracePlane against the grazing-angle 1/0 below.
+    float roL = dot(normalize(rDir), normalize(lDir));
+    if (roL > AREA_LIGHT_EPSILON) {
+        const vec3 intPos = P + rDir * TracePlane(P, rDir, lPos, lDir);
+        const vec3 intVec = intPos - lPos;
+        const vec2 intDist = vec2(dot(intVec, xDirHalf) / xLen, dot(intVec, yDirHalf) / yLen);
+        const vec2 nearRect = vec2(clamp(intDist.x, -xLen, xLen), clamp(intDist.y, -yLen, yLen));
         float specFactor = 1.0 - clamp(length(nearRect - intDist) * Sqr(1.0 - alpha2) * 32.0, 0.0, 1.0);
         specularFactor += spec * specFactor * roL * noL;
     }
 
-    const float range = uLightData.lights[lightIdx].dir.w;
-
-    // Add contribution, luminosity is baked into light color.
+    // Add contribution, the light color is the emitted radiance (luminosity is baked into it).
     vec3 result = uLightData.lights[lightIdx].color.xyz * (specularFactor + diffuseFactor);
 
     return result;

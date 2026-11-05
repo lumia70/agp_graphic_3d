@@ -1,0 +1,21 @@
+#version 460 core
+#extension GL_ARB_separate_shader_objects : enable
+#define V21_COMPUTE_SHADER 1
+#define V21_PROFILE_SH_RANGE 1
+#include "common/v2_1_gaussian.glsl"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+void main()
+{
+    uint id = gl_GlobalInvocationID.x;
+    if (id >= v21.counts.x) {
+        return;
+    }
+    atomicAdd(globals.roiCount, 1u);
+    for (uint dimension = 0u; dimension < V21_SH_DIMENSIONS; ++dimension) {
+        uint ordered = V21FloatToOrdered(V21ShCoefficient(id, dimension));
+        atomicMin(shRobustStats[dimension].orderedMinimum, ordered);
+        atomicMax(shRobustStats[dimension].orderedMaximum, ordered);
+    }
+}

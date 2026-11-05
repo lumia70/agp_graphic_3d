@@ -929,6 +929,9 @@ bool EGLState::CreateContext(DeviceCreateInfo const& createInfo)
 
     plat_.hasColorSpaceExt = hasColorSpaceExt_ = HasExtension("EGL_KHR_gl_colorspace");
     plat_.hasImageColorSpaceExt = HasExtension("EGL_EXT_image_gl_colorspace");
+    // release fences for surface buffer producers. Sync objects and server side waits are separate extensions.
+    plat_.hasNativeFenceSyncExt = HasExtension("EGL_ANDROID_native_fence_sync") && HasExtension("EGL_KHR_fence_sync") &&
+                                  HasExtension("EGL_KHR_wait_sync");
     hasConfiglessExt_ = HasExtension("EGL_KHR_no_config_context");
     hasSurfacelessExt_ = HasExtension("EGL_KHR_surfaceless_context");
     // we need a config for the context..
@@ -1007,6 +1010,15 @@ void EGLState::GlInitialize()
         PLUGIN_LOG_E("Missing eglCreateImageKHR");
         PLUGIN_LOG_E("Missing eglDestroyImageKHR");
     }
+
+#if defined(EGL_KHR_fence_sync) && defined(EGL_ANDROID_native_fence_sync) && defined(EGL_KHR_wait_sync)
+    if (!eglCreateSyncKHR || !eglDestroySyncKHR || !eglClientWaitSyncKHR || !eglDupNativeFenceFDANDROID ||
+        !eglWaitSyncKHR) {
+        plat_.hasNativeFenceSyncExt = false;
+    }
+#else
+    plat_.hasNativeFenceSyncExt = false;
+#endif
 
     if (const char* r = reinterpret_cast<const char*>(glGetString(GL_RENDERER))) {
         plat_.deviceName = r;

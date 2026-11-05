@@ -43,6 +43,7 @@
 #include <3d/intf_graphics_context.h>
 #include <3d/render/default_material_constants.h>
 #include <3d/util/intf_mesh_util.h>
+#include <3d/ecs/systems/intf_render_system.h>
 #include <base/containers/fixed_string.h>
 #include <base/containers/unordered_map.h>
 #include <base/containers/vector.h>
@@ -1299,5 +1300,13 @@ bool SceneUtil::IsSphereInsideCameraFrustum(
     const Math::Mat4X4 proj = CameraMatrixUtil::CalculateProjectionMatrix(*cameraHandle, isCameraNegative);
     const Frustum frustum = frustumUtil->CreateFrustum(proj * view);
     return frustumUtil->SphereFrustumCollision(frustum, center, radius);
+}
+
+uint32_t SceneUtil::GetDroppedCameraCount(const IEcs& ecs) const
+{
+    if (auto* rs = GetSystem<IRenderSystem>(ecs)) {
+        return rs->GetDroppedCameraCount();
+    }
+    return 0;
 }
 CORE3D_END_NAMESPACE()

@@ -1,4 +1,44 @@
-# This file was originally tracked by Git LFS but LFS tracking has been removed
-version https://git-lfs.github.com/spec/v1
-oid sha256:456fcfc46092cb289026067ddcb287a49f81961aa75133d490445b33780ec75f
-size 1030
+{
+    "asset": {"version": "2.0"},
+    "scene": 0,
+    "scenes": [{"nodes": []}],
+    "buffers": [
+        {
+            "uri": "data:application/octet-stream;base64,AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "byteLength": 24
+        }
+    ],
+    "bufferViews": [
+        {
+            "buffer": 0,
+            "byteOffset": 0,
+            "byteLength": 12
+        },
+        {
+            "buffer": 0,
+            "byteOffset": 12,
+            "byteLength": 12
+        }
+    ],
+    "accessors": [
+        {
+            "bufferView": 0,
+            "byteOffset": 0,
+            "componentType": 5126,
+            "count": 3,
+            "type": "SCALAR",
+            "sparse": {
+                "count": 1,
+                "indices": {
+                    "bufferView": 1,
+                    "bufferOffset": 0,
+                    "componentType": 5125
+                },
+                "values": {
+                    "bufferView": 1,
+                    "bufferOffset": 4
+                }
+            }
+        }
+    ]
+}

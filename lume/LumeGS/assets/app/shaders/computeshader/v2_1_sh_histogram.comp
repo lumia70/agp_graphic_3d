@@ -1,0 +1,23 @@
+#version 460 core
+#extension GL_ARB_separate_shader_objects : enable
+#define V21_COMPUTE_SHADER 1
+#define V21_PROFILE_SH_HISTOGRAM 1
+#include "common/v2_1_gaussian.glsl"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+void main()
+{
+    uint id = gl_GlobalInvocationID.x;
+    if (id >= v21.counts.x) {
+        return;
+    }
+    for (uint dimension = 0u; dimension < V21_SH_DIMENSIONS; ++dimension) {
+        float minimum = V21OrderedToFloat(shRobustStats[dimension].orderedMinimum);
+        float maximum = V21OrderedToFloat(shRobustStats[dimension].orderedMaximum);
+        float value = V21ShCoefficient(id, dimension);
+        float normalized = (value - minimum) / max(maximum - minimum, 1.0e-12);
+        uint bin = min(255u, uint(clamp(normalized, 0.0, 1.0) * 255.0));
+        atomicAdd(histogramBins[dimension * V21_HISTOGRAM_BINS + bin].count, 1u);
+    }
+}

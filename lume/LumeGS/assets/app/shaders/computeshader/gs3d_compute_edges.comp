@@ -1,0 +1,96 @@
+#version 460 core
+#extension GL_ARB_separate_shader_objects : enable
+#extension GL_ARB_shading_language_420pack : enable
+#include "3d/shaders/common/3d_dm_structures_common.h"
+#include "common/gs_common.h"
+#include "common/gs_struct_common.h"
+
+layout(set = 0, binding = 0) uniform sampler2D uDepthTex;
+layout(set = 0, binding = 1) uniform sampler2D uNormalsTex;
+layout(set = 0, binding = 2, r8) writeonly restrict uniform image2D uOutEdgeTex;
+
+layout(push_constant, std430) uniform uPostProcessPushConstant
+{
+    GsEdgePassPushConstantStruct uPc;
+};
+
+const float NORMAL_EDGE_COS = 0.95; // cos(25)
+const float PROXIMITY_FADE = 0.1;
+
+float LinearDepth(float depth, float near, float far)
+{
+    return (far * near) / ((near - far) * depth + far);
+}
+
+vec3 ReconstructWorldPos(vec2 uv, float ndcDepth)
+{
+    vec4 clip = vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, ndcDepth, 1.0);
+    vec4 world = uPc.invViewProj * clip;
+    return world.xyz / world.w;
+}
+
+// https://github.com/GameTechDev/XeGTAO/blob/a5b1686c7ea37788eeb3576b5be47f7c03db532c/Source/Rendering/Shaders/XeGTAO.hlsli#L120
+vec4 CalculateDepthEdges(float centerZ, float leftZ, float rightZ, float topZ, float bottomZ)
+{
+    vec4 edgesLRTB = vec4(leftZ, rightZ, topZ, bottomZ) - centerZ;
+    float slopeLR = (edgesLRTB.y - edgesLRTB.x) * 0.5f;
+    float slopeTB = (edgesLRTB.w - edgesLRTB.z) * 0.5f;
+    vec4 eAdj = edgesLRTB + vec4(slopeLR, -slopeLR, slopeTB, -slopeTB);
+    edgesLRTB = min(abs(edgesLRTB), abs(eAdj));
+    const float threshold = centerZ * 0.0001f;
+    return clamp(1.25f - edgesLRTB / threshold, vec4(0.0), vec4(1.0));
+}
+
+vec4 CalculateNormalEdges(vec3 normalCenter, vec3 normalLeft, vec3 normalRight, vec3 normalTop, vec3 normalBottom)
+{
+    vec4 dots = vec4(dot(normalCenter, normalLeft), dot(normalCenter, normalRight), dot(normalCenter, normalTop),
+        dot(normalCenter, normalBottom));
+    return step(NORMAL_EDGE_COS, dots);
+}
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+void main()
+{
+    const ivec2 uv = ivec2(gl_GlobalInvocationID.xy);
+    const ivec2 imageDim = textureSize(uDepthTex, 0);
+
+    float centerDepthNdc = texelFetch(uDepthTex, uv, 0).r;
+    float centerLinearDepth = LinearDepth(centerDepthNdc, uPc.cameraParams.x, uPc.cameraParams.y);
+
+    // depth edges
+    float depthLeft =
+        LinearDepth(texelFetch(uDepthTex, uv + ivec2(-1, 0), 0).r, uPc.cameraParams.x, uPc.cameraParams.y);
+    float depthRight =
+        LinearDepth(texelFetch(uDepthTex, uv + ivec2(1, 0), 0).r, uPc.cameraParams.x, uPc.cameraParams.y);
+    float depthTop = LinearDepth(texelFetch(uDepthTex, uv + ivec2(0, -1), 0).r, uPc.cameraParams.x, uPc.cameraParams.y);
+    float depthBottom =
+        LinearDepth(texelFetch(uDepthTex, uv + ivec2(0, 1), 0).r, uPc.cameraParams.x, uPc.cameraParams.y);
+    vec4 depthEdges = CalculateDepthEdges(centerLinearDepth, depthLeft, depthRight, depthTop, depthBottom);
+
+    // normal edges
+    vec3 normalCenter = texelFetch(uNormalsTex, uv, 0).xyz;
+    vec3 normalLeft = texelFetch(uNormalsTex, uv + ivec2(-1, 0), 0).xyz;
+    vec3 normalRight = texelFetch(uNormalsTex, uv + ivec2(1, 0), 0).xyz;
+    vec3 normalTop = texelFetch(uNormalsTex, uv + ivec2(0, -1), 0).xyz;
+    vec3 normalBottom = texelFetch(uNormalsTex, uv + ivec2(0, 1), 0).xyz;
+    vec4 normalEdges = CalculateNormalEdges(normalCenter, normalLeft, normalRight, normalTop, normalBottom);
+
+    vec4 edges = min(depthEdges, normalEdges);
+    float edge = min(min(edges.x, edges.y), min(edges.z, edges.w));
+
+    vec2 pixelUv = (vec2(uv) + 0.5) / vec2(imageDim);
+    vec3 pixelWorld = ReconstructWorldPos(pixelUv, centerDepthNdc);
+    ivec2 hitPx = ivec2(uPc.cameraParams.zw);
+    float hitDepthNdc = texelFetch(uDepthTex, hitPx, 0).r;
+    vec2 hitUv = (vec2(hitPx) + 0.5) / vec2(imageDim);
+    vec3 hitWorld = ReconstructWorldPos(hitUv, hitDepthNdc);
+
+    float worldDist = length(pixelWorld - hitWorld);
+    // TODO: fade radius should be normalized by the world AABB - not the far plane
+    float fadeRadius = uPc.cameraParams.y * PROXIMITY_FADE;
+    float proximity = smoothstep(0.0, fadeRadius, worldDist);
+
+    edge = mix(edge, 1.0, proximity);
+    imageStore(uOutEdgeTex, uv, vec4(edge));
+}

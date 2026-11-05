@@ -75,6 +75,8 @@ struct SwapchainCreateInfo {
      * NOTE: do not create surface for surfaceHandle if the window and instance is provided
      */
     SwapchainWindow window;
+
+    uint32_t swapchainImageCountOverride{0u};
 };
 
 struct DeviceConfiguration {

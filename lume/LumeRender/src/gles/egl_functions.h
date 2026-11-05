@@ -36,6 +36,20 @@ declare(PFNEGLCREATEIMAGEKHRPROC, eglCreateImageKHR);
 declare(PFNEGLDESTROYIMAGEKHRPROC, eglDestroyImageKHR);
 #endif
 
+#ifdef EGL_KHR_fence_sync
+declare(PFNEGLCREATESYNCKHRPROC, eglCreateSyncKHR);
+declare(PFNEGLDESTROYSYNCKHRPROC, eglDestroySyncKHR);
+declare(PFNEGLCLIENTWAITSYNCKHRPROC, eglClientWaitSyncKHR);
+#endif
+
+#ifdef EGL_KHR_wait_sync
+declare(PFNEGLWAITSYNCKHRPROC, eglWaitSyncKHR);
+#endif
+
+#ifdef EGL_ANDROID_native_fence_sync
+declare(PFNEGLDUPNATIVEFENCEFDANDROIDPROC, eglDupNativeFenceFDANDROID);
+#endif
+
 #endif  // RENDER_HAS_GLES_BACKEND
 #undef declare
 #endif  // EGL_FUNCTIONS_H

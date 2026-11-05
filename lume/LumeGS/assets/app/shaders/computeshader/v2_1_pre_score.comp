@@ -1,0 +1,44 @@
+#version 460 core
+#extension GL_ARB_separate_shader_objects : enable
+#define V21_COMPUTE_SHADER 1
+#define V21_PROFILE_PRE_SCORE 1
+#include "common/v2_1_bindings.glsl"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+void main()
+{
+    uint id = gl_GlobalInvocationID.x;
+    if (id >= v21.counts.x) {
+        return;
+    }
+    if (states[id].cumulativeMask != 0u || projected[id].centerDepth.w < 0.5) {
+        states[id].score = 0.0;
+        return;
+    }
+    V21Evidence item = analysis[id].evidence;
+    float fixedScale = float(max(v21.peel.z, 1u));
+    float firstPurity = float(item.anomalyPixels) / float(max(item.ownerPixels, 1u));
+    float alphaPurity = float(item.alphaAnomalyQ) / float(max(item.alphaTotalQ, 1u));
+    float meanGap = float(item.relativeGapSumQ) / (float(max(item.anomalyPixels, 1u)) * fixedScale);
+    float depthAnomaly = clamp((meanGap - v21.discAlphaGap.z) /
+        max(v21.discAlphaGap.w - v21.discAlphaGap.z, 1.0e-6), 0.0, 1.0);
+    float front = analysis[id].features.frontSuspension;
+    // Python v21 normalizes center/footprint front suspension by 0.35.  The
+    // seed front gate (0.10) is an admission threshold, not a score scale.
+    float frontScore = clamp(front / max(v21.discAlphaGap.w, 1.0e-6), 0.0, 1.0);
+    float rawScore = v21.weights0.x * depthAnomaly + v21.weights0.y * firstPurity +
+        v21.weights0.z * alphaPurity + v21.weights0.w * frontScore;
+    float supportConfidence = clamp(log(1.0 + float(item.anomalyPixels)) / log(49.0), 0.0, 1.0);
+    float detailFactor = 1.0 - v21.weights1.y * analysis[id].features.detailProtection;
+    float preliminary = clamp(rawScore * (0.55 + 0.45 * supportConfidence) * detailFactor, 0.0, 1.0);
+    analysis[id].features.depthScore = depthAnomaly;
+    analysis[id].features.firstPurity = firstPurity;
+    analysis[id].features.alphaPurity = alphaPurity;
+    analysis[id].features.meanGap = meanGap;
+    analysis[id].features.preliminaryScore = preliminary;
+    analysis[id].features.weakEvidence = (preliminary >= v21.weak0.x && front >= v21.weak0.y &&
+        firstPurity >= v21.weak0.z && meanGap >= v21.weak0.w &&
+        item.anomalyPixels >= uint(v21.weak1.x)) ? 1.0 : 0.0;
+    states[id].score = preliminary;
+}

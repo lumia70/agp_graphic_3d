@@ -1,4 +1,975 @@
-# This file was originally tracked by Git LFS but LFS tracking has been removed
-version https://git-lfs.github.com/spec/v1
-oid sha256:b7d9d2dc1ff6e6410b204bee199d845da90f03a956d2f028448cf684092a2d56
-size 25966
+{
+    "asset": {
+        "version": "2.0",
+        "minVersion": "2.0",
+        "generator": "CoreEngine 2022.10.0"
+    },
+    "accessors": [
+        {
+            "componentType": 5126,
+            "count": 1,
+            "type": "VEC3",
+            "bufferView": 0,
+            "byteOffset": 0,
+            "max": [1.0, 1.0, 1.0],
+            "min": [0.0, 0.0, 0.0],
+            "normalized": true,
+            "sparse": {
+                "count": 1,
+                "indices": {
+                    "bufferView": 2,
+                    "byteOffset": 0,
+                    "componentType": 5126
+                },
+                "values": {
+                    "bufferView": 2,
+                    "byteOffset": 0
+                }
+            }
+        },
+        {
+            "componentType": 5126,
+            "count": 1,
+            "type": "VEC2",
+            "bufferView": 0,
+            "byteOffset": 0,
+            "normalized": true,
+            "max": [1.0, 1.0],
+            "min": [0.0, 0.0]
+        },
+        {
+            "componentType": 5126,
+            "count": 1,
+            "type": "VEC3",
+            "bufferView": 0,
+            "byteOffset": 0,
+            "normalized": true,
+            "max": [1.0, 1.0, 1.0],
+            "min": [0.0, 0.0, 0.0]
+        },
+        {
+            "componentType": 5125,
+            "count": 3,
+            "type": "SCALAR",
+            "bufferView": 1,
+            "byteOffset": 0,
+            "normalized": true,
+            "max": [1],
+            "min": [0]
+        },
+        {
+            "componentType": 5123,
+            "count": 3,
+            "type": "SCALAR",
+            "bufferView": 1,
+            "byteOffset": 0,
+            "normalized": true,
+            "max": [1],
+            "min": [0]
+        },
+        {
+            "componentType": 5123,
+            "count": 1,
+            "type": "VEC2",
+            "bufferView": 1,
+            "byteOffset": 0,
+            "normalized": true,
+            "max": [1, 1],
+            "min": [0, 0]
+        },
+        {
+            "componentType": 5121,
+            "count": 1,
+            "type": "VEC2",
+            "bufferView": 1,
+            "byteOffset": 0,
+            "normalized": false,
+            "max": [1, 1],
+            "min": [0, 0]
+        },
+        {
+            "componentType": 5121,
+            "count": 1,
+            "type": "VEC4",
+            "bufferView": 1,
+            "byteOffset": 0,
+            "normalized": true,
+            "max": [1, 1, 1, 1],
+            "min": [0, 0, 0, 0]
+        },
+        {
+            "componentType": 5123,
+            "count": 1,
+            "type": "VEC4",
+            "bufferView": 1,
+            "byteOffset": 0,
+            "normalized": true,
+            "max": [1, 1, 1, 1],
+            "min": [0, 0, 0, 0]
+        },
+        {
+            "componentType": 5123,
+            "count": 1,
+            "type": "VEC4",
+            "bufferView": 1,
+            "byteOffset": 0,
+            "normalized": false,
+            "max": [1, 1, 1, 1],
+            "min": [0, 0, 0, 0]
+        },
+        {
+            "componentType": 5121,
+            "count": 3,
+            "type": "SCALAR",
+            "bufferView": 1,
+            "byteOffset": 0,
+            "normalized": true,
+            "max": [1],
+            "min": [0]
+        },
+        {
+            "componentType": 5122,
+            "count": 1,
+            "type": "VEC3",
+            "bufferView": 0,
+            "byteOffset": 0,
+            "normalized": true,
+            "max": [1.0, 1.0, 1.0],
+            "min": [0.0, 0.0, 0.0]
+        },
+        {
+            "componentType": 5122,
+            "count": 1,
+            "type": "VEC3",
+            "bufferView": 0,
+            "byteOffset": 0,
+            "normalized": false,
+            "max": [1.0, 1.0, 1.0],
+            "min": [0.0, 0.0, 0.0]
+        },
+        {
+            "componentType": 5126,
+            "count": 2,
+            "type": "SCALAR",
+            "bufferView": 0,
+            "byteOffset": 0,
+            "normalized": false,
+            "max": [1.0],
+            "min": [0.0]
+        },
+        {
+            "componentType": 5121,
+            "count": 2,
+            "type": "SCALAR",
+            "bufferView": 0,
+            "byteOffset": 0,
+            "normalized": false,
+            "max": [1.0],
+            "min": [0.0]
+        },
+        {
+            "componentType": 5121,
+            "count": 2,
+            "type": "SCALAR",
+            "bufferView": 0,
+            "byteOffset": 0,
+            "normalized": true,
+            "max": [1.0],
+            "min": [0.0]
+        },
+        {
+            "componentType": 5121,
+            "count": 2,
+            "type": "SCALAR",
+            "bufferView": 0,
+            "byteOffset": 0,
+            "normalized": true,
+            "max": [1.0],
+            "min": [0.0]
+        },
+        {
+            "componentType": 5121,
+            "count": 2,
+            "type": "SCALAR",
+            "bufferView": 0,
+            "byteOffset": 0,
+            "normalized": false,
+            "max": [1.0],
+            "min": [0.0]
+        },
+        {
+            "componentType": 5126,
+            "count": 3,
+            "type": "VEC3",
+            "bufferView": 0,
+            "byteOffset": 0,
+            "max": [1.0, 1.0, 1.0],
+            "min": [0.0, 0.0, 0.0],
+            "normalized": true,
+            "sparse": {
+                "count": 3,
+                "indices": {
+                    "bufferView": 2,
+                    "byteOffset": 0,
+                    "componentType": 5121
+                },
+                "values": {
+                    "bufferView": 2,
+                    "byteOffset": 0
+                }
+            }
+        }
+    ],
+    "buffers": [
+        {
+            "byteLength": 1024,
+            "uri": "DummyBuffer1024.bin"
+        },
+        {
+            "byteLength": 48,
+            "uri": "data:application/octet-stream;base64,AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        }
+    ],
+    "bufferViews": [
+        {
+            "buffer": 0,
+            "byteLength": 120,
+            "byteOffset": 0,
+            "byteStride": 16
+        },
+        {
+            "buffer": 1,
+            "byteLength": 48,
+            "byteOffset": 0,
+            "byteStride": 4
+        },
+        {
+            "buffer": 0,
+            "byteLength": 120,
+            "byteOffset": 0
+        }
+    ],
+    "images": [
+        {
+            "uri": "canine_512x512%2Epng",
+            "mimeType": "image/png"
+        }
+    ],
+    "samplers": [
+        {
+            "magFilter": 9729,
+            "minFilter": 9729,
+            "wrapS": 33071,
+            "wrapT": 33071
+        },
+        {
+            "magFilter": 9729,
+            "minFilter": 9729,
+            "wrapS": 33071,
+            "wrapT": 33071
+        },
+        {
+            "magFilter": 9728,
+            "minFilter": 9985,
+            "wrapS": 33071,
+            "wrapT": 33071
+        },
+        {
+            "magFilter": 9728,
+            "minFilter": 9986,
+            "wrapS": 33071,
+            "wrapT": 33071
+        }
+    ],
+    "textures": [
+        {
+            "sampler": 0,
+            "source": 0,
+            "extensions": {
+                "MSFT_texture_dds": {
+                    "source": 0
+                },
+                "KHR_texture_basisu": {
+                    "source": 0
+                }
+            }
+        }
+    ],
+    "materials": [
+        {
+            "extras": {
+                "clearCoat": {
+                    "factor": 1,
+                    "roughness": 1
+                }
+            },
+            "extensions": {
+                "KHR_materials_clearcoat": {
+                    "clearcoatFactor": 0,
+                    "clearcoatTexture": {
+                        "index": 0,
+                        "texCoord": 0
+                    },
+                    "clearcoatRoughnessFactor": 0,
+                    "clearcoatRoughnessTexture": {
+                        "index": 0,
+                        "texCoord": 0
+                    },
+                    "clearcoatNormalTexture": {
+                        "index": 0,
+                        "texCoord": 0,
+                        "scale": 1
+                    }
+                },
+                "KHR_materials_emissive_strength": {
+                    "emissiveStrength": 1
+                },
+                "KHR_materials_ior": {
+                    "ior": 1
+                },
+                "KHR_materials_pbrSpecularGlossiness": {
+                    "diffuseFactor": [1, 1, 1, 1],
+                    "diffuseTexture": {
+                        "index": 0,
+                        "texCoord": 0
+                    },
+                    "specularFactor": [1, 1, 1],
+                    "glossinessFactor": 1,
+                    "specularGlossinessTexture": {
+                        "index": 0,
+                        "texCoord": 0
+                    }
+                },
+                "KHR_materials_sheen": {
+                    "sheenColorFactor": [1, 1, 1],
+                    "sheenColorTexture": {
+                        "index": 0,
+                        "texCoord": 0
+                    },
+                    "sheenRoughnessFactor": 0,
+                    "sheenRoughnessTexture": {
+                        "index": 0,
+                        "texCoord": 0
+                    }
+                },
+                "KHR_materials_specular": {
+                    "specularFactor": 1,
+                    "specularTexture": {
+                        "index": 0,
+                        "texCoord": 0
+                    },
+                    "specularColorFactor": [1, 1, 1],
+                    "specularColorTexture": {
+                        "index": 0,
+                        "texCoord": 0
+                    }
+                },
+                "KHR_materials_transmission": {
+                    "transmissionFactor": 1,
+                    "transmissionTexture": {
+                        "index": 0,
+                        "texCoord": 0
+                    }
+                }
+            }
+        },
+        {
+            "normalTexture": {
+                "index": 0,
+                "texCoord": 0,
+                "scale": 1
+            }
+        },
+        {
+            "extensions": {
+                "KHR_materials_unlit": {}
+            }
+        },
+        {
+            "extensions": {
+                "KHR_materials_pbrSpecularGlossiness": {
+                    "specularFactor": [1, 1, 1],
+                    "glossinessFactor": 1,
+                    "specularGlossinessTexture": {
+                        "index": 0,
+                        "texCoord": 0
+                    }
+                }
+            }
+        },
+        {
+            "extensions": {
+                "KHR_materials_pbrSpecularGlossiness": {
+                    "specularFactor": [1, 1, 1],
+                    "glossinessFactor": 1
+                }
+            }
+        },
+        {
+            "emissiveTexture": {
+                "index": 0,
+                "texCoord": 0
+            }
+        },
+        {
+            "occlusionTexture": {
+                "index": 0,
+                "texCoord": 0,
+                "strength": 1
+            }
+        },
+        {
+            "pbrMetallicRoughness": {
+                "baseColorTexture": {
+                    "index": 0,
+                    "texCoord": 0
+                }
+            },
+            "extensions": {
+                "KHR_materials_unlit": {}
+            }
+        },
+        {
+            "alphaMode": "BLEND",
+            "extensions": {
+                "KHR_materials_specular": {
+                    "specularFactor": 1,
+                    "specularTexture": {
+                        "index": 0,
+                        "texCoord": 0
+                    }
+                }
+            }
+        },
+        {
+            "alphaMode": "MASK",
+            "extensions": {
+                "KHR_materials_specular": {
+                    "specularColorFactor": [1, 1, 1],
+                    "specularColorTexture": {
+                        "index": 0,
+                        "texCoord": 0
+                    }
+                }
+            }
+        },
+        {
+            "extensions": {
+                "KHR_materials_specular": {
+                    "specularFactor": 1,
+                    "specularTexture": {
+                        "index": 0,
+                        "texCoord": 0
+                    },
+                    "specularColorFactor": [0.7, 0.6, 0.5],
+                    "specularColorTexture": {
+                        "index": 0,
+                        "texCoord": 0
+                    }
+                }
+            }
+        }
+    ],
+    "meshes": [
+        {
+            "name": "mesh0",
+            "primitives": [
+                {
+                    "attributes": {
+                        "POSITION": 2,
+                        "TEXCOORD_0": 1,
+                        "NORMAL": 2
+                    },
+                    "indices": 3,
+                    "mode": 4,
+                    "targets": [],
+                    "material": 1
+                }
+            ],
+            "weights": [1]
+        },
+        {
+            "name": "mesh1",
+            "primitives": [
+                {
+                    "attributes": {
+                        "POSITION": 2,
+                        "TEXCOORD_0": 5,
+                        "NORMAL": 2
+                    },
+                    "indices": 4,
+                    "mode": 4,
+                    "targets": []
+                }
+            ],
+            "weights": [1]
+        },
+        {
+            "name": "mesh2",
+            "primitives": [
+                {
+                    "attributes": {
+                        "POSITION": 2,
+                        "TEXCOORD_0": 6,
+                        "NORMAL": 2,
+                        "COLOR_0": 7
+                    },
+                    "indices": 4,
+                    "mode": 4,
+                    "targets": []
+                }
+            ],
+            "weights": [1]
+        },
+        {
+            "name": "mesh3",
+            "primitives": [
+                {
+                    "attributes": {
+                        "POSITION": 2,
+                        "TEXCOORD_0": 6,
+                        "NORMAL": 2,
+                        "COLOR_0": 8
+                    },
+                    "indices": 4,
+                    "mode": 4,
+                    "targets": [],
+                    "material": 1
+                }
+            ],
+            "weights": [1]
+        },
+        {
+            "name": "mesh4",
+            "primitives": [
+                {
+                    "attributes": {
+                        "POSITION": 2,
+                        "TEXCOORD_0": 6,
+                        "NORMAL": 2,
+                        "COLOR_0": 9
+                    },
+                    "indices": 10,
+                    "mode": 4,
+                    "targets": []
+                }
+            ],
+            "weights": [1]
+        },
+        {
+            "name": "mesh5",
+            "primitives": [
+                {
+                    "attributes": {
+                        "POSITION": 2,
+                        "TEXCOORD_0": 6,
+                        "COLOR_0": 9
+                    },
+                    "indices": 10,
+                    "mode": 4,
+                    "targets": [],
+                    "material": 1
+                }
+            ],
+            "weights": [1]
+        },
+        {
+            "name": "mesh6",
+            "primitives": [
+                {
+                    "attributes": {
+                        "POSITION": 2,
+                        "TEXCOORD_0": 6,
+                        "COLOR_0": 9
+                    },
+                    "indices": 10,
+                    "mode": 4,
+                    "targets": [
+                        {
+                            "POSITION": 11,
+                            "NORMAL": 2
+                        },
+                        {
+                            "POSITION": 11,
+                            "NORMAL": 2
+                        }
+                    ],
+                    "material": 1,
+                    "extensions": {
+                        "IGFX_compressed": {
+                            "targets": [
+                                {
+                                    "POSITION": 11,
+                                    "NORMAL": 2
+                                },
+                                {
+                                    "POSITION": 11,
+                                    "NORMAL": 2
+                                }
+                            ]
+                        }
+                    }
+                }
+            ],
+            "weights": [1, 1]
+        },
+        {
+            "name": "mesh7",
+            "primitives": [
+                {
+                    "attributes": {
+                        "POSITION": 2,
+                        "TEXCOORD_0": 6,
+                        "COLOR_0": 9
+                    },
+                    "indices": 10,
+                    "mode": 4,
+                    "targets": [
+                        {
+                            "POSITION": 12,
+                            "NORMAL": 2
+                        }
+                    ],
+                    "material": 1,
+                    "extensions": {
+                        "IGFX_compressed": {
+                            "targets": [
+                                {
+                                    "POSITION": 12,
+                                    "NORMAL": 2,
+                                    "TANGENT": 2
+                                }
+                            ]
+                        }
+                    }
+                }
+            ],
+            "weights": [1]
+        },
+        {
+            "name": "meshXX",
+            "primitives": [
+                {
+                    "attributes": {
+                        "POSITION": 2,
+                        "TEXCOORD_0": 1,
+                        "NORMAL": 2
+                    },
+                    "indices": 3,
+                    "mode": 4,
+                    "targets": [],
+                    "material": 10
+                }
+            ],
+            "weights": [1]
+        },
+        {
+            "name": "meshXY",
+            "primitives": [
+                {
+                    "attributes": {
+                        "POSITION": 18,
+                        "TEXCOORD_0": 1,
+                        "NORMAL": 2
+                    },
+                    "indices": 3,
+                    "mode": 4,
+                    "targets": [],
+                    "material": 4
+                }
+            ],
+            "weights": [1]
+        }
+    ],
+    "cameras": [
+        {
+            "type": "perspective",
+            "perspective": {
+                "aspectRatio": 1,
+                "yfov": 1.3089969158172607,
+                "zfar": 100,
+                "znear": 2
+            }
+        },
+        {
+            "type": "orthographic",
+            "orthographic": {
+                "xmag": 1,
+                "ymag": 1,
+                "zfar": 100,
+                "znear": 2
+            }
+        }
+    ],
+    "nodes": [
+        {
+            "children": [
+                1, 4, 5, 6, 7, 8, 9, 10
+            ],
+            "name": "TestScene"
+        },
+        {
+            "name": "Cube",
+            "translation": [
+                -3,
+                -2,
+                -5.5
+            ]
+        },
+        {
+            "camera": 0,
+            "translation": [
+                0,
+                0.5,
+                4
+            ]
+        },
+        {
+            "name": "Light",
+            "translation": [
+                0,
+                0,
+                3
+            ],
+            "rotation": [
+                -0.38268345594406128,
+                -0,
+                -0,
+                0.92387950420379639
+            ],
+            "extensions": {
+                "KHR_lights_punctual": {
+                    "light": 0
+                }
+            }
+        },
+        {
+            "mesh": 7,
+            "extras": {
+                "modelId": "RSDZ"
+            }
+        },
+        {
+            "extensions": {
+                "KHR_lights_punctual": {
+                    "light": 1
+                }
+            }
+        },
+        {
+            "extensions": {
+                "KHR_lights_punctual": {
+                    "light": 2
+                }
+            }
+        },
+        {
+            "camera": 1
+        },
+        {
+            "name": "weightNode",
+            "mesh": 7,
+            "weights": [1, 1]
+        },
+        {
+            "name": "samplerNode",
+            "mesh": 8
+        },
+        {
+            "name": "sparseNode",
+            "mesh": 9
+        }
+    ],
+    "animations": [
+        {
+            "name": "anim",
+            "samplers": [
+                {
+                    "input": 13,
+                    "output": 14,
+                    "interpolation": "STEP"
+                }
+            ],
+            "channels": [
+                {
+                    "sampler": 0,
+                    "target": {
+                        "path": "visible",
+                        "node": 7
+                    }
+                }
+            ]
+        },
+        {
+            "samplers": [
+                {
+                    "input": 13,
+                    "output": 13,
+                    "interpolation": "STEP"
+                }
+            ],
+            "channels": [
+                {
+                    "sampler": 0,
+                    "target": {
+                        "path": "visible",
+                        "node": 7
+                    }
+                }
+            ]
+        },
+        {
+            "samplers": [
+                {
+                    "input": 13,
+                    "output": 15,
+                    "interpolation": "CUBICSPLINE"
+                }
+            ],
+            "channels": [
+                {
+                    "sampler": 0,
+                    "target": {
+                        "path": "weights",
+                        "node": 4
+                    }
+                }
+            ]
+        },
+        {
+            "samplers": [
+                {
+                    "input": 13,
+                    "output": 17,
+                    "interpolation": "CUBICSPLINE"
+                }
+            ],
+            "channels": [
+                {
+                    "sampler": 0,
+                    "target": {
+                        "path": "weights",
+                        "node": 3
+                    }
+                }
+            ]
+        },
+        {
+            "samplers": [
+                {
+                    "input": 13,
+                    "output": 16,
+                    "interpolation": "LINEAR"
+                }
+            ],
+            "channels": [
+                {
+                    "sampler": 0,
+                    "target": {
+                        "path": "material.opacity",
+                        "node": 5
+                    }
+                }
+            ]
+        },
+        {
+            "samplers": [
+                {
+                    "input": 13,
+                    "output": 16,
+                    "interpolation": "STEP"
+                }
+            ],
+            "channels": [
+                {
+                    "sampler": 0,
+                    "target": {
+                        "path": "material.opacity",
+                        "node": 5
+                    }
+                }
+            ]
+        }
+    ],
+    "scenes": [
+        {
+            "nodes": [
+                0,
+                2,
+                3
+            ],
+            "extensions": {
+                "EXT_lights_image_based": {
+                    "light": 0
+                }
+            }
+        }
+    ],
+    "scene": 0,
+    "extensions": {
+        "KHR_lights_punctual": {
+            "lights": [
+                {
+                    "color": [
+                        0.5,
+                        1,
+                        8
+                    ],
+                    "intensity": 4,
+                    "type": "directional"
+                },
+                {
+                    "color": [
+                        0.5,
+                        1,
+                        8
+                    ],
+                    "intensity": 4,
+                    "type": "spot"
+                },
+                {
+                    "color": [
+                        0.5,
+                        1,
+                        8
+                    ],
+                    "intensity": 4,
+                    "type": "point"
+                }
+            ]
+        },
+        "EXT_lights_image_based": {
+            "lights": [
+                {
+                    "name": "name",
+                    "rotation": [0, 0, 0, 0],
+                    "intensity": 1,
+                    "irradianceCoefficients": [
+                        [1, 1, 1],
+                        [0, 0, 0],
+                        [0, 0, 0],
+                        [0, 0, 0],
+                        [0, 0, 0],
+                        [0, 0, 0],
+                        [0, 0, 0],
+                        [0, 0, 0],
+                        [0, 0, 0]
+                    ],
+                    "specularImages": [
+                        [0, 0, 0, 0, 0, 0],
+                        [0, 0, 0, 0, 0, 0]
+                    ],
+                    "specularImageSize": 16,
+                    "extras": {
+                        "skymapImage": 0,
+                        "skymapImageLodLevel": 1,
+                        "specularCubeImage": 0
+                    }
+                }
+            ]
+        }
+    },
+    "extensionsUsed": [
+        "KHR_lights_punctual"
+    ]
+}

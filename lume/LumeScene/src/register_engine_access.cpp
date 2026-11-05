@@ -51,6 +51,7 @@ using CORE3D_NS::RenderConfigurationComponent;
 CORE_BEGIN_NAMESPACE()
 DECLARE_PROPERTY_TYPE(EnvironmentComponent::Background);
 DECLARE_PROPERTY_TYPE(LightComponent::Type);
+DECLARE_PROPERTY_TYPE(LightComponent::RectLight);
 DECLARE_PROPERTY_TYPE(MaterialComponent::Type);
 DECLARE_PROPERTY_TYPE(MaterialComponent::RenderSort);
 DECLARE_PROPERTY_TYPE(MaterialComponent::Shader);
@@ -76,6 +77,7 @@ CORE_END_NAMESPACE()
 
 META_TYPE(CORE3D_NS::EnvironmentComponent::Background);
 META_TYPE(CORE3D_NS::LightComponent::Type);
+META_TYPE(CORE3D_NS::LightComponent::RectLight);
 META_TYPE(CORE3D_NS::MaterialComponent::Type);
 META_TYPE(CORE3D_NS::MaterialComponent::RenderSort);
 META_TYPE(CORE3D_NS::MaterialComponent::Shader);
@@ -169,6 +171,7 @@ void RegisterEngineAccess()
 
     RegisterMapEngineAccessImpl<EnvironmentComponent::Background, EnvBackgroundType>();
     RegisterMapEngineAccessImpl<LightComponent::Type, LightType>();
+    RegisterEngineAccessImplAndAny<LightComponent::RectLight>();
     RegisterMapEngineAccessImpl<MaterialComponent::Type, MaterialType>();
 
     RegisterEngineAccessImplAndAny<MaterialComponent::RenderSort>();
@@ -204,6 +207,7 @@ void UnregisterEngineAccess()
 
     auto& r = META_NS::GetObjectRegistry();
     r.GetEngineData().UnregisterInternalValueAccess(META_NS::MetaType<MaterialComponent::Type>::coreType);
+    UnregisterEngineAccessImplAndAny<LightComponent::RectLight>();
     r.GetEngineData().UnregisterInternalValueAccess(META_NS::MetaType<LightComponent::Type>::coreType);
     r.GetEngineData().UnregisterInternalValueAccess(META_NS::MetaType<EnvironmentComponent::Background>::coreType);
     r.GetEngineData().UnregisterInternalValueAccess(META_NS::MetaType<AnimationComponent::PlaybackState>::coreType);

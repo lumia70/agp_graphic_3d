@@ -1,0 +1,115 @@
+#version 460 core
+#extension GL_ARB_separate_shader_objects : enable
+#extension GL_ARB_shading_language_420pack : enable
+
+// includes
+#include "3d/shaders/common/3d_dm_structures_common.h"
+#include "common/gs_struct_common.h"
+#include "common/gs_common.h"
+
+// set0 is always bound like this
+
+layout(set = 0, binding = 0, std430) readonly restrict buffer inGSData {
+    GsSplatData gsDataIn[];
+};
+
+layout(set = 0, binding = 1, std430) writeonly restrict buffer outGSData {
+    GsSplatData gsDataOut[];
+};
+
+layout(set = 0, binding = 2, std140) readonly uniform uCameraMatrices
+{
+    GsCameraUboStruct cameraUbo;
+};
+
+layout(set = 0, binding = 3, std140) readonly uniform uGSDynamicDataBuffer
+{
+    GsDynamicDataStruct gsDynamicDatas[GS_MAX_NUM_GS_OBJECTS];
+};
+
+// set1 can have whatever buffers required
+
+layout(push_constant, std430) uniform uGsMetadata {
+    GsRenderPushConstantStruct uPc;
+};
+
+
+int GetGsObjectIndex(const uint elementId) {
+    for (int ii = 0; ii < int(uPc.numGsObjects); ii++) {
+        if (elementId >= gsDynamicDatas[ii].startOffset && elementId < gsDynamicDatas[ii].endOffset) {
+            return ii;
+        }
+    }
+
+    return -1;
+}
+
+void CalculateFadeInAnimation(const uint gsIndex, const vec3 splatCenter, inout float gaussianOpacity, out bool isRenderPoints)
+{
+    if (gsDynamicDatas[gsIndex].useFadeAnimation != 1) {
+        isRenderPoints = false;
+        return;
+    }
+
+    const float fadeWaitOffset = gsDynamicDatas[gsIndex].fadeWaitOffset;
+    const float currentTime = max(cameraUbo.animationRunningTimeSeconds - fadeWaitOffset, 0.0f);
+
+    const vec3 fadeStartPosition = gsDynamicDatas[gsIndex].fadeStartPosition;
+    const float fadeSpeed = gsDynamicDatas[gsIndex].fadeSpeed;
+    const float fullBoundaryTimeOffset = gsDynamicDatas[gsIndex].timeToFadeFullPoints;
+
+    const float gsDistanceToFadeCenter = length(fadeStartPosition - splatCenter);
+    
+    const float speedTime = fadeSpeed * currentTime;
+    const float pointBoundaryDistance = pow(speedTime, GS_FADE_RATE_EXPONENT) + gsDynamicDatas[gsIndex].fadeDistanceOffset;
+    
+    const float timeMinusOffset = max(currentTime - fullBoundaryTimeOffset, 0.0f);
+    const float fullBoundaryDistance = pow(fadeSpeed * timeMinusOffset, GS_FADE_RATE_EXPONENT) + gsDynamicDatas[gsIndex].fadeDistanceOffset;
+
+    const float clampedPointBoundary = min(pointBoundaryDistance, GS_FADE_MAX_BOUNDARY);
+    const float clampedFullBoundary = min(fullBoundaryDistance, GS_FADE_MAX_BOUNDARY);
+
+    const float isOutsideFullBoundary = float(gsDistanceToFadeCenter >= clampedFullBoundary || currentTime < fullBoundaryTimeOffset);
+    isRenderPoints = isOutsideFullBoundary > 0.5f;
+    
+    gaussianOpacity = mix(gaussianOpacity, 1.0f, isRenderPoints ? 1.0f : 0.0f);
+    
+    if (gsDistanceToFadeCenter >= clampedPointBoundary || currentTime <= 0.0f) {
+        gaussianOpacity = 0.0f;
+    }
+}
+
+// local_size_x must be 64
+layout(local_size_x = GS_PROCESS_DATA_TGS, local_size_y = 1, local_size_z = 1) in;
+void main()
+{
+    const uint elementId = gl_GlobalInvocationID.x;
+    if (elementId >= gsDataIn.length() || elementId >= gsDataOut.length()) {
+        return;
+    }
+    
+    GsSplatData gsData = gsDataIn[elementId];
+    
+    const int gsIndex = GetGsObjectIndex(elementId);
+    if (gsIndex < 0) {
+        return;
+    }
+    
+    const mat4 worldMatrix = gsDynamicDatas[gsIndex].worldMat;
+    const vec4 positionWorld = worldMatrix * vec4(gsData.positionOpacity.xyz, 1.0f);
+    const vec3 splatWorld = positionWorld.xyz;
+    
+    float gaussianOpacity = gsData.positionOpacity.w;
+    bool isRenderPoints = false;
+    CalculateFadeInAnimation(gsIndex, splatWorld, gaussianOpacity, isRenderPoints);
+    
+    // For rendering sharp points, the isRenderPoints is encoded as negative opacity.
+    // The point size as (width, height) is encoded in the covA.rg channels.
+
+    if (isRenderPoints) {
+        gsData.covAScale.rg = vec2(GS_FADE_ANIMATION_POINT_SIZE, GS_FADE_ANIMATION_POINT_SIZE);
+        gsData.positionOpacity.w = -gaussianOpacity;
+    }
+    
+    gsDataOut[elementId] = gsData;
+}

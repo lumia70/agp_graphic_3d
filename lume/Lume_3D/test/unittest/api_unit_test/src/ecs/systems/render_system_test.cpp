@@ -224,7 +224,7 @@ UNIT_TEST(API_EcsRenderSystem, ColorPrePassMultiViewCountDoesNotOverflow, testin
     if (auto handle = cameraMgr->Write(mainCamera); handle) {
         handle->sceneFlags |=
             CameraComponent::SceneFlagBits::MAIN_CAMERA_BIT | CameraComponent::SceneFlagBits::ACTIVE_RENDER_BIT;
-        handle->pipelineFlags |= CameraComponent::PipelineFlagBits::ALLOW_COLOR_PRE_PASS_BIT;
+        handle->pipelineFlags |= CameraComponent::PipelineFlagBits::FORCE_COLOR_PRE_PASS_BIT;
         handle->multiViewCameras = children;
         handle->prePassCamera = prePassCamera;
     }
@@ -244,6 +244,66 @@ UNIT_TEST(API_EcsRenderSystem, ColorPrePassMultiViewCountDoesNotOverflow, testin
     for (const RenderCamera& renderCamera : dsCamera->GetCameras()) {
         EXPECT_LE(renderCamera.multiViewCameraCount, RenderSceneDataConstants::MAX_MULTI_VIEW_LAYER_CAMERA_COUNT);
     }
+}
+
+/**
+ * @tc.name: ColorPrePassCameraOnlyWhenFrameNeedsIt
+ * @tc.desc: Pre-pass cameras take slots of the fixed size camera array, so a camera only allowing a pre-pass gets one
+ *           only when a material needs one (transmission). Forcing on one camera gives the pre-pass to that camera
+ *           only.
+ * @tc.type: FUNC
+ */
+UNIT_TEST(API_EcsRenderSystem, ColorPrePassCameraOnlyWhenFrameNeedsIt, testing::ext::TestSize.Level1)
+{
+    UTest::TestContext* testContext = UTest::GetTestContext();
+    auto renderContext = testContext->renderContext;
+    auto graphicsContext = testContext->graphicsContext;
+    auto ecs = testContext->ecs;
+ 
+    auto* renderSystem = GetSystem<IRenderSystem>(*ecs);
+    ASSERT_NE(nullptr, renderSystem);
+    renderSystem->SetActive(true);
+ 
+    const auto& sceneUtil = graphicsContext->GetSceneUtil();
+    auto cameraMgr = GetManager<ICameraComponentManager>(*ecs);
+    ASSERT_NE(nullptr, cameraMgr);
+ 
+    const auto makeCamera = [&](const uint32_t sceneFlags) {
+        const Entity camera = sceneUtil.CreateCamera(*ecs, Math::Vec3{}, Math::Quat{}, 0.1f, 100.0f, 75.0f);
+        if (auto handle = cameraMgr->Write(camera); handle) {
+            handle->sceneFlags |= sceneFlags;
+            handle->pipelineFlags |= CameraComponent::PipelineFlagBits::ALLOW_COLOR_PRE_PASS_BIT;
+            handle->renderResolution = {64U, 64U};
+        }
+        return camera;
+    };
+    const Entity mainCamera =
+        makeCamera(CameraComponent::SceneFlagBits::MAIN_CAMERA_BIT | CameraComponent::SceneFlagBits::ACTIVE_RENDER_BIT);
+    makeCamera(CameraComponent::SceneFlagBits::ACTIVE_RENDER_BIT);
+ 
+    BASE_NS::string cameraDsName;
+    if (auto props = ScopedHandle<const IRenderSystem::Properties>(renderSystem->GetProperties()); props) {
+        cameraDsName = props->dataStoreCamera;
+    }
+    ASSERT_FALSE(cameraDsName.empty());
+    auto& dsManager = renderContext->GetRenderDataStoreManager();
+    auto* dsCamera = static_cast<IRenderDataStoreDefaultCamera*>(dsManager.GetRenderDataStore(cameraDsName).get());
+    ASSERT_NE(nullptr, dsCamera);
+    const auto countPrePassCameras = [dsCamera]() {
+        const auto cameras = dsCamera->GetCameras();
+        return std::count_if(cameras.begin(), cameras.end(), [](const RenderCamera& cam) {
+            return (cam.flags & RenderCamera::CAMERA_FLAG_COLOR_PRE_PASS_BIT) != 0U;
+        });
+    };
+ 
+    ecs->Update(2u, 1u);
+    EXPECT_EQ(0, countPrePassCameras());
+ 
+    if (auto handle = cameraMgr->Write(mainCamera); handle) {
+        handle->pipelineFlags |= CameraComponent::PipelineFlagBits::FORCE_COLOR_PRE_PASS_BIT;
+    }
+    ecs->Update(3u, 1u);
+    EXPECT_EQ(1, countPrePassCameras());
 }
 
 /**

@@ -119,6 +119,9 @@ public:
     void Deactivate() override;
 
     bool AllowThreadedProcessing() const override;
+    bool CanImportNativeFence() const override;
+    bool CanExportNativeFence() const override;
+    IRenderFrameUtil::NativeFence ExportNativeFence(const GpuSemaphore& semaphore, bool signaled) const override;
 
     GpuQueue GetValidGpuQueue(const GpuQueue& gpuQueue) const override;
     uint32_t GetGpuQueueCount() const override;
@@ -228,6 +231,10 @@ public:
 
         // VK_KHR_buffer_device_address
         PFN_vkGetBufferDeviceAddressKHR vkGetBufferDeviceAddressKHR{nullptr};
+
+        // VK_KHR_external_semaphore_fd, loaded by the platform. Null when SYNC_FD export or import is unsupported
+        PFN_vkGetSemaphoreFdKHR vkGetSemaphoreFdKHR{nullptr};
+        PFN_vkImportSemaphoreFdKHR vkImportSemaphoreFdKHR{nullptr};
 
 #if (RENDER_VULKAN_RT_ENABLED == 1)
         // VK_KHR_acceleration_structure

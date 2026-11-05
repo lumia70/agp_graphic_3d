@@ -1,0 +1,33 @@
+#version 460 core
+#extension GL_ARB_separate_shader_objects : enable
+#define V21_COMPUTE_SHADER 1
+#include "common/v2_1_bindings.glsl"
+
+// D16: Compact every Gaussian flagged by the cumulative mask into a contiguous
+// index list. Output layout matches gsedit_select_index.comp input:
+//   selectIndex[0]     - count of compacted indices (must be 0 before dispatch)
+//   selectIndex[1..N]  - Gaussian indices with cumulativeMask set
+// The host is responsible for clearing selectIndex[0] to 0 before dispatch.
+layout(set = 0, binding = 1, std430) readonly buffer StateBuffer
+{
+    V21GaussianState states[];
+};
+
+layout(set = 0, binding = 2, std430) buffer IndexBuffer
+{
+    uint selectIndex[];
+};
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+void main()
+{
+    uint id = gl_GlobalInvocationID.x;
+    if (id >= v21.counts.x) {
+        return;
+    }
+    if (states[id].cumulativeMask == 1u) {
+        uint slot = atomicAdd(selectIndex[0], 1u);
+        selectIndex[slot + 1u] = id;
+    }
+}

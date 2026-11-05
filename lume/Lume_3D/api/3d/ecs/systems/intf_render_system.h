@@ -60,6 +60,12 @@ public:
      */
     virtual BASE_NS::array_view<const RENDER_NS::RenderHandleReference> GetRenderNodeGraphs() const = 0;
 
+    /** Get the number of cameras dropped during the last Update.
+     * Uses the cached data store pointer, no name lookup needed.
+     * @return Dropped camera count. 0 if no cameras were dropped or data store not available.
+     */
+    virtual uint32_t GetDroppedCameraCount() const = 0;
+
 protected:
     IRenderSystem() = default;
     ~IRenderSystem() override = default;

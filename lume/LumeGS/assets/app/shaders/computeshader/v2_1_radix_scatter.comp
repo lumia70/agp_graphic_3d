@@ -1,0 +1,41 @@
+#version 460 core
+#extension GL_ARB_separate_shader_objects : enable
+#extension GL_ARB_shading_language_420pack : enable
+#define V21_COMPUTE_SHADER 1
+#define V21_PROFILE_RADIX 1
+#include "common/v2_1_bindings.glsl"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+void main()
+{
+    uint id = gl_GlobalInvocationID.x;
+    if (id >= pushData.mode) {
+        return;
+    }
+    uint localId = gl_LocalInvocationID.x;
+    uint groupId = gl_WorkGroupID.x;
+    bool scratchInput = ((pushData.round / 8u) & 1u) != 0u;
+    V21SortEntry entry = scratchInput ? sortScratch[id] : sortEntries[id];
+    uint key = entry.orderedDepthKey;
+    uint bucket = (key >> pushData.round) & 255u;
+    uint localRank = 0u;
+    uint groupStart = groupId * 256u;
+    for (uint lane = 0u; lane < localId; ++lane) {
+        uint otherId = groupStart + lane;
+        if (otherId < pushData.mode) {
+            uint otherKey = scratchInput ? sortScratch[otherId].orderedDepthKey :
+                sortEntries[otherId].orderedDepthKey;
+            if (((otherKey >> pushData.round) & 255u) == bucket) {
+                ++localRank;
+            }
+        }
+    }
+    uint destination = histogramBins[pushData.reserved * 256u + bucket].count +
+        histogramBins[groupId * 256u + bucket].count + localRank;
+    if (scratchInput) {
+        sortEntries[destination] = entry;
+    } else {
+        sortScratch[destination] = entry;
+    }
+}

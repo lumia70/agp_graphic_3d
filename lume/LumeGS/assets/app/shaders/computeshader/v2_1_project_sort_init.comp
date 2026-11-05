@@ -1,0 +1,20 @@
+#version 460 core
+#extension GL_ARB_separate_shader_objects : enable
+#define V21_COMPUTE_SHADER 1
+#define V21_PROFILE_PROJECT 1
+#include "common/v2_1_gaussian.glsl"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+void main()
+{
+    uint id = gl_GlobalInvocationID.x;
+    if (id >= v21.counts.x) {
+        return;
+    }
+    V21ProjectedGaussian value;
+    bool valid = V21ProjectGaussian(id, value);
+    projected[id] = value;
+    uint depthBits = floatBitsToUint(max(value.centerDepth.z, 0.0));
+    sortEntries[id] = V21SortEntry(valid ? (0xfffffffeu - depthBits) : 0xffffffffu, id);
+}

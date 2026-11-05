@@ -29,7 +29,7 @@ SCENE_BEGIN_NAMESPACE()
  * @brief LightType enum defines the light type. Different types of lights use
  *        different properties
  */
-enum class LightType : uint8_t { DIRECTIONAL = 0, POINT = 1, SPOT = 2 };
+enum class LightType : uint8_t { DIRECTIONAL = 0, POINT = 1, SPOT = 2, RECT = 3 };
 
 class ILight : public CORE_NS::IInterface {
     META_INTERFACE(CORE_NS::IInterface, ILight, "cbf423b5-e12d-4433-8967-2e4e8c38e5a6")
@@ -74,6 +74,18 @@ public:
      * @brief Light range.
      */
     META_PROPERTY(float, Range)
+    /**
+     * @brief Rect area light width.
+     */
+    META_PROPERTY(float, RectWidth)
+    /**
+     * @brief Rect area light height.
+     */
+    META_PROPERTY(float, RectHeight)
+    /**
+     * @brief Rect area light two-sided emission.
+     */
+    META_PROPERTY(bool, RectTwoSided)
     /**
      * @brief Type of the light. Defaults to DIRECTIONAL.
      */

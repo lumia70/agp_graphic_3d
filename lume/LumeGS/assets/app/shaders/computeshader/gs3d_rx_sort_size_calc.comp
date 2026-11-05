@@ -1,0 +1,32 @@
+#version 460 core
+#extension GL_ARB_separate_shader_objects : enable
+#extension GL_ARB_shading_language_420pack : enable
+
+#include "3d/shaders/common/3d_dm_structures_common.h"
+
+#include "common/gs_common.h"
+#include "common/gs_struct_common.h"
+
+layout(set = 0, binding = 0, std430) buffer outDrawDispatch
+{
+    GsIndirectDrawDispatch indirectDrawDispatch;
+};
+
+layout(set = 0, binding = 1, std430) buffer outDispatch
+{
+    GsDispatchIndirectCommand indirectDispatch;
+};
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+void main()
+{
+    indirectDrawDispatch.vertexCount = 4;
+    uint invocationSize = (indirectDrawDispatch.instanceCount + NUM_BLOCKS_PER_GROUP_RADIX - 1) / NUM_BLOCKS_PER_GROUP_RADIX;
+    indirectDrawDispatch.x = (invocationSize + RADIX_SORT_BINS - 1) / RADIX_SORT_BINS;
+    indirectDrawDispatch.y = 1;
+    indirectDrawDispatch.z = 1;
+
+    indirectDispatch.x = (indirectDrawDispatch.instanceCount + GS_PROCESS_DATA_TGS - 1) / GS_PROCESS_DATA_TGS;
+    indirectDispatch.y = 1;
+    indirectDispatch.z = 1;
+}

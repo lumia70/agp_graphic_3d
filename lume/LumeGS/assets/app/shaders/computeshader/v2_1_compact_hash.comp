@@ -1,0 +1,30 @@
+#version 460 core
+#extension GL_ARB_separate_shader_objects : enable
+#define V21_COMPUTE_SHADER 1
+#define V21_PROFILE_COMPACT 1
+#include "common/v2_1_bindings.glsl"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+void main()
+{
+    uint id = gl_GlobalInvocationID.x;
+    if (globals.stopReason != V21_STOP_NONE || id >= v21.counts.x ||
+        states[id].cumulativeMask != 0u ||
+        projected[id].centerDepth.w < 0.5 || analysis[id].evidence.ownerPixels == 0u) {
+        return;
+    }
+    // "Current visible" means that this Gaussian actually owns at least one
+    // opaque-disc pixel in this peel. Merely being projected into the frustum
+    // is insufficient: hashing deeper occluded Gaussians made them look like
+    // stable surface support and prematurely protected deep-layer anomalies.
+    // All active current-layer Gaussians enter the existing spatial hash so an
+    // anomalous item can see stable scene support. Only weak anomalies enter
+    // the compact scoring list; no second graph or buffer is introduced.
+    uint bucket = V21HashCell(V21Cell(V21Position(id)));
+    states[id].hashNext = atomicExchange(hashBuckets[bucket].head, id);
+    if (analysis[id].features.weakEvidence >= 0.5) {
+        uint compactIndex = atomicAdd(globals.compactCount, 1u);
+        compactEntries[compactIndex].weakGaussianIndex = id;
+    }
+}

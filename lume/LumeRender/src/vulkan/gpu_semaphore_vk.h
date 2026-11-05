@@ -28,6 +28,8 @@ class Device;
 
 struct GpuSemaphorePlatformDataVk final {
     VkSemaphore semaphore{VK_NULL_HANDLE};
+    // sync fd exportable payload, never set for a view of a client's semaphore
+    bool exportable{false};
 };
 
 class GpuSemaphoreVk final : public GpuSemaphore {

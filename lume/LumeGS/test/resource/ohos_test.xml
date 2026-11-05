@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Copyright (c) 2024 Huawei Device Co., Ltd.
+
+     Licensed under the Apache License, Version 2.0 (the "License");
+     you may not use this file except in compliance with the License.
+     You may obtain a copy of the License at
+
+          http://www.apache.org/licenses/LICENSE-2.0
+
+     Unless required by applicable law or agreed to in writing, software
+     distributed under the License is distributed on an "AS IS" BASIS,
+     WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+     See the License for the specific language governing permissions and
+     limitations under the License.
+-->
+<configuration ver="2.0">
+    <target name="lume_gs_test">
+        <preparer>
+            <option name="shell" value="mkdir -p  /data/local/3dgs_test"/>
+            <option name="shell" value="mkdir -p  /data/local/3dgs_test/assets"/>
+
+            <option name="push" value="assets/banana.ply -> /data/local/3dgs_test/assets" src="res"/>
+            <option name="push" value="assets/panda.ply -> /data/local/3dgs_test/assets" src="res"/>
+            <option name="push" value="assets/doll.glb -> /data/local/3dgs_test/assets" src="res"/>
+            <option name="push" value="assets/flower.glb -> /data/local/3dgs_test/assets" src="res"/>
+            <option name="push" value="assets/panda.glb -> /data/local/3dgs_test/assets" src="res"/>
+            <option name="push" value="assets/attack.glb -> /data/local/3dgs_test/assets" src="res"/>
+            <option name="push" value="assets/attack1.glb -> /data/local/3dgs_test/assets" src="res"/>
+            <option name="push" value="assets/attack2.glb -> /data/local/3dgs_test/assets" src="res"/>
+            <option name="push" value="assets/attack3.glb -> /data/local/3dgs_test/assets" src="res"/>
+            <option name="push" value="assets/attack4.glb -> /data/local/3dgs_test/assets" src="res"/>
+            <option name="push" value="assets/attack5.glb -> /data/local/3dgs_test/assets" src="res"/>
+            <option name="push" value="assets/attack6.glb -> /data/local/3dgs_test/assets" src="res"/>
+            <option name="push" value="assets/attack7.glb -> /data/local/3dgs_test/assets" src="res"/>
+            <option name="push" value="assets/attack8.glb -> /data/local/3dgs_test/assets" src="res"/>
+            <option name="push" value="assets/attack9.glb -> /data/local/3dgs_test/assets" src="res"/>
+            <option name="push" value="assets/attack10.glb -> /data/local/3dgs_test/assets" src="res"/>
+            <option name="push" value="assets/attack11.glb -> /data/local/3dgs_test/assets" src="res"/>
+            <option name="push" value="assets/attack12.glb -> /data/local/3dgs_test/assets" src="res"/>
+            <option name="push" value="assets/attack13.glb -> /data/local/3dgs_test/assets" src="res"/>
+            <option name="push" value="assets/attack14.glb -> /data/local/3dgs_test/assets" src="res"/>
+            <option name="push" value="assets/attack15.glb -> /data/local/3dgs_test/assets" src="res"/>
+            <option name="push" value="assets/attack16.glb -> /data/local/3dgs_test/assets" src="res"/>
+            <option name="push" value="assets/attack17.glb -> /data/local/3dgs_test/assets" src="res"/>
+            <option name="push" value="assets/attack18.glb -> /data/local/3dgs_test/assets" src="res"/>
+            <option name="push" value="assets/attack19.glb -> /data/local/3dgs_test/assets" src="res"/>
+            <option name="push" value="assets/attack20.glb -> /data/local/3dgs_test/assets" src="res"/>
+            <option name="push" value="assets/attack21.glb -> /data/local/3dgs_test/assets" src="res"/>
+            <option name="push" value="assets/attack22.glb -> /data/local/3dgs_test/assets" src="res"/>
+            <option name="push" value="assets/attack23.glb -> /data/local/3dgs_test/assets" src="res"/>
+            <option name="push" value="assets/attack24.glb -> /data/local/3dgs_test/assets" src="res"/>
+            <option name="push" value="assets/attack25.glb -> /data/local/3dgs_test/assets" src="res"/>
+            <option name="push" value="assets/attack26.glb -> /data/local/3dgs_test/assets" src="res"/>
+            <option name="push" value="assets/attack27.glb -> /data/local/3dgs_test/assets" src="res"/>
+            <option name="push" value="assets/attack28.glb -> /data/local/3dgs_test/assets" src="res"/>
+            <option name="push" value="assets/attack.ply -> /data/local/3dgs_test/assets" src="res"/>
+            <option name="push" value="assets/attack_d0.ply -> /data/local/3dgs_test/assets" src="res"/>
+            <option name="push" value="assets/attack_d1.ply -> /data/local/3dgs_test/assets" src="res"/>
+            <option name="push" value="assets/attack_d2.ply -> /data/local/3dgs_test/assets" src="res"/>
+            <option name="push" value="assets/attack_d3.ply -> /data/local/3dgs_test/assets" src="res"/>
+            <option name="push" value="assets/2408944_381654.mp4 -> /data/local/3dgs_test/assets" src="res"/>
+        </preparer>
+    </target>
+</configuration>

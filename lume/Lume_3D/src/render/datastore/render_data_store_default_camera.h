@@ -78,6 +78,8 @@ public:
 
     // IRenderDataStoreDefaultCamera
     void AddCamera(const RenderCamera& camera) override;
+    void NotifyDroppedCamera() override;
+    uint32_t GetDroppedCameraCount() const override;
     void AddEnvironment(const RenderCamera::Environment& environment) override;
 
     BASE_NS::array_view<const RenderCamera> GetCameras() const override;
@@ -103,6 +105,7 @@ private:
     BASE_NS::vector<RenderCamera> cameras_;
     BASE_NS::vector<RenderCamera::Environment> environments_;
     bool hasBlendEnvironments_{false};
+    uint32_t droppedCameraCount_{0};
 
     std::atomic_int32_t refcnt_{0};
 };

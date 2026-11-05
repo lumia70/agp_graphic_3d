@@ -192,6 +192,9 @@ struct DevicePlatformDataGLES : DevicePlatformData {
     const char* driverVersion;
     /** Collection of implementation dependant limits. */
     DevicePropertiesGLES deviceProperties;
+    /** EGL supports native fence sync objects. Then IRenderFrameUtil::SignalData handles are EGLSyncKHR, otherwise
+     * GLsync, which must not be passed to EGL. */
+    bool hasNativeFenceSyncExt{false};
 };
 
 /** The following structure can be used to pass a TextureObject from application GLES context to Engine Context

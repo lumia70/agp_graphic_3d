@@ -844,7 +844,7 @@ void Renderer::RenderFrameBackendImpl()
     renderFrameTimeData_.config = config;
     // must run backend if there are descriptor sets to update even if there's nothing to render.
     renderFrameTimeData_.hasBackendWork = (!rcfd.renderCommandContexts.empty()) ||
-                                           (!device_.GetDescriptorSetManager().GetUpdateDescriptorSetHandles().empty());
+                                          (!device_.GetDescriptorSetManager().GetUpdateDescriptorSetHandles().empty());
 
     device_.Activate();
 

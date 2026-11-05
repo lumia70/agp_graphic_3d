@@ -108,7 +108,7 @@ public:
     /** Signal resource object which can be retrieved after render frame has been processed
      */
     struct SignalData {
-        /** Handle if it was attached to some handle */
+        /** Handle if it was attached to some handle. Only its id is compared, no reference counter needed. */
         RenderHandleReference handle;
         /** Guarantee that the semaphore object has been signaled */
         bool signaled{false};
@@ -116,6 +116,28 @@ public:
         uint64_t gpuSignalResourceHandle{0};
         /** Low level signal resource type */
         SignalResourceType signalResourceType{};
+    };
+
+    /** Result of exporting a GPU signal as a native fence. */
+    enum class ExportResult : uint32_t {
+        /** Descriptor valid and owned by the caller */
+        EXPORTED,
+        /** Already signaled, nothing to wait on. Descriptor is -1 */
+        ALREADY_SIGNALED,
+        /** Not signaled by this frame, e.g. no GPU work or an unknown handle */
+        NOT_SIGNALED,
+        /** This backend cannot export native fences */
+        NOT_SUPPORTED,
+        /** The export failed, or the signal was already exported */
+        FAILED,
+    };
+
+    /** A GPU signal exported as a native fence. */
+    struct NativeFence {
+        /** Outcome of the export */
+        ExportResult result{ExportResult::NOT_SIGNALED};
+        /** Native fence file descriptor owned by the caller, -1 unless EXPORTED */
+        int32_t nativeFenceFd{-1};
     };
 
     /** Copy data to CPU the next frame if waiting for idle.
@@ -162,10 +184,78 @@ public:
     /** Get frame signal data for a specific handle.
      * Make sure to check the boolean flag every time before using.
      * Be sure to check the boolean flag, and the gpuSemaphoreHandle before casting
-     * @param handle The handle which was used when signal was added.
+     * @param handle The handle which was used when signal was added. A handle without an id never matches.
      * @return semaphore data if it was found.
      */
     virtual SignalData GetFrameGpuSignalData(const RenderHandleReference& handle) = 0;
+
+    /** Per frame outcome of a wait. */
+    enum class WaitStatus : uint32_t {
+        /** Not processed yet */
+        PENDING,
+        /** The GPU waited on it. The frame is synchronized against it. */
+        WAITED,
+        /** The GPU could not wait on it, and the CPU wait failed or timed out. The frame is not synchronized. */
+        IMPORT_FAILED,
+        /** The frame had no GPU work. The wait and its descriptor are carried to the next frame. */
+        NOT_SUBMITTED,
+        /** The render thread waited on it before submitting. The frame is synchronized against it. */
+        CPU_WAITED,
+    };
+
+    /** External GPU wait to be inserted before this frame's work. */
+    struct WaitData {
+        /** Native fence file descriptor to wait on. Negative is ignored. */
+        int32_t nativeFenceFd{-1};
+        /** Outcome for this frame, set only in GetFrameGpuWaitData results. */
+        WaitStatus status{WaitStatus::PENDING};
+        /** Optional handle for GetFrameGpuWaitData(handle). Only its id is compared, no reference counter needed. */
+        RenderHandleReference handle;
+    };
+
+    /** Result of AddGpuWait. */
+    enum class WaitResult : uint32_t {
+        /** Accepted, the renderer owns the descriptor */
+        ACCEPTED,
+        /** Not a usable descriptor, the caller keeps it */
+        INVALID_FD,
+        /** This backend cannot import native fences, the caller keeps the descriptor */
+        NOT_SUPPORTED,
+    };
+
+    /** Add a GPU side wait on an external native fence to the next frame that submits GPU work. Does not block.
+     * Add it again for every frame that needs it. Only ACCEPTED transfers ownership, otherwise the caller keeps the
+     * descriptor and can wait on the CPU. ACCEPTED only means queued, see GetFrameGpuWaitData for the outcome.
+     * If the GPU cannot wait on it, the render thread waits up to a few seconds before submitting.
+     * NOTE: gates one submission only, batches on other gpu queues are not gated.
+     * @param waitData Native fence to wait on, and an optional handle for looking up the outcome.
+     * @return Whether the descriptor was taken.
+     */
+    virtual WaitResult AddGpuWait(const WaitData& waitData) = 0;
+
+    /** Get GPU frame wait data for the processed frame, including waits carried over from earlier frames.
+     * Valid after RenderFrame until the next RenderFrame call. Only the status and the handle are meaningful.
+     * The descriptors still belong to the renderer and must not be closed or waited on.
+     * @return array view of the waits of the processed frame.
+     */
+    virtual BASE_NS::array_view<const WaitData> GetFrameGpuWaitData() = 0;
+
+    /** Get GPU frame wait data of a specific handle for the processed frame.
+     * Valid after RenderFrame until the next RenderFrame call. The descriptor is always -1, the renderer keeps it.
+     * @param handle The handle which was used when the wait was added. A handle without an id never matches.
+     * @return wait data if it was found, otherwise a default WaitData.
+     */
+    virtual WaitData GetFrameGpuWaitData(const RenderHandleReference& handle) = 0;
+
+    /** Export the GPU signal of a specific handle as a native fence, e.g. a release fence for another producer.
+     * Valid after RenderFrame until the next RenderFrame call. A signal can be exported once, then FAILED.
+     * NOTE: not thread safe, do not call during RenderFrame().
+     * With NOT_SUPPORTED or FAILED synchronize on the CPU before releasing the buffer the signal guards, e.g. with
+     * IDevice::WaitForIdle().
+     * @param handle The handle which was used when the signal was added. A handle without an id never matches.
+     * @return The outcome, and with EXPORTED the descriptor.
+     */
+    virtual NativeFence ExportFrameGpuSignal(const RenderHandleReference& handle) = 0;
 
 protected:
     IRenderFrameUtil() = default;

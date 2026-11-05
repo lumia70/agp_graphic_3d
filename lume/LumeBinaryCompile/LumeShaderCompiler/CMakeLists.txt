@@ -130,10 +130,8 @@ else()
     cmake_policy(SET CMP0077 OLD)
 
     set(GLSLANG_VERSION 120200)
-    set(KHRONOS_GL "${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/khronos/GL")
-    set(KHRONOS_KHR "${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/khronos")
-    set(SPIRV_TOOLS_PATH "${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/spirv-tools")
-    set(SPIRV_TOOLS_EXTENSION_PATH "${CMAKE_BINARY_DIR}/3rdparty/spirv-tools")
+    set(KHRONOS_GL "3rdparty/khronos/gl")
+    set(KHRONOS_KHR "3rdparty/khronos")
 endif()
 
 set(sources 

@@ -115,6 +115,9 @@ public:
     void Deactivate() override;
 
     bool AllowThreadedProcessing() const override;
+    bool CanImportNativeFence() const override;
+    bool CanExportNativeFence() const override;
+    IRenderFrameUtil::NativeFence ExportNativeFence(const GpuSemaphore& semaphore, bool signaled) const override;
 
     GpuQueue GetValidGpuQueue(const GpuQueue& gpuQueue) const override;
     uint32_t GetGpuQueueCount() const override;
@@ -170,6 +173,31 @@ public:
     BASE_NS::unique_ptr<GpuSemaphore> CreateGpuSemaphoreView(uint64_t handle) override;
 
     void SetBackendConfig(const BackendConfig& config) override;
+
+    // GPU signal fence exportable as a native fence fd
+    struct PlatformGpuFence {
+        // EGLSyncKHR, zero when creation failed
+        uint64_t handle{0};
+        // also true when creation failed. Clients take the handle for an EGLSyncKHR, so don't fall back to a GLsync.
+        bool nativeFence{false};
+    };
+
+    // Requires the context to be active. Empty without EGL native fence sync.
+    PlatformGpuFence CreatePlatformGpuFence();
+    void DestroyPlatformGpuFence(const PlatformGpuFence& fence);
+    enum class NativeFenceWait {
+        // the caller keeps the fd
+        UNSUPPORTED,
+        // fd consumed, but neither the GPU wait nor the CPU fallback succeeded
+        FAILED,
+        // fd consumed, GPU wait queued
+        QUEUED,
+        // fd consumed, the GPU wait could not be queued so the calling thread waited
+        CPU_WAITED,
+    };
+
+    // Blocks the calling thread only when the GPU wait cannot be queued, then waits on the CPU with a timeout.
+    NativeFenceWait WaitPlatformNativeFenceFd(int32_t fd);
 
     // Internal apis, only usable by other parts of GLES backend.
     bool HasExtension(BASE_NS::string_view extension) const;

@@ -1,0 +1,60 @@
+#version 460 core
+#extension GL_ARB_separate_shader_objects : enable
+#extension GL_ARB_shading_language_420pack : enable
+
+// includes
+#include "3d/shaders/common/3d_dm_structures_common.h"
+#include "common/gs_common.h"
+#include "common/gs_struct_common.h"
+
+layout(set = 0, binding = 0) uniform sampler2D prefilteredDepth;
+
+layout(set = 0, binding = 1, rgba16f) writeonly restrict uniform image2D uOutNormals;
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(push_constant, std430) uniform uPostProcessPushConstant
+{
+    mat4 invViewProj;
+};
+
+vec3 ReconstructWorldPos(vec2 uv, float ndcDepth)
+{
+    // TODO: for opengl
+    //    vec4 clip = vec4(uv * 2.0 - 1.0, ndcDepth, 1.0);
+    vec4 clip = vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, ndcDepth, 1.0);
+
+    vec4 world = invViewProj * clip;
+    return world.xyz / world.w;
+}
+
+vec3 ComputeNormal(ivec2 px)
+{
+    vec2 texelSize = 1.0 / vec2(textureSize(prefilteredDepth, 0));
+    vec2 uvCenter = (vec2(px) + 0.5) * texelSize;
+
+    float depthCenter = texelFetch(prefilteredDepth, px, 0).r;
+    float depthRight = texelFetch(prefilteredDepth, px + ivec2(1, 0), 0).r;
+    float depthDown = texelFetch(prefilteredDepth, px + ivec2(0, 1), 0).r;
+
+    vec3 posCenter = ReconstructWorldPos(uvCenter, depthCenter);
+    vec3 posRight = ReconstructWorldPos(uvCenter + vec2(texelSize.x, 0.0), depthRight);
+    vec3 posDown = ReconstructWorldPos(uvCenter + vec2(0.0, texelSize.y), depthDown);
+
+    vec3 normal = normalize(cross(posRight - posCenter, posDown - posCenter));
+
+    return normal;
+}
+
+void main()
+{
+    const ivec2 uv = ivec2(gl_GlobalInvocationID.xy);
+    const ivec2 imageDim = textureSize(prefilteredDepth, 0);
+    if (uv.x >= imageDim.x || uv.y >= imageDim.y) {
+        return;
+    }
+
+    vec3 normal = ComputeNormal(uv);
+
+    imageStore(uOutNormals, uv, vec4(normal, 1.0));
+}

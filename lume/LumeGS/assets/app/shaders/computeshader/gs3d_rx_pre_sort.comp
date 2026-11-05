@@ -1,0 +1,187 @@
+#version 460 core
+#extension GL_ARB_separate_shader_objects : enable
+#extension GL_ARB_shading_language_420pack : enable
+
+#include "3d/shaders/common/3d_dm_structures_common.h"
+
+#include "common/gs_common.h"
+#include "common/gs_struct_common.h"
+#define LUME_GS_EDIT_LAYOUT 0
+#include "common/gs_edit_common.h"
+
+layout(set = 0, binding = 0, std430) readonly buffer GSComputeDatas
+{
+    GsSplatData gsData[];
+};
+
+layout(set = 0, binding = 1, std430) buffer sortingBuffer
+{
+    SortKeyIndex sortKeyData[];
+};
+
+layout(set = 0, binding = 2, std140) readonly uniform uCameraMatrices
+{
+    GsCameraUboStruct cameraUbo;
+};
+
+layout(set = 0, binding = 3, std140) readonly uniform uGSDynamicDataBuffer
+{
+    GsDynamicDataStruct gsDynamicDatas[GS_MAX_NUM_GS_OBJECTS];
+};
+
+layout(set = 0, binding = 4, std430) readonly restrict buffer indirectDispatchCounterBuffer
+{
+    IndirectEditDispatchCounterBuffer indirectCounter;
+};
+
+layout(push_constant, std430) uniform uPushConstant
+{
+    GsSortPushConstantStruct uPc;
+};
+
+vec3 ComputeCov2D(const vec3 center, const float focalX, const float focalY, const mat4 viewMat, const vec3 covA, const vec3 covB)
+{
+    const vec4 t = viewMat * vec4(center, 1.0);
+
+    // Jacobian matrix
+    const mat3 J = mat3(
+        focalX / t.z, 0.0, -(focalX * t.x) / (t.z * t.z),
+        0.0, -focalY / t.z, (focalY * t.y) / (t.z * t.z),
+        0.0, 0.0, 0.0
+    );
+
+    const mat3 W = mat3(
+        viewMat[0][0], viewMat[1][0], viewMat[2][0],
+        viewMat[0][1], viewMat[1][1], viewMat[2][1],
+        viewMat[0][2], viewMat[1][2], viewMat[2][2]
+    );
+
+    const mat3 T = W * J;
+
+    const mat3 Vrk = mat3(
+        covA.x, covA.y, covA.z,
+        covA.y, covB.x, covB.y,
+        covA.z, covB.y, covB.z
+    );
+
+    const mat3 cov = transpose(T) * Vrk * T;
+    return vec3(cov[0][0], cov[0][1], cov[1][1]);
+}
+
+int GetGsObjectIndex(const uint elementId) {
+    for (int ii = 0; ii < int(uPc.numGsObjects); ii++) {
+        if (elementId >= gsDynamicDatas[ii].startOffset && elementId < gsDynamicDatas[ii].endOffset) {
+            return ii;
+        }
+    }
+
+    return -1;
+}
+
+layout(local_size_x = RADIX_SORT_BINS, local_size_y = 1, local_size_z = 1) in;
+void main()
+{
+    const uint localId = gl_LocalInvocationID.x;
+    const uint workGroupId = gl_WorkGroupID.x;
+    const uint cameraIdx = 0;
+    
+    const vec2 depthRange = uPc.depthRange;
+
+    const float nearPlane = cameraUbo.proj[3][2] / (cameraUbo.proj[2][2] - 1.0);
+    const float farPlane = cameraUbo.proj[3][2] / (cameraUbo.proj[2][2] + 1.0);
+
+    const float depthMin = depthRange.x;
+    const float depthMax = depthRange.y;
+
+    const float viewportWidth = cameraUbo.viewportSize.x;
+    const float viewportHeight = cameraUbo.viewportSize.y;
+
+    const float fullWidth = viewportWidth * float(uPc.renderScaleFactor);
+    const float fullHeight = viewportHeight * float(uPc.renderScaleFactor);
+
+    const float invHalfTan = cameraUbo.proj[1][1];
+    const float fovY = -2.0f * atan(1.0f / invHalfTan);
+    
+    const float tanFovY = tan(fovY * 0.5f);
+    const float tanFovX = tanFovY * (fullWidth / fullHeight);
+
+    const float focalY = fullHeight / (2.0f * tanFovY);
+    const float focalX = fullWidth / (2.0f * tanFovX);
+
+    const uint numGs = (uPc.useIndirectDispatch != 0u) ? indirectCounter.counter : uPc.numGs;
+
+    for (uint ii = 0; ii < NUM_BLOCKS_PER_GROUP_RADIX; ii++) {
+        const uint elementId = workGroupId * NUM_BLOCKS_PER_GROUP_RADIX * RADIX_SORT_BINS + ii * RADIX_SORT_BINS + localId;
+
+        if (elementId >= numGs) {
+            if (elementId >= sortKeyData.length()) {
+                continue;
+            }
+
+            // to support editing, set to max key
+            SortKeyIndex keyIndex;
+            keyIndex.key = 0xFFFFffff;
+            keyIndex.gsIndex = elementId;
+
+            sortKeyData[elementId] = keyIndex;
+            continue;
+        }
+
+        // For tiled path, GS object index is passed directly; for non-tiled, search by range.
+        int gsIndex;
+        if (uPc.gsObjectIndex != 0xFFFFffffu) {
+            gsIndex = int(uPc.gsObjectIndex);
+        } else {
+            gsIndex = GetGsObjectIndex(elementId);
+        }
+        
+        if (gsIndex < 0) {
+            SortKeyIndex keyIndex;
+            keyIndex.key = 0xFFFFffff;
+            keyIndex.gsIndex = elementId;
+
+            sortKeyData[elementId] = keyIndex;
+            continue;
+        }
+
+        const mat4 worldMatrix = gsDynamicDatas[gsIndex].worldMat;
+        const mat4 viewWorldMatrix = cameraUbo.view * worldMatrix;
+
+        const GsSplatData currentGsData = gsData[elementId];
+
+        const vec4 gsPosition = vec4(currentGsData.positionOpacity.xyz, 1);
+        const vec4 pointViewProjected = viewWorldMatrix * gsPosition;
+        const float gsDistance = pointViewProjected.z;
+
+        const vec4 clipPos = cameraUbo.proj * pointViewProjected;
+        const vec3 ndc = clipPos.xyz / clipPos.w;
+
+        const bool insideFrustum = ndc.z >= 0.0f;
+
+        // full frustum culling can be used, but it causes tearing at screen edges
+        // if the target devices cannot maintain about 60fps
+        // const float margin = 1.05f;
+        // const bool insideFrustum = ndc.x >= -margin && ndc.x <= margin &&
+        //                            ndc.y >= -margin && ndc.y <= margin &&
+        //                            ndc.z >= 0.0f && ndc.z <= margin;
+
+        uint key;
+        if (!insideFrustum) {
+            key = 0xFFFFffff;
+        } else {
+            float remapDepth;
+            if (uPc.enableGsOpt == 0) {
+                remapDepth = 1.0f - clamp((depthMax - gsDistance) / (depthMax - depthMin), 0.0f, 1.0f);;
+            } else {
+                remapDepth = clamp((depthMax - gsDistance) / (depthMax - depthMin), 0.0f, 1.0f);;
+            }
+            key = uint(remapDepth * UINT32_MAX);
+        }
+
+        SortKeyIndex keyIndex;
+        keyIndex.key = key;
+        keyIndex.gsIndex = elementId;
+        
+        sortKeyData[elementId] = keyIndex;
+    }
+}

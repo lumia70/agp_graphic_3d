@@ -1,0 +1,112 @@
+#version 460 core
+#extension GL_ARB_separate_shader_objects : enable
+#extension GL_ARB_shading_language_420pack : enable
+
+#include "3d/shaders/common/3d_dm_structures_common.h"
+
+#include "common/gs_common.h"
+#include "common/gs_struct_common.h"
+
+layout(set = 0, binding = 0, std430) readonly buffer GSComputeDatas
+{
+    GsSplatData gsData[];
+};
+
+layout(set = 0, binding = 1, std430) buffer sortingBuffer
+{
+    SortKeyIndex sortKeyData[];
+};
+
+layout(set = 0, binding = 2, std140) readonly uniform uCameraMatrices
+{
+    GsCameraUboStruct cameraUbo;
+};
+
+layout(set = 0, binding = 3, std140) readonly uniform uGSDynamicDataBuffer
+{
+    GsDynamicDataStruct gsDynamicDatas[GS_MAX_NUM_GS_OBJECTS];
+};
+
+layout(set = 0, binding = 4, std430) readonly buffer wgInfoBuffer
+{
+    GsTileWorkgroupMetadataStruct wgInfos[];
+};
+
+layout(set = 0, binding = 5, std430) buffer outDrawDispatch
+{
+    GsIndirectDrawDispatch indirectDrawDispatch;
+};
+
+layout(push_constant, std430) uniform uPushConstant
+{
+    GsTiledPreSortPushConstantStruct uPc;
+};
+
+layout(local_size_x = RADIX_SORT_BINS, local_size_y = 1, local_size_z = 1) in;
+void main()
+{
+    const uint localId = gl_LocalInvocationID.x;
+    const uint workGroupId = gl_WorkGroupID.x;
+
+    const GsTileWorkgroupMetadataStruct wgInfo = wgInfos[workGroupId];
+
+    const uint paddedCount = (wgInfo.splatCount + MERGED_SLOT_ALIGNMENT - 1u) & ~(MERGED_SLOT_ALIGNMENT - 1u);
+    const uint splatsPerTile = uPc.numGs;
+
+    const vec2 depthRange = uPc.depthRange;
+    const float depthMin = depthRange.x;
+    const float depthMax = depthRange.y;
+
+    const int gsIndex = int(uPc.gsObjectIndex);
+    const mat4 worldMatrix = gsDynamicDatas[gsIndex].worldMat;
+    const mat4 viewWorldMatrix = cameraUbo.view * worldMatrix;
+
+    const uint wgElementBase = wgInfo.wgIndexInTile * NUM_BLOCKS_PER_GROUP_RADIX * RADIX_SORT_BINS;
+
+    for (uint ii = 0; ii < NUM_BLOCKS_PER_GROUP_RADIX; ii++) {
+        const uint elementInTile = wgElementBase + ii * RADIX_SORT_BINS + localId;
+
+        if (elementInTile >= paddedCount) {
+            continue;
+        }
+
+        const uint sortBufIdx = wgInfo.mergedOffset + elementInTile;
+        const uint splatGlobalIdx = wgInfo.slotIdx * splatsPerTile + elementInTile;
+
+        if (elementInTile >= wgInfo.splatCount) {
+            continue;
+        }
+
+        const GsSplatData currentGsData = gsData[splatGlobalIdx];
+
+        const vec4 gsPosition = vec4(currentGsData.positionOpacity.xyz, 1);
+        const vec4 pointViewProjected = viewWorldMatrix * gsPosition;
+        const float gsDistance = pointViewProjected.z;
+
+        const vec4 clipPos = cameraUbo.proj * pointViewProjected;
+        const vec3 ndc = clipPos.xyz / clipPos.w;
+
+        // frustum culling
+        const float clip = 1.2f * clipPos.w;
+        const vec3 absSp = abs(clipPos.xyz);
+
+        if (ndc.z < 0.0f || absSp.x > clip || absSp.y > clip || absSp.z > clip) {
+            continue;
+        }
+
+        float remapDepth;
+        if (uPc.enableGsOpt == 0) {
+            remapDepth = 1.0f - clamp((depthMax - gsDistance) / (depthMax - depthMin), 0.0f, 1.0f);;
+        } else {
+            remapDepth = clamp((depthMax - gsDistance) / (depthMax - depthMin), 0.0f, 1.0f);;
+        }
+        uint key = (uPc.sortKeyBits == 24u) ? uint(remapDepth * 16777214.0f) : uint(remapDepth * UINT32_MAX);
+
+        SortKeyIndex k;
+        k.key = key;
+        k.gsIndex = splatGlobalIdx;
+
+        uint id = atomicAdd(indirectDrawDispatch.instanceCount, 1);
+        sortKeyData[id] = k;
+    }
+}

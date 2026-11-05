@@ -29,6 +29,8 @@ static constexpr string_view DEVICE_EXTENSION_SAMPLER_YCBCR_CONVERSION{VK_KHR_SA
 static constexpr string_view DEVICE_EXTENSION_QUEUE_FAMILY_FOREIGN{VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME};
 static constexpr string_view DEVICE_EXTENSION_OPENHARMONY_EXTERNAL_MEMORY_OHOS_NATIVE_BUFFER{
     VK_OHOS_NATIVE_BUFFER_EXTENSION_NAME};
+static constexpr string_view DEVICE_EXTENSION_EXTERNAL_SEMAPHORE{VK_KHR_EXTERNAL_SEMAPHORE_EXTENSION_NAME};
+static constexpr string_view DEVICE_EXTENSION_EXTERNAL_SEMAPHORE_FD{VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME};
 }  // namespace
 
 void GetPlatformDeviceExtensions(vector<string_view>& extensions)
@@ -39,12 +41,16 @@ void GetPlatformDeviceExtensions(vector<string_view>& extensions)
     extensions.push_back(DEVICE_EXTENSION_SAMPLER_YCBCR_CONVERSION);
     extensions.push_back(DEVICE_EXTENSION_QUEUE_FAMILY_FOREIGN);
     extensions.push_back(DEVICE_EXTENSION_OPENHARMONY_EXTERNAL_MEMORY_OHOS_NATIVE_BUFFER);
+    // native fence (sync fd) import and export
+    extensions.push_back(DEVICE_EXTENSION_EXTERNAL_SEMAPHORE);
+    extensions.push_back(DEVICE_EXTENSION_EXTERNAL_SEMAPHORE_FD);
 }
 
 PlatformDeviceExtensions GetEnabledPlatformDeviceExtensions(
     const unordered_map<string, uint32_t>& enabledDeviceExtensions)
 {
     return PlatformDeviceExtensions{
-        enabledDeviceExtensions.contains(DEVICE_EXTENSION_OPENHARMONY_EXTERNAL_MEMORY_OHOS_NATIVE_BUFFER)};
+        enabledDeviceExtensions.contains(DEVICE_EXTENSION_OPENHARMONY_EXTERNAL_MEMORY_OHOS_NATIVE_BUFFER),
+        enabledDeviceExtensions.contains(DEVICE_EXTENSION_EXTERNAL_SEMAPHORE_FD)};
 }
 RENDER_END_NAMESPACE()

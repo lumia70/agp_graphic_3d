@@ -513,11 +513,15 @@ GraphicsPipelineStateObjectMln::GraphicsPipelineStateObjectMln(Device& device, c
         uint64_t h = 0;
         BASE_NS::HashCombine(h,
             static_cast<uint64_t>(plat_.topology),
+            static_cast<uint64_t>(plat_.primitiveRestartEnable),
             static_cast<uint64_t>(plat_.cullMode),
             static_cast<uint64_t>(plat_.frontFace),
+            static_cast<uint64_t>(plat_.depthBiasEnable),
+            FNV1aHash(plat_.lineWidth),
             static_cast<uint64_t>(plat_.depthTestEnable),
             static_cast<uint64_t>(plat_.depthWriteEnable),
             static_cast<uint64_t>(plat_.depthCompareOp),
+            static_cast<uint64_t>(plat_.depthBoundsTestEnable),
             static_cast<uint64_t>(plat_.stencilTestEnable),
             static_cast<uint64_t>(plat_.rasterizerDiscardEnable));
         plat_.staticStateHash = h;

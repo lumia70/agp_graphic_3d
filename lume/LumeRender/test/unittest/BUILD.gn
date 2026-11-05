@@ -243,6 +243,7 @@ ohos_unittest("lume_render_api_test") {
     "api_unit_test/src/src-gfx/gfx_gpu_resource_manager_test.cpp",
     "api_unit_test/src/src-gfx/gfx_gpu_resource_manager_test2.cpp",
     "api_unit_test/src/src-gfx/gfx_gpu_signal_test.cpp",
+    "api_unit_test/src/src-gfx/gfx_gpu_wait_test.cpp",
     "api_unit_test/src/src-gfx/gfx_multi_post_process_render_node_test.cpp",
     "api_unit_test/src/src-gfx/gfx_multi_queue_test.cpp",
     "api_unit_test/src/src-gfx/gfx_single_post_process_render_node_test.cpp",

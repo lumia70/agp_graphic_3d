@@ -1,0 +1,41 @@
+{
+    "compatibility_info": {
+        "version": "22.00",
+        "type": "pipelinelayout"
+    },
+    "pushConstant": {
+        "size": 16,
+        "shaderStageFlags": "compute_bit"
+    },
+    "descriptorSetLayouts": [
+        {
+            "set": 0,
+            "bindings": [
+                {
+                    "binding": 0,
+                    "descriptorType": "uniform_buffer",
+                    "descriptorCount": 1,
+                    "shaderStageFlags": "compute_bit"
+                },
+                {
+                    "binding": 1,
+                    "descriptorType": "storage_buffer",
+                    "descriptorCount": 1,
+                    "shaderStageFlags": "compute_bit"
+                },
+                {
+                    "binding": 2,
+                    "descriptorType": "storage_buffer",
+                    "descriptorCount": 1,
+                    "shaderStageFlags": "compute_bit"
+                },
+                {
+                    "binding": 3,
+                    "descriptorType": "storage_buffer",
+                    "descriptorCount": 1,
+                    "shaderStageFlags": "compute_bit"
+                }
+            ]
+        }
+    ]
+}

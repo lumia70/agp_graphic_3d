@@ -950,29 +950,17 @@ void RenderGraph::StoreFinalBufferState()
 void RenderGraph::StoreFinalImageState()
 {
     swapchainStates_ = {};  // reset
-    static uint32_t sFrameCount = 0;
-    sFrameCount++;
 
-    uint32_t dynamicCount = 0;
-    uint32_t swapchainFlagCount = 0;
-    uint32_t totalTracked = 0;
 #if (RENDER_DEV_ENABLED == 1)
     if constexpr (CORE_RENDER_GRAPH_PRINT_RESOURCE_STATES) {
         PLUGIN_LOG_I("end_frame image_state:");
     }
 #endif
     for (auto& ref : gpuImageTracking_) {
-        if (ref.resource.handle.id == 0) continue;
-        totalTracked++;
         // if resource is not dynamic, we do not track and care
         if (!RenderHandleUtil::IsDynamicResource(ref.resource.handle)) {
             ref = {};
             continue;
-        }
-        dynamicCount++;
-        if (RenderHandleUtil::IsSwapchain(ref.resource.handle)) {
-            swapchainFlagCount++;
-            const uint32_t flags = ref.state.accessFlags | ref.state.shaderStageFlags | ref.state.pipelineStageFlags;
         }
         // handle automatic presentation layout
         if (stateCache_.checkForBackbufferDependency && RenderHandleUtil::IsSwapchain(ref.resource.handle)) {

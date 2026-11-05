@@ -37,6 +37,16 @@ public:
      */
     virtual void AddCamera(const RenderCamera& camera) = 0;
 
+    /** Notify that a camera was dropped (not added due to limit).
+     * Called when a camera could not be added because MAX_CAMERA_COUNT was reached.
+     */
+    virtual void NotifyDroppedCamera() = 0;
+
+    /** Get the number of cameras that were dropped during the last Update.
+     * @return Dropped camera count.
+     */
+    virtual uint32_t GetDroppedCameraCount() const = 0;
+
     /** Get all cameras for particular scene id.
      * @return array view to all cameras.
      */

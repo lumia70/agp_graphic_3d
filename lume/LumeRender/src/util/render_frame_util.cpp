@@ -31,6 +31,7 @@
 #include "device/gpu_resource_manager.h"
 #include "device/gpu_semaphore.h"
 #include "util/log.h"
+#include "util/native_fence_fd.h"
 
 RENDER_BEGIN_NAMESPACE()
 using namespace BASE_NS;
@@ -52,6 +53,12 @@ GpuBufferDesc GetStagingBufferDesc(
         {},
     };
 }
+
+// wait and signal handles are only compared, so clients may pass handles without a reference counter
+bool IsLookupHandle(const RenderHandleReference& handle)
+{
+    return handle.GetHandle().id != INVALID_RESOURCE_HANDLE;
+}
 }  // namespace
 
 RenderFrameUtil::RenderFrameUtil(const IRenderContext& renderContext)
@@ -67,6 +74,17 @@ RenderFrameUtil::RenderFrameUtil(const IRenderContext& renderContext)
     dsCpuToGpuCopy_ = static_cast<IRenderDataStoreDefaultGpuResourceDataCopy*>(
         dsManager.GetRenderDataStore(RENDER_DATA_STORE_DEFAULT_DATA_COPY).get());
     PLUGIN_ASSERT(dsCpuToGpuCopy_);
+}
+
+RenderFrameUtil::~RenderFrameUtil()
+{
+    // close descriptors the backend never took
+    for (const auto& ref : thisFrameWaitData_) {
+        CloseNativeFenceFd(ref.nativeFenceFd);
+    }
+    for (const auto& ref : preWaitData_) {
+        CloseNativeFenceFd(ref.nativeFenceFd);
+    }
 }
 
 void RenderFrameUtil::BeginFrame()
@@ -89,6 +107,7 @@ void RenderFrameUtil::BeginFrame()
         }
         thisFrameSignalData_.gpuSemaphores.clear();
         thisFrameSignalData_.signalData.clear();
+        thisFrameSignalData_.exported.clear();
 
         // process backbuffer
         postBackBufferConfig_ = preBackBufferConfig_;  // NOTE: copy
@@ -109,6 +128,7 @@ void RenderFrameUtil::BeginFrame()
         // process signals
         postSignalData_ = move(preSignalData_);
         preSignalData_.clear();
+        ProcessFrameWaitData();
     }
     // advance to next buffer position, the copies are done for the oldest data
     bufferedIndex_ = (bufferedIndex_ + 1) % bufferedPostFrame_.size();
@@ -219,6 +239,7 @@ void RenderFrameUtil::ProcessFrameSignalData()
     // try to reserve
     thisFrameSignalData_.gpuSemaphores.reserve(postSignalData_.size());
     thisFrameSignalData_.signalData.reserve(postSignalData_.size());
+    thisFrameSignalData_.exported.resize(postSignalData_.size(), false);
 
     auto& device = (Device&)device_;
     const DeviceBackendType backendType = device.GetBackendType();
@@ -238,6 +259,25 @@ void RenderFrameUtil::ProcessFrameSignalData()
         sd.gpuSignalResourceHandle = thisFrameSignalData_.gpuSemaphores.back()->GetHandle();
         thisFrameSignalData_.signalData.push_back(sd);
     }
+}
+
+void RenderFrameUtil::ProcessFrameWaitData()
+{
+    // a wait the last frame did not submit still guards the client's buffer, so it goes ahead of the new ones
+    vector<WaitData> waitData;
+    waitData.reserve(thisFrameWaitData_.size() + preWaitData_.size());
+    for (auto& ref : thisFrameWaitData_) {
+        if ((ref.status == WaitStatus::NOT_SUBMITTED) && (ref.nativeFenceFd >= 0)) {
+            waitData.push_back(WaitData{ref.nativeFenceFd, WaitStatus::PENDING, move(ref.handle)});
+        } else {
+            CloseNativeFenceFd(ref.nativeFenceFd);
+        }
+    }
+    for (auto& ref : preWaitData_) {
+        waitData.push_back(move(ref));
+    }
+    thisFrameWaitData_ = move(waitData);
+    preWaitData_.clear();
 }
 
 void RenderFrameUtil::ProcessFrameBackBufferConfiguration()
@@ -279,6 +319,12 @@ void RenderFrameUtil::ProcessFrameSignalDeferredDestroy()
 
 void RenderFrameUtil::EndFrame()
 {
+    // still PENDING means the frame submitted no GPU work, the next BeginFrame carries these over
+    for (auto& ref : thisFrameWaitData_) {
+        if (ref.status == WaitStatus::PENDING) {
+            ref.status = WaitStatus::NOT_SUBMITTED;
+        }
+    }
     postFrame_.copyData.clear();
     if (frameHasWaitForIdle_) {
         for (auto& ref : bufferedPostFrame_) {
@@ -367,6 +413,56 @@ void RenderFrameUtil::SetBackBufferConfiguration(const BackBufferConfiguration& 
     preBackBufferConfig_.bbc = backBufferConfiguration;
 }
 
+IRenderFrameUtil::WaitResult RenderFrameUtil::AddGpuWait(const WaitData& waitData)
+{
+    if (waitData.nativeFenceFd < 0) {
+        return WaitResult::INVALID_FD;
+    }
+    // checked here so clients do not need to reach into the backend specific platform data
+    if (!static_cast<const Device&>(device_).CanImportNativeFence()) {
+        return WaitResult::NOT_SUPPORTED;
+    }
+    const auto lock = std::lock_guard(mutex_);
+
+    preWaitData_.push_back(WaitData{waitData.nativeFenceFd, WaitStatus::PENDING, waitData.handle});
+    // take over the fdsan ownership of the fd the client handed over
+    ExchangeNativeFenceFdOwnership(waitData.nativeFenceFd, true);
+    return WaitResult::ACCEPTED;
+}
+
+BASE_NS::array_view<const IRenderFrameUtil::WaitData> RenderFrameUtil::GetFrameGpuWaitData()
+{
+    // NOTE: not thread safe (should not be called during rendering from other threads)
+    return thisFrameWaitData_;
+}
+
+IRenderFrameUtil::WaitData RenderFrameUtil::GetFrameGpuWaitData(const RenderHandleReference& handle)
+{
+    // NOTE: not thread safe (should not be called during rendering from other threads)
+    if (!IsLookupHandle(handle)) {
+        return {};
+    }
+    const RenderHandle rawHandle = handle.GetHandle();
+    for (const auto& ref : thisFrameWaitData_) {
+        if (ref.handle.GetHandle() == rawHandle) {
+            // the copy can outlive the frame, and the renderer may close the descriptor at the next one
+            return WaitData{-1, ref.status, ref.handle};
+        }
+    }
+    return {};
+}
+
+bool RenderFrameUtil::HasGpuWaits() const
+{
+    return !thisFrameWaitData_.empty();
+}
+
+BASE_NS::array_view<IRenderFrameUtil::WaitData> RenderFrameUtil::GetGpuWaitData()
+{
+    // NOTE: not thread safe (should not be called during rendering from other threads)
+    return thisFrameWaitData_;
+}
+
 void RenderFrameUtil::AddGpuSignal(const SignalData& signalData)
 {
     bool valid = true;
@@ -406,7 +502,7 @@ BASE_NS::array_view<IRenderFrameUtil::SignalData> RenderFrameUtil::GetFrameGpuSi
 IRenderFrameUtil::SignalData RenderFrameUtil::GetFrameGpuSignalData(const RenderHandleReference& handle)
 {
     // NOTE: not thread safe (should not be called during rendering)
-    if (handle) {
+    if (IsLookupHandle(handle)) {
         const RenderHandle rawHandle = handle.GetHandle();
         for (const auto& ref : thisFrameSignalData_.signalData) {
             if (ref.handle.GetHandle() == rawHandle) {
@@ -415,6 +511,39 @@ IRenderFrameUtil::SignalData RenderFrameUtil::GetFrameGpuSignalData(const Render
         }
     }
     return {};
+}
+
+IRenderFrameUtil::NativeFence RenderFrameUtil::ExportFrameGpuSignal(const RenderHandleReference& handle)
+{
+    // NOTE: not thread safe (should not be called during rendering)
+    auto& frame = thisFrameSignalData_;
+    size_t index = frame.signalData.size();
+    if (IsLookupHandle(handle)) {
+        const RenderHandle rawHandle = handle.GetHandle();
+        for (size_t idx = 0; idx < frame.signalData.size(); ++idx) {
+            if (frame.signalData[idx].handle.GetHandle() == rawHandle) {
+                index = idx;
+                break;
+            }
+        }
+    }
+    if (index >= frame.signalData.size()) {
+        return {ExportResult::NOT_SIGNALED, -1};
+    }
+    // Vulkan export resets the payload, so a second export would hand out a fence that never signals
+    if (frame.exported[index]) {
+        return {ExportResult::FAILED, -1};
+    }
+    const auto& device = static_cast<const Device&>(device_);
+    const GpuSemaphore* semaphore = frame.gpuSemaphores[index].get();
+    if ((!device.CanExportNativeFence()) || (!semaphore)) {
+        return {ExportResult::NOT_SUPPORTED, -1};
+    }
+    const NativeFence fence = device.ExportNativeFence(*semaphore, frame.signalData[index].signaled);
+    // any attempt counts, a failed one may have reset the payload too
+    frame.exported[index] =
+        (fence.result != ExportResult::NOT_SIGNALED) && (fence.result != ExportResult::NOT_SUPPORTED);
+    return fence;
 }
 
 bool RenderFrameUtil::HasGpuSignals() const

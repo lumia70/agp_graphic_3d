@@ -1,4 +1,75 @@
-# This file was originally tracked by Git LFS but LFS tracking has been removed
-version https://git-lfs.github.com/spec/v1
-oid sha256:0bb994cb3933de22eef3a02d3feff3b12ef344b0d3432236f6157701ac93b2a3
-size 2437
+{
+    "asset": {
+        "version": "2.0"
+    },
+    "images": [
+        {
+            "name": "quarry_02_2k_radiance(spec).ktx",
+            "uri": "images/quarry_02_2k_radiance(spec).ktx",
+            "mimeType": "image/ktx"
+        },
+        {
+            "name": "quarry_02_2k_skybox.ktx",
+            "uri": "images/quarry_02_2k_skybox.ktx",
+            "mimeType": "image/ktx"
+        }
+    ],
+    "scenes": [
+        {
+            "name": "scene",
+            "extensions": {
+                "EXT_lights_image_based": {
+                    "light": 0
+                }
+            }
+        }
+    ],
+    "scene": 0,
+    "extensions": {
+        "EXT_lights_image_based": {
+            "lights": [
+                {
+                    "intensity": 1,
+                    "irradianceCoefficients": [
+                        [
+                            1.083536505699158,  0.939471721649170,  0.668708860874176
+                        ],
+                        [
+                            0.962803125381470,  0.831773161888123,  0.572560966014862
+                        ],
+                        [
+                            0.850659430027008,  0.717516005039215,  0.475567072629929
+                        ],
+                        [
+                            -0.593479573726654, -0.503368437290192, -0.335708379745483
+                        ],
+                        [
+                            -0.777685821056366, -0.657747030258179, -0.439588129520416
+                        ],
+                        [
+                            1.056635260581970,  0.890507876873016,  0.590429842472076
+                        ],
+                        [
+                            -0.019005663692951, -0.014923308975995, -0.008943087421358
+                        ],
+                        [
+                            -0.567901372909546, -0.478516459465027, -0.316203951835632
+                        ],
+                        [
+                            -0.240082979202271, -0.201172053813934, -0.133483424782753
+                        ]
+                    ],
+                    "name": "imageBasedLight",
+                    "extras": {
+                        "skymapImage": 1,
+                        "skymapImageLodLevel": 0,
+                        "specularCubeImage": 0
+                    }
+                }
+            ]
+        }
+    },
+    "extensionsUsed": [
+        "EXT_lights_image_based"
+    ]
+}

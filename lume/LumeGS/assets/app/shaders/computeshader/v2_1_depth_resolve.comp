@@ -1,0 +1,64 @@
+#version 460 core
+#extension GL_ARB_separate_shader_objects : enable
+#define V21_COMPUTE_SHADER 1
+#define V21_PROFILE_DEPTH 1
+#include "common/v2_1_bindings.glsl"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+shared uint strongPixelReduction[256];
+
+void main()
+{
+    uint linearIndex = gl_GlobalInvocationID.x;
+    uint localIndex = gl_LocalInvocationID.x;
+    uint pixelCount = v21.counts.y * v21.counts.z;
+    bool inBounds = linearIndex < pixelCount;
+    ivec2 coordinate = inBounds
+        ? ivec2(int(linearIndex % v21.counts.y), int(linearIndex / v21.counts.y))
+        : ivec2(0);
+    vec4 accumulated = inBounds ? texelFetch(weightedAccumulatorTexture, coordinate, 0) : vec4(0.0);
+    uint owner = inBounds ? texelFetch(opaqueOwnerTexture, coordinate, 0).r : V21_INVALID_ID;
+    float opaqueNormalized = inBounds ? texelFetch(opaqueDepthTexture, coordinate, 0).r : 0.0;
+    bool weightedValid = inBounds && accumulated.g >= v21.weights1.w;
+    bool opaqueValid = inBounds && owner != V21_INVALID_ID && opaqueNormalized > 0.0;
+    float weightedNormalized = weightedValid ? accumulated.r / max(accumulated.g, 1.0e-6) : 0.0;
+    float depthRange = v21.principalNearFar.w - v21.principalNearFar.z;
+    float weightedDepth = weightedValid ? v21.principalNearFar.z + weightedNormalized * depthRange : 0.0;
+    float opaqueDepth = opaqueValid ? v21.principalNearFar.z + opaqueNormalized * depthRange : 0.0;
+    float relativeDifference = (weightedValid && opaqueValid) ?
+        max(weightedDepth - opaqueDepth, 0.0) / max(weightedDepth, 1.0e-6) : 0.0;
+
+    bool evidenceEligible = pushData.mode != 0u && globals.stopReason == V21_STOP_NONE &&
+        weightedValid && opaqueValid && owner < v21.counts.x &&
+        states[owner].cumulativeMask == 0u;
+    strongPixelReduction[localIndex] = evidenceEligible &&
+        relativeDifference >= v21.discAlphaGap.w ? 1u : 0u;
+    barrier();
+    for (uint offset = 128u; offset > 0u; offset >>= 1u) {
+        if (localIndex < offset) {
+            strongPixelReduction[localIndex] += strongPixelReduction[localIndex + offset];
+        }
+        barrier();
+    }
+    if (localIndex == 0u && strongPixelReduction[0] != 0u) {
+        atomicAdd(globals.currentStrongPixels, strongPixelReduction[0]);
+    }
+
+    if (!evidenceEligible) {
+        return;
+    }
+    uint fixedScale = v21.peel.z;
+    uint alphaQ = uint(round(clamp(accumulated.g, 0.0, 1.0) * float(fixedScale)));
+    atomicAdd(analysis[owner].evidence.ownerPixels, 1u);
+    atomicAdd(analysis[owner].evidence.alphaTotalQ, alphaQ);
+    if (relativeDifference >= v21.discAlphaGap.z) {
+        atomicAdd(analysis[owner].evidence.anomalyPixels, 1u);
+        atomicAdd(analysis[owner].evidence.relativeGapSumQ,
+            uint(round(clamp(relativeDifference, 0.0, 1.0) * float(fixedScale))));
+        atomicAdd(analysis[owner].evidence.alphaAnomalyQ, alphaQ);
+        if (relativeDifference >= v21.discAlphaGap.w) {
+            atomicAdd(analysis[owner].evidence.strongPixels, 1u);
+        }
+    }
+}

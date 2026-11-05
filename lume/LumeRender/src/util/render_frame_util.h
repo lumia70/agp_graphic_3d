@@ -32,7 +32,7 @@ class IRenderDataStoreDefaultGpuResourceDataCopy;
 class RenderFrameUtil : public IRenderFrameUtil {
 public:
     explicit RenderFrameUtil(const IRenderContext& renderContext);
-    ~RenderFrameUtil() override = default;
+    ~RenderFrameUtil() override;
 
     void BeginFrame();
     void EndFrame();
@@ -40,15 +40,24 @@ public:
     bool HasGpuSignals() const;
     BASE_NS::array_view<BASE_NS::unique_ptr<GpuSemaphore>> GetGpuSemaphores();
 
+    // Valid during backend processing. A consumer sets the fd to -1 and the status, CpuWaitNativeFence does both.
+    // Fds still set are closed at the next frame, entries left PENDING are carried over.
+    bool HasGpuWaits() const;
+    BASE_NS::array_view<IRenderFrameUtil::WaitData> GetGpuWaitData();
+
     void CopyToCpu(const RenderHandleReference& handle, CopyFlags flags) override;
     BASE_NS::array_view<IRenderFrameUtil::FrameCopyData> GetFrameCopyData() override;
     const FrameCopyData& GetFrameCopyData(const RenderHandleReference& handle) override;
 
     void SetBackBufferConfiguration(const BackBufferConfiguration& backBufferConfiguration) override;
 
+    WaitResult AddGpuWait(const WaitData& waitData) override;
+    BASE_NS::array_view<const WaitData> GetFrameGpuWaitData() override;
+    WaitData GetFrameGpuWaitData(const RenderHandleReference& handle) override;
     void AddGpuSignal(const SignalData& signalData) override;
     BASE_NS::array_view<SignalData> GetFrameGpuSignalData() override;
     SignalData GetFrameGpuSignalData(const RenderHandleReference& handle) override;
+    NativeFence ExportFrameGpuSignal(const RenderHandleReference& handle) override;
 
 private:
     struct InternalFrameCopyData {
@@ -64,6 +73,8 @@ private:
     void ProcessFrameCopyData();
     void ProcessFrameInputCopyData(const CopyData& copyData);
     void ProcessFrameSignalData();
+    // called with mutex_ held
+    void ProcessFrameWaitData();
     void ProcessFrameBackBufferConfiguration();
     void ProcessFrameSignalDeferredDestroy();
 
@@ -88,10 +99,15 @@ private:
 
     BASE_NS::vector<SignalData> preSignalData_;
     BASE_NS::vector<SignalData> postSignalData_;
+    // preWaitData_ collects between frames, thisFrameWaitData_ is consumed by the backend and read by clients
+    BASE_NS::vector<WaitData> preWaitData_;
+    BASE_NS::vector<WaitData> thisFrameWaitData_;
     // will hold the actual results from where the array_view is created for the user
     struct FrameSignalData {
         BASE_NS::vector<BASE_NS::unique_ptr<GpuSemaphore>> gpuSemaphores;
         BASE_NS::vector<SignalData> signalData;
+        // parallel to signalData, set once an export was attempted
+        BASE_NS::vector<bool> exported;
     };
     FrameSignalData thisFrameSignalData_;
 

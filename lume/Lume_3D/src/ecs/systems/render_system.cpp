@@ -2226,8 +2226,10 @@ void RenderSystem::ProcessCameras(
     unordered_map<uint64_t, uint64_t> mvChildToParent;  // multi-view child to parent
     RenderScene::Flags sceneFlags{0u};
 
-    const auto hasOcclusionMaterial =
-        dsMaterial_->GetRenderFrameObjectInfo().renderMaterialFlags & RENDER_MATERIAL_OCCLUSION_BIT;
+    const auto renderMaterialFlags = dsMaterial_->GetRenderFrameObjectInfo().renderMaterialFlags;
+    const auto hasOcclusionMaterial = renderMaterialFlags & RENDER_MATERIAL_OCCLUSION_BIT;
+    // pre-pass cameras use camera slots even when not rendered, so allowed ones are added only for material needs
+    const auto hasTransmissionMaterial = renderMaterialFlags & RENDER_MATERIAL_TRANSMISSION_BIT;
 
     for (const auto& row : queryResults) {
         const auto id = row.components[0U];
@@ -2333,8 +2335,10 @@ void RenderSystem::ProcessCameras(
 
         // NOTE: setting up the color pre pass with a target name is a temporary solution
         uint64_t prePassCameraHash = 0U;
-        const bool createPrePassCam = (component.pipelineFlags & CameraComponent::FORCE_COLOR_PRE_PASS_BIT) ||
-                                      (component.pipelineFlags & CameraComponent::ALLOW_COLOR_PRE_PASS_BIT);
+        const bool createPrePassCam =
+            ((component.pipelineFlags & CameraComponent::FORCE_COLOR_PRE_PASS_BIT) ||
+                (hasTransmissionMaterial && (component.pipelineFlags & CameraComponent::ALLOW_COLOR_PRE_PASS_BIT)));
+
         if (createPrePassCam) {
             prePassCameraHash = Hash(camera.id, camera.id);
             camera.prePassColorTargetName = renderScene.name +
@@ -2580,15 +2584,18 @@ void RenderSystem::ProcessLight(const LightProcessData& lpd)
             lc.rectLight.twoSided ? RenderLight::LightUsageFlagBits::LIGHT_USAGE_TWO_SIDED_LIGHT_BIT : 0;
 
         const Math::Vec3 dir = Math::Normalize(light.dir);
-        Math::Vec3 up = Math::Normalize(Math::Cross(dir, Math::Vec3(1.0f, 0.0f, 0.0f)));
-        // Edge case, because dir can be paralell to (1, 0, 0).
-        if (up.x == 0.0f && up.y == 0.0f && up.z == 0.0f) {
-            up = Math::Vec3(0.0f, 1.0f, 0.0f);
-        }
+        // Seed axis kept well away from dir so the cross product is stable for near-parallel cases.
+        const Math::Vec3 seedAxis =
+            (std::abs(dir.x) > 0.9f) ? Math::Vec3(0.0f, 1.0f, 0.0f) : Math::Vec3(1.0f, 0.0f, 0.0f);
+        const Math::Vec3 up = Math::Normalize(Math::Cross(dir, seedAxis));
         const Math::Vec3 right = -Math::Cross(up, dir);
 
-        light.dir = Math::Vec4(right * lc.rectLight.width, lc.rectLight.width);
-        light.spotLightParams = Math::Vec4(up * lc.rectLight.height, lc.rectLight.height);
+        // Avoid zero half-axis lengths in the shader.
+        constexpr float minRectDim = 0.0001f;
+        const float width = Math::max(minRectDim, lc.rectLight.width);
+        const float height = Math::max(minRectDim, lc.rectLight.height);
+        light.dir = Math::Vec4(right * width, width);
+        light.spotLightParams = Math::Vec4(up * height, height);
     }
     light.range = ComponentUtilFunctions::CalculateSafeLightRange(lc.range, lc.intensity);
 
@@ -2628,6 +2635,7 @@ void RenderSystem::ProcessShadowCamera(const LightProcessData lpd, RenderLight& 
     if (light.shadowCameraIndex >= DefaultMaterialCameraConstants::MAX_CAMERA_COUNT) {
         light.shadowCameraIndex = ~0u;
         light.lightUsageFlags &= (~RenderLight::LightUsageFlagBits::LIGHT_USAGE_SHADOW_LIGHT_BIT);
+        dsCamera_->NotifyDroppedCamera();
 #if (CORE3D_VALIDATION_ENABLED == 1)
         const string onceName = string(to_string(light.id) + "_too_many_cam");
         PLUGIN_LOG_ONCE_W(onceName, "CORE3D_VALIDATION: shadow camera dropped, too many cameras in scene");
@@ -3254,6 +3262,11 @@ array_view<const RenderHandleReference> RenderSystem::GetRenderNodeGraphs() cons
     }
 }
 
+uint32_t RenderSystem::GetDroppedCameraCount() const
+{
+    return dsCamera_ ? dsCamera_->GetDroppedCameraCount() : 0;
+}
+
 RenderSystem::CameraData RenderSystem::UpdateAndGetPreviousFrameCameraData(
     const Entity& entity, const Math::Mat4X4& view, const Math::Mat4X4& proj)
 {
@@ -3622,13 +3635,10 @@ void RenderSystem::UpdateSingleMaterial(const Entity matEntity, const MaterialCo
 
 void RenderSystem::HandleModifiedMeshes() noexcept
 {
-    PLUGIN_LOG_E("DIAG HandleModifiedMeshes: count=%zu dsMaterial=%d",
-        meshModifiedEvents_.size(), dsMaterial_ ? 1 : 0);
     vector<uint64_t> additionalMaterials;
     for (const auto& entRef : meshModifiedEvents_) {
         auto meshHandle = meshMgr_->Read(entRef);
         if (!meshHandle) {
-            PLUGIN_LOG_E("DIAG HandleModifiedMeshes: entity 0x%llx - no mesh handle", (unsigned long long)entRef.id);
             continue;
         }
 
@@ -3674,8 +3684,6 @@ void RenderSystem::HandleModifiedMeshes() noexcept
             writeRef.drawCommand.firstInstance = readRef.firstInstance;
         }
         dsMaterial_->UpdateMeshData(md.meshId, md);
-        PLUGIN_LOG_E("DIAG HandleModifiedMeshes: registered meshId=0x%llx submeshes=%zu",
-            (unsigned long long)md.meshId, md.submeshes.size());
     }
     meshModifiedEvents_.clear();
 }

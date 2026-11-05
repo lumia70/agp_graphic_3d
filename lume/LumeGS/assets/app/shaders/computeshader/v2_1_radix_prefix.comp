@@ -1,0 +1,28 @@
+#version 460 core
+#extension GL_ARB_separate_shader_objects : enable
+#extension GL_ARB_shading_language_420pack : enable
+#define V21_COMPUTE_SHADER 1
+#define V21_PROFILE_RADIX 1
+#include "common/v2_1_bindings.glsl"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+shared uint totals[256];
+
+void main()
+{
+    uint bucket = gl_LocalInvocationID.x;
+    uint running = 0u;
+    for (uint group = 0u; group < pushData.reserved; ++group) {
+        uint offset = group * 256u + bucket;
+        uint value = histogramBins[offset].count;
+        histogramBins[offset].count = running;
+        running += value;
+    }
+    totals[bucket] = running;
+    barrier();
+    uint bucketStart = 0u;
+    for (uint lower = 0u; lower < bucket; ++lower) {
+        bucketStart += totals[lower];
+    }
+    histogramBins[pushData.reserved * 256u + bucket].count = bucketStart;
+}

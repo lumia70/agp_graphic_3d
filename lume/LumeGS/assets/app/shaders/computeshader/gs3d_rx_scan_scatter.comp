@@ -1,0 +1,189 @@
+#version 460 core
+#extension GL_ARB_separate_shader_objects : enable
+#extension GL_ARB_shading_language_420pack : enable
+
+#include "common/gs_common.h"
+#include "common/gs_struct_common.h"
+#define LUME_GS_EDIT_LAYOUT 0
+#include "common/gs_edit_common.h"
+
+layout(set = 0, binding = 0, std430) buffer sortingBuffer0
+{
+    SortKeyIndex sortKeyData0[];
+};
+
+layout(set = 0, binding = 1, std430) buffer sortingBuffer1
+{
+    SortKeyIndex sortKeyData1[];
+};
+
+layout(set = 0, binding = 2, std430) buffer countingBuffer
+{
+    uint g_histograms[]; // prefix sum buffer
+};
+
+layout(set = 0, binding = 3, std430) readonly restrict buffer indirectDispatchCounterBuffer
+{
+    IndirectEditDispatchCounterBuffer indirectCounter;
+};
+
+layout(push_constant, std430) uniform uPushConstant
+{
+    GsRadixSortPushConstantStruct uPc;
+};
+
+shared uint[RADIX_SORT_BINS] globalOffsets; // global prefix sum
+shared uint[RADIX_SORT_BINS] localHistogramCounts;
+
+struct BinFlags {
+    uint flags[RADIX_SORT_BINS / 32u]; // 32bit keys
+};
+shared BinFlags binFlags[RADIX_SORT_BINS];
+
+void ReduceExclusiveScan(const uint localId, const uint workGroupId, const uint numWorkgroups)
+{
+    uint localHistogram = 0;
+    uint prefixSum = 0;
+
+    // local histogram counts 
+    uint count = 0;
+    for (uint jj = 0; jj < numWorkgroups; jj++) {
+        const uint tt = g_histograms[RADIX_SORT_BINS * jj + localId];
+
+        localHistogram = (jj == workGroupId) ? count : localHistogram;
+        count += tt;
+    }
+
+    localHistogramCounts[localId] = count;
+    barrier();
+
+    // exclusive prefix scan
+    // for (int ii = 0; ii < localId; ii++) {
+    //     prefixSum += localHistogramCounts[ii];
+    // }
+    {
+        // a more parallel implementation of the exclusive scan
+
+        uint offset = 1;
+        // up-sweep
+        for (uint dd = RADIX_SORT_BINS >> 1; dd > 0; dd >>= 1) {
+            barrier();
+
+            if (localId < dd) {
+                const uint ai = offset * (2u * localId + 1u) - 1u;
+                const uint bi = offset * (2u * localId + 2u) - 1u;
+
+                localHistogramCounts[bi] += localHistogramCounts[ai];
+            }
+
+            offset *= 2u;
+        }
+
+        // clear the last element
+        if (localId == 0) {
+            localHistogramCounts[RADIX_SORT_BINS - 1] = 0;
+        }
+
+        // down-sweep
+        for (uint dd = 1u; dd < RADIX_SORT_BINS; dd *= 2u) {
+            offset >>= 1u;
+            barrier();
+
+            if (localId < dd) {
+                const uint ai = offset * (2u * localId + 1u) - 1u;
+                const uint bi = offset * (2u * localId + 2u) - 1u;
+                const uint temp = localHistogramCounts[ai];
+
+                localHistogramCounts[ai] = localHistogramCounts[bi];
+                localHistogramCounts[bi] += temp;
+            }
+        }
+
+        barrier();
+        prefixSum = localHistogramCounts[localId];
+    }
+
+    // global histogram assignment
+    globalOffsets[localId] = prefixSum + localHistogram;
+
+    barrier();
+}
+
+layout(local_size_x = RADIX_SORT_BINS, local_size_y = 1, local_size_z = 1) in;
+void main()
+{
+    const uint globalId = gl_GlobalInvocationID.x;
+    const uint localId = gl_LocalInvocationID.x;
+    const uint workGroupId = gl_WorkGroupID.x;
+    const uint numWorkgroups = gl_NumWorkGroups.x;
+    const bool pingPongBuffer = (uPc.bytePosition % 2 == 0);
+
+    ReduceExclusiveScan(localId, workGroupId, numWorkgroups);
+
+    // scatter
+    const uint flags_bin = localId / 32;
+    const uint flags_bit = 1 << (localId % 32);
+
+    for (uint index = 0; index < NUM_BLOCKS_PER_GROUP_RADIX; index++)
+    {
+        const uint elementId = workGroupId * NUM_BLOCKS_PER_GROUP_RADIX * RADIX_SORT_BINS + index * RADIX_SORT_BINS + localId;
+
+        // initialize bin flags
+        const uint totalFlags = RADIX_SORT_BINS * (RADIX_SORT_BINS / 32u);
+        for (uint ii = localId; ii < totalFlags; ii += RADIX_SORT_BINS) {
+            const uint binIdx = ii / (RADIX_SORT_BINS / 32u);
+            const uint flagIdx = ii % (RADIX_SORT_BINS / 32u);
+
+            binFlags[binIdx].flags[flagIdx] = 0u;
+        }
+        barrier();
+
+        SortKeyIndex elementIn;
+        uint binID = 0;
+        uint binOffset = 0;
+
+        const uint numGs = (uPc.useIndirectDispatch != 0u) ? indirectCounter.counter : uPc.numGs;
+
+        if (elementId < numGs)
+        {
+            elementIn = pingPongBuffer ? sortKeyData0[elementId] : sortKeyData1[elementId];
+            binID = uint(elementIn.key >> (uPc.bytePosition * 8u)) & uint(RADIX_SORT_BINS - 1);
+
+            // offset for group
+            binOffset = globalOffsets[binID];
+            // add bit to flag
+            atomicAdd(binFlags[binID].flags[flags_bin], flags_bit);
+        }
+        barrier();
+
+        if (elementId < numGs)
+        {
+            // calculate output index of element
+            uint prefix = 0;
+            uint count = 0;
+
+            for (uint ii = 0; ii < RADIX_SORT_BINS / 32; ii++)
+            {
+                const uint bits = binFlags[binID].flags[ii];
+                const uint fullCount = bitCount(bits);
+                const uint partialCount = bitCount(bits & (flags_bit - 1));
+
+                prefix += fullCount * uint(ii < flags_bin);
+                prefix += (ii == flags_bin) ? partialCount : 0;
+                count += fullCount;
+            }
+
+            if (pingPongBuffer) {
+                sortKeyData1[binOffset + prefix] = elementIn;
+            } else {
+                sortKeyData0[binOffset + prefix] = elementIn;
+            }
+
+            if (prefix == count - 1) {
+                atomicAdd(globalOffsets[binID], count);
+            }
+        }
+
+        barrier();
+    }
+}

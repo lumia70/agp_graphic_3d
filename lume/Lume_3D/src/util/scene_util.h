@@ -94,6 +94,7 @@ public:
 
     bool IsSphereInsideCameraFrustum(const CORE_NS::IEcs& ecs, CORE_NS::Entity cameraEntity, BASE_NS::Math::Vec3 center,
         float radius) const override;
+    uint32_t GetDroppedCameraCount(const CORE_NS::IEcs& ecs) const override;
 
 private:
     IGraphicsContext& graphicsContext_;

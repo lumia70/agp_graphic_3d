@@ -49,6 +49,7 @@
 #include "nodecontext/render_node_graph_node_store.h"
 #include "render_backend.h"
 #include "util/log.h"
+#include "util/native_fence_fd.h"
 #include "util/render_frame_util.h"
 #include "vulkan/gpu_buffer_vk.h"
 #include "vulkan/gpu_image_vk.h"
@@ -158,6 +159,15 @@ bool CheckPresentResult(const VkResult result)
             return false;
     }
     return true;
+}
+
+void DestroySemaphores(const VkDevice device, const vector<VkSemaphore>& semaphores)
+{
+    for (const auto semaphore : semaphores) {
+        if (semaphore != VK_NULL_HANDLE) {
+            vkDestroySemaphore(device, semaphore, nullptr);
+        }
+    }
 }
 }  // namespace
 
@@ -423,6 +433,7 @@ bool RenderBackendVk::Present()
                 waitSemaphores.push_back(info.presentSemaphore);
             }
         }
+
         const VkPresentInfoKHR presentInfo{
             VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,            // sType
             nullptr,                                       // pNext
@@ -442,6 +453,16 @@ bool RenderBackendVk::Present()
     commonCpuTimers_.present.End();
 #endif
     return presentOk;
+}
+
+RenderBackendVk::~RenderBackendVk()
+{
+    // the device is idle here, destroy what ageing has not released yet
+    const VkDevice device = deviceVk_.GetPlatformDataVk().device;
+    for (const auto& ref : externalWaitSemaphores_) {
+        DestroySemaphores(device, ref.semaphores);
+    }
+    externalWaitSemaphores_.clear();
 }
 
 void RenderBackendVk::Render(
@@ -498,6 +519,91 @@ void RenderBackendVk::Render(
 #endif
 }
 
+void RenderBackendVk::ProcessExternalWaitSemaphoreDestroy()
+{
+    // the submission has completed once the command buffering count of frames has passed
+    const uint64_t frameCount = deviceVk_.GetFrameCount();
+    const auto minAge = deviceVk_.GetCommandBufferingCount();
+    const uint64_t ageLimit = (frameCount < minAge) ? 0 : (frameCount - minAge);
+    const VkDevice device = deviceVk_.GetPlatformDataVk().device;
+    for (auto iter = externalWaitSemaphores_.begin(); iter != externalWaitSemaphores_.end();) {
+        if (iter->frameIndex < ageLimit) {
+            DestroySemaphores(device, iter->semaphores);
+            iter = externalWaitSemaphores_.erase(iter);
+        } else {
+            ++iter;
+        }
+    }
+}
+
+namespace {
+// on success the semaphore owns the fd, on failure the caller still owns it
+VkSemaphore ImportNativeFenceSemaphore(
+    const VkDevice device, const PFN_vkImportSemaphoreFdKHR vkImportSemaphoreFdKHR, const int32_t fd)
+{
+    constexpr VkSemaphoreCreateInfo semaphoreCreateInfo{
+        VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,  // sType
+        nullptr,                                  // pNext
+        0,                                        // flags
+    };
+    VkSemaphore semaphore = VK_NULL_HANDLE;
+    if (vkCreateSemaphore(device, &semaphoreCreateInfo, nullptr, &semaphore) != VK_SUCCESS) {
+        PLUGIN_LOG_E("failed to create semaphore for external wait");
+        return VK_NULL_HANDLE;
+    }
+    // TEMPORARY import: the wait consumes the payload and the semaphore reverts to its prior state
+    const VkImportSemaphoreFdInfoKHR importInfo{
+        VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_FD_INFO_KHR,  // sType
+        nullptr,                                         // pNext
+        semaphore,                                       // semaphore
+        VK_SEMAPHORE_IMPORT_TEMPORARY_BIT,               // flags
+        VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT,   // handleType
+        fd,                                              // fd
+    };
+    if (vkImportSemaphoreFdKHR(device, &importInfo) != VK_SUCCESS) {
+        PLUGIN_LOG_E("vkImportSemaphoreFdKHR failed");
+        vkDestroySemaphore(device, semaphore, nullptr);
+        return VK_NULL_HANDLE;
+    }
+    return semaphore;
+}
+}  // namespace
+
+vector<VkSemaphore> RenderBackendVk::ImportExternalWaitSemaphores(RenderCommandFrameData& renderCommandFrameData)
+{
+    vector<VkSemaphore> imported;
+    auto* renderFrameUtil = renderCommandFrameData.renderFrameUtil;
+    if ((!renderFrameUtil) || (!renderFrameUtil->HasGpuWaits())) {
+        return imported;
+    }
+    const VkDevice device = deviceVk_.GetPlatformDataVk().device;
+    const PFN_vkImportSemaphoreFdKHR vkImportSemaphoreFdKHR = deviceVk_.GetExtFunctions().vkImportSemaphoreFdKHR;
+    auto waitData = renderFrameUtil->GetGpuWaitData();
+    imported.reserve(waitData.size());
+    for (auto& ref : waitData) {
+        if (ref.nativeFenceFd < 0) {
+            continue;
+        }
+        // hand the fdsan ownership of the fd to the driver before importing it
+        ExchangeNativeFenceFdOwnership(ref.nativeFenceFd, false);
+        const VkSemaphore semaphore =
+            vkImportSemaphoreFdKHR ? ImportNativeFenceSemaphore(device, vkImportSemaphoreFdKHR, ref.nativeFenceFd)
+                                   : VK_NULL_HANDLE;
+        if (semaphore == VK_NULL_HANDLE) {
+            // take the fdsan ownership back before the CPU wait closes the fd
+            ExchangeNativeFenceFdOwnership(ref.nativeFenceFd, true);
+            // nothing of this frame is submitted yet, so a CPU wait still synchronizes it
+            CpuWaitNativeFence(ref);
+            continue;
+        }
+        // prevent a double close
+        ref.nativeFenceFd = -1;
+        ref.status = IRenderFrameUtil::WaitStatus::WAITED;
+        imported.push_back(semaphore);
+    }
+    return imported;
+}
+
 void RenderBackendVk::RenderProcessSubmitCommandLists(
     RenderCommandFrameData& renderCommandFrameData, const RenderBackendBackBufferConfiguration& backBufferConfig)
 {
@@ -523,6 +629,11 @@ void RenderBackendVk::RenderProcessSubmitCommandLists(
         }
     }
 
+    ProcessExternalWaitSemaphoreDestroy();
+    // NOTE: the waits gate only the first submission, a binary semaphore wait is one-shot. Batches on other
+    // queues are not gated, which would need one imported semaphore per queue from a dup of the fd.
+    bool externalWaitsConsumed = false;
+
     for (size_t cmdBufferIdx = 0; cmdBufferIdx < commandBufferSubmitter_.commandBuffers.size(); ++cmdBufferIdx) {
         const auto& cmdSubmitterRef = commandBufferSubmitter_.commandBuffers[cmdBufferIdx];
         if (cmdSubmitterRef.commandBuffer == VK_NULL_HANDLE) {
@@ -530,6 +641,7 @@ void RenderBackendVk::RenderProcessSubmitCommandLists(
         }
 
         const auto& renderContextRef = renderCommandFrameData.renderCommandContexts[cmdBufferIdx];
+        const VkQueue queue = deviceVk_.GetGpuQueue(renderContextRef.renderCommandList->GetGpuQueue()).queue;
 
         vector<VkSemaphore> waitSemaphores;
         vector<VkPipelineStageFlags> waitSemaphorePipelineStageFlags;
@@ -544,6 +656,19 @@ void RenderBackendVk::RenderProcessSubmitCommandLists(
             if (waitSemaphore != VK_NULL_HANDLE) {
                 waitSemaphores.push_back(waitSemaphore);
                 waitSemaphorePipelineStageFlags.push_back(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);
+            }
+        }
+
+        // imported only for a batch that is really submitted, so an fd is never consumed without a GPU wait. A
+        // frame that submits nothing keeps its fds, which the renderer carries over.
+        vector<VkSemaphore> externalWaitSemaphores;
+        if ((!externalWaitsConsumed) && queue) {
+            externalWaitsConsumed = true;
+            externalWaitSemaphores = ImportExternalWaitSemaphores(renderCommandFrameData);
+            for (const auto semaphore : externalWaitSemaphores) {
+                waitSemaphores.push_back(semaphore);
+                // the fenced buffer may be read in any stage
+                waitSemaphorePipelineStageFlags.push_back(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
             }
         }
 
@@ -607,7 +732,6 @@ void RenderBackendVk::RenderProcessSubmitCommandLists(
             semaphores.push_back(cmdSubmitterRef.semaphore);
         }
 
-        const VkQueue queue = deviceVk_.GetGpuQueue(renderContextRef.renderCommandList->GetGpuQueue()).queue;
         if (queue) {
             const VkSubmitInfo submitInfo{
                 VK_STRUCTURE_TYPE_SUBMIT_INFO,                               // sType
@@ -626,6 +750,13 @@ void RenderBackendVk::RenderProcessSubmitCommandLists(
                 1,                                   // submitCount
                 &submitInfo,                         // pSubmits
                 fence));                             // fence
+
+            if (!externalWaitSemaphores.empty()) {
+                ExternalWaitSemaphores retained;
+                retained.frameIndex = deviceVk_.GetFrameCount();
+                retained.semaphores = move(externalWaitSemaphores);
+                externalWaitSemaphores_.push_back(move(retained));
+            }
         }
     }
 }

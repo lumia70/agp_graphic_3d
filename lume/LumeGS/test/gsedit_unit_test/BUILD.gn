@@ -1,0 +1,139 @@
+# Copyright (c) 2026 Huawei Device Co., Ltd.
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import("//build/ohos.gni")
+import("//build/test.gni")
+import("//foundation/graphic/graphic_3d/lume/lume_config.gni")
+
+module_output_path = "graphic_3d/graphic_3d/gsedit_test"
+
+ohos_unittest("gsedit_test") {
+  module_out_path = module_output_path
+
+  sources = [
+    "src/gs_edit_command_parsing_test.cpp",
+    "src/gs_utils_test.cpp",
+    "src/render_data_store_gs_edit_test.cpp",
+    "../mock/ai_edit_loader_stub.cpp",
+  ]
+
+  include_dirs = [
+    "${LUME_ROOT}/LumeGS/api",
+    "${LUME_ROOT}/LumeGS/api/plugin_gs/ecs/components",
+    "${LUME_ROOT}/LumeGS/api/plugin_gs/ecs/systems",
+    "${LUME_ROOT}/LumeGS/api/plugin_gs/render",
+    "${LUME_ROOT}/LumeGS/api/plugin_gs/util",
+    "${LUME_ROOT}/LumeGS/api/plugin_gs",
+    "${LUME_ROOT}/LumeGS/assets",
+    "${LUME_ROOT}/LumeGS/src",
+    "${LUME_ROOT}/LumeGS/src/render",
+  ]
+
+  deps = [
+    "${LUME_CORE_PATH}:AGPEcshelperApi",
+    "${LUME_CORE_PATH}:AGPBaseApi",
+    "${LUME_CORE_PATH}:AGPEngineApi",
+    "${LUME_CORE3D_PATH}:AGP3DApi",
+    "${LUME_RENDER_PATH}:AGPRenderApi",
+    "${LUME_META_PATH}:AGPMetaApi",
+    "${LUME_SCENE_PATH}:AGPSceneApi",
+    "//foundation/graphic/graphic_3d/lume/LumeGS:3d_gs_src",
+  ]
+
+  defines = [
+    "RENDER_HAS_GLES_BACKEND=1",
+    "RENDER_HAS_VULKAN_BACKEND=1",
+    "VMA_STATS_STRING_ENABLED=0",
+    "VMA_STATIC_VULKAN_FUNCTIONS=0",
+    "GS_EMBEDDED_ASSETS_ENABLED=1",
+    "CORE_PLUGIN=1",
+    "CORE_DYNAMIC=1",
+  ]
+
+  if (target_cpu == "arm") {
+    defines += [
+      "PLATFORM_CORE_ROOT_PATH=/system/lib/",
+      "PLATFORM_CORE_PLUGIN_PATH=/system/lib/graphics3d",
+      "PLATFORM_APP_ROOT_PATH=/system/lib/",
+      "PLATFORM_APP_PLUGIN_PATH=/system/lib/graphics3d",
+    ]
+  }
+
+  if (target_cpu == "arm64") {
+    defines += [
+      "PLATFORM_CORE_ROOT_PATH=/system/lib64/",
+      "PLATFORM_CORE_PLUGIN_PATH=/system/lib64/graphics3d/",
+      "PLATFORM_APP_ROOT_PATH=/system/lib64/",
+      "PLATFORM_APP_PLUGIN_PATH=/system/lib64/graphics3d/",
+    ]
+  }
+
+  defines += [ "RENDER_PUBLIC=__attribute__((visibility(\"default\")))" ]
+  defines += [ "LIB_ENGINE_CORE=\"libAGPDLL.z.so\"" ]
+
+  if (BUILDTYPE == "Release") {
+    defines += [ "PLUGIN_LOG_NO_DEBUG=0" ]
+  }
+
+  if (BUILDTYPE == "MinSizeRel") {
+    defines += [ "PLUGIN_LOG_NO_DEBUG=0" ]
+  }
+
+  if (BUILDTYPE == "RelWithDebInfo") {
+    defines += [ "PLUGIN_LOG_NO_DEBUG=0" ]
+  }
+
+  if (LUME_OHOS_BUILD) {
+    defines += [ "__OHOS_PLATFORM__" ]
+  }
+
+  external_deps = [
+    "c_utils:utils",
+    "googletest:gmock",
+    "googletest:gtest",
+    "hilog:libhilog",
+    "hitrace:hitrace_meter",
+    "graphic_2d:EGL",
+    "graphic_2d:GLESv3",
+    "vulkan-headers:vulkan_headers",
+    "egl:libEGL",
+    "opengles:libGLES",
+  ]
+
+  cflags = [
+    "-g",
+    "-O0",
+    "-Wno-unused-variable",
+    "-fno-omit-frame-pointer",
+    "-Wno-nullability-completeness",
+    "-Wno-ignored-qualifiers",
+    "-Wno-switch",
+    "-Wno-header-hygiene",
+    "-Wno-inconsistent-missing-override",
+    "-Wno-global-constructors",
+    "-Wno-unused-function",
+    "-Wno-unused-private-field",
+    "-Wno-unused-lambda-capture",
+    "-Wno-unused-but-set-variable",
+  ]
+
+  ldflags = [
+    "-Wl,--allow-multiple-definition",
+  ]
+
+  resource_config_file =
+      "//foundation/graphic/graphic_3d/lume/LumeGS/test/gsedit_unit_test/resource/ohos_test.xml"
+
+  part_name = "graphic_3d"
+  subsystem_name = "graphic"
+}

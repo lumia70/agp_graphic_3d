@@ -416,7 +416,7 @@ UNIT_TEST_F(API_SceneApiTest, CreateComponent, testing::ext::TestSize.Level1)
     // Create a new component (unknown to ScenePlugin)
     auto component = scene.CreateComponent(camera, "LightComponent");
     auto properties = META_NS::Metadata(component).GetProperties();
-    EXPECT_EQ(properties.size(), 14);
+    EXPECT_EQ(properties.size(), 15);
 
     EXPECT_THAT(properties, ::testing::Contains(NameMatcher("Type")));
     EXPECT_THAT(properties, ::testing::Contains(NameMatcher("ShadowLayerMask")));

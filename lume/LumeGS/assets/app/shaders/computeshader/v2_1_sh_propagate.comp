@@ -1,0 +1,113 @@
+#version 460 core
+#extension GL_ARB_separate_shader_objects : enable
+#define V21_COMPUTE_SHADER 1
+#define V21_PROFILE_SH_PROPAGATE 1
+#include "common/v2_1_gaussian.glsl"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+bool PropagationEdge(uint a, uint b)
+{
+    if (a == b || b >= v21.counts.x || states[b].cumulativeMask != 0u ||
+        states[a].protectionMask != 0u || states[b].protectionMask != 0u ||
+        projected[b].centerDepth.w < 0.5 || analysis[a].features.detailProtection > v21.graph1.z ||
+        analysis[b].features.detailProtection > v21.graph1.z) {
+        return false;
+    }
+    float distance3d = distance(V21Position(a), V21Position(b));
+    float distanceLimit = min(v21.graph0.x,
+        v21.graph0.y * (projected[a].extentScale.z + projected[b].extentScale.z) + v21.graph0.z);
+    float screenLimit = v21.graph1.x * (projected[a].extentScale.w + projected[b].extentScale.w) + v21.graph1.y;
+    float relativeDepth = abs(projected[a].centerDepth.z - projected[b].centerDepth.z) /
+        max(min(projected[a].centerDepth.z, projected[b].centerDepth.z), 1.0e-6);
+    return distance3d <= distanceLimit &&
+        distance(projected[a].centerDepth.xy, projected[b].centerDepth.xy) <= screenLimit &&
+        relativeDepth <= v21.graph0.w;
+}
+
+void InsertSeed(uint seed, float distanceValue, inout uint seeds[3], inout float distances[3])
+{
+    if (distanceValue >= distances[2]) {
+        return;
+    }
+    uint position = 2u;
+    while (position > 0u && distanceValue < distances[position - 1u]) {
+        distances[position] = distances[position - 1u];
+        seeds[position] = seeds[position - 1u];
+        --position;
+    }
+    distances[position] = distanceValue;
+    seeds[position] = seed;
+}
+
+float MedianThree(float a, float b, float c)
+{
+    return max(min(a, b), min(max(a, b), c));
+}
+
+void main()
+{
+    uint compactIndex = gl_GlobalInvocationID.x;
+    if (compactIndex >= globals.compactCount || v21.counts.w == 0u) {
+        return;
+    }
+    uint id = compactEntries[compactIndex].weakGaussianIndex;
+    if (states[id].protectionMask != 0u || states[id].currentDepthMask != 0u ||
+        analysis[id].features.weakEvidence < 0.5 ||
+        analysis[id].evidence.validFootprintSamples < uint(v21.sampleGates.x) ||
+        analysis[id].evidence.frontFootprintSamples < uint(v21.sampleGates.y) ||
+        analysis[id].features.footprintFrontQ75 < v21.sampleGates.z) {
+        return;
+    }
+    uint nearestSeeds[3] = uint[3](V21_INVALID_ID, V21_INVALID_ID, V21_INVALID_ID);
+    float spatialDistances[3] = float[3](3.4028234e38, 3.4028234e38, 3.4028234e38);
+    ivec3 cell = V21Cell(V21Position(id));
+    for (int dz = -1; dz <= 1; ++dz) {
+        for (int dy = -1; dy <= 1; ++dy) {
+            for (int dx = -1; dx <= 1; ++dx) {
+                ivec3 queryCell = cell + ivec3(dx, dy, dz);
+                uint neighbor = hashBuckets[V21HashCell(queryCell)].head;
+                uint visits = 0u;
+                while (neighbor != V21_INVALID_ID && visits < 512u) {
+                    uint next = states[neighbor].hashNext;
+                    bool sameCell = all(equal(V21Cell(V21Position(neighbor)), queryCell));
+                    if (states[neighbor].currentSeedMask != 0u && sameCell &&
+                        PropagationEdge(id, neighbor) &&
+                        (nearestSeeds[0] == V21_INVALID_ID ||
+                            PropagationEdge(nearestSeeds[0], neighbor))) {
+                        InsertSeed(neighbor, distance(V21Position(id), V21Position(neighbor)),
+                            nearestSeeds, spatialDistances);
+                    }
+                    neighbor = next;
+                    ++visits;
+                }
+            }
+        }
+    }
+    if (nearestSeeds[1] == V21_INVALID_ID) {
+        return; // a component represented by only one immutable seed never propagates.
+    }
+    uint thirdSeed = nearestSeeds[2] == V21_INVALID_ID ? nearestSeeds[1] : nearestSeeds[2];
+    float candidateDistances[3] = float[3](
+        V21NormalizedShDistance(id, nearestSeeds[0]),
+        V21NormalizedShDistance(id, nearestSeeds[1]),
+        V21NormalizedShDistance(id, thirdSeed));
+    float candidateDistance = MedianThree(candidateDistances[0], candidateDistances[1], candidateDistances[2]);
+
+    float pairDistances[3] = float[3](
+        V21NormalizedShDistance(nearestSeeds[0], nearestSeeds[1]),
+        V21NormalizedShDistance(nearestSeeds[0], thirdSeed),
+        V21NormalizedShDistance(nearestSeeds[1], thirdSeed));
+    float pairMedian = MedianThree(pairDistances[0], pairDistances[1], pairDistances[2]);
+    float pairMad = MedianThree(abs(pairDistances[0] - pairMedian),
+        abs(pairDistances[1] - pairMedian), abs(pairDistances[2] - pairMedian));
+    float q90 = max(pairDistances[0], max(pairDistances[1], pairDistances[2]));
+    float threshold = clamp(q90 + v21.shLimits.w * pairMad, v21.shLimits.y, v21.shLimits.z);
+    float affinity = clamp(1.0 - candidateDistance / max(threshold, 1.0e-6), 0.0, 1.0);
+    analysis[id].features.shAffinity = affinity;
+    analysis[id].features.propagationConfidence = affinity *
+        clamp(analysis[id].features.footprintFrontQ75 / max(v21.sampleGates.z, 1.0e-6), 0.0, 1.0);
+    if (candidateDistance <= threshold) {
+        states[id].currentPropagatedMask = 1u;
+    }
+}

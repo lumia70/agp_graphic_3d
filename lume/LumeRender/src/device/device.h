@@ -32,6 +32,7 @@
 #include <render/device/pipeline_state_desc.h>
 #include <render/namespace.h>
 #include <render/resource_handle.h>
+#include <render/util/intf_render_frame_util.h>
 
 #include "device/shader_manager.h"
 #include "device/swapchain.h"
@@ -102,6 +103,23 @@ public:
 
     // Allow parallel render node processing  (on GLES checks that coherent mapping allowed)
     virtual bool AllowThreadedProcessing() const = 0;
+
+    virtual bool CanImportNativeFence() const
+    {
+        return false;
+    }
+
+    virtual bool CanExportNativeFence() const
+    {
+        return false;
+    }
+
+    // signaled is the flag of the frame's SignalData
+    virtual IRenderFrameUtil::NativeFence ExportNativeFence(
+        [[maybe_unused]] const GpuSemaphore& semaphore, [[maybe_unused]] bool signaled) const
+    {
+        return {IRenderFrameUtil::ExportResult::NOT_SUPPORTED, -1};
+    }
 
     // Generally set once to true when device is created.
     // Set to false e.g. when device is lost.

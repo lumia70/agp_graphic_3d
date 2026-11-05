@@ -25,6 +25,7 @@
 #include "device/gpu_resource_manager.h"
 #include "device/shader_manager.h"
 #include "device/shader_module.h"
+#include "gles/egl_functions.h"
 #include "gles/gl_functions.h"
 #include "gles/gpu_buffer_gles.h"
 #include "gles/gpu_image_gles.h"
@@ -40,6 +41,7 @@
 #include "gles/swapchain_gles.h"
 #include "render_context.h"
 #include "util/log.h"
+#include "util/native_fence_fd.h"
 
 using namespace BASE_NS;
 
@@ -3063,6 +3065,140 @@ void DeviceGLES::BindElementBuffer(uint32_t buffer)
 bool DeviceGLES::AllowThreadedProcessing() const
 {
     return HasExtension(EXT_BUFFER_STORAGE);
+}
+
+bool DeviceGLES::CanImportNativeFence() const
+{
+#if RENDER_HAS_GLES_BACKEND
+    return static_cast<const DevicePlatformDataGLES&>(eglState_.GetPlatformData()).hasNativeFenceSyncExt;
+#else
+    return false;  // desktop GL has no native fence sync
+#endif
+}
+
+bool DeviceGLES::CanExportNativeFence() const
+{
+    // the same extension creates the exportable signal fences
+    return CanImportNativeFence();
+}
+
+#if RENDER_HAS_GLES_BACKEND && defined(EGL_KHR_fence_sync) && defined(EGL_ANDROID_native_fence_sync) && \
+    defined(EGL_KHR_wait_sync)
+#define RENDER_GLES_NATIVE_FENCE_AVAILABLE 1
+#else
+#define RENDER_GLES_NATIVE_FENCE_AVAILABLE 0
+#endif
+
+#if RENDER_GLES_NATIVE_FENCE_AVAILABLE
+namespace {
+// nothing of the frame is queued yet, so a CPU wait still synchronizes it
+DeviceGLES::NativeFenceWait ClientWaitNativeFenceSync(EGLDisplay display, EGLSyncKHR sync)
+{
+    constexpr EGLTimeKHR timeoutNs = static_cast<EGLTimeKHR>(NATIVE_FENCE_CPU_WAIT_TIMEOUT_MS) * 1000000ULL;
+    const EGLint status = eglClientWaitSyncKHR(display, sync, 0, timeoutNs);
+    if (status == EGL_CONDITION_SATISFIED_KHR) {
+        return DeviceGLES::NativeFenceWait::CPU_WAITED;
+    }
+    if (status == EGL_TIMEOUT_EXPIRED_KHR) {
+        PLUGIN_LOG_W("native fence did not signal within %u ms, the frame is not synchronized against it",
+            NATIVE_FENCE_CPU_WAIT_TIMEOUT_MS);
+    } else {
+        PLUGIN_LOG_W("eglClientWaitSyncKHR failed %d, the frame is not synchronized against it", eglGetError());
+    }
+    return DeviceGLES::NativeFenceWait::FAILED;
+}
+}  // namespace
+#endif
+
+DeviceGLES::PlatformGpuFence DeviceGLES::CreatePlatformGpuFence()
+{
+    PlatformGpuFence fence;
+#if RENDER_GLES_NATIVE_FENCE_AVAILABLE
+    const auto& platData = static_cast<const DevicePlatformDataGLES&>(eglState_.GetPlatformData());
+    if (!platData.hasNativeFenceSyncExt) {
+        return fence;
+    }
+    fence.nativeFence = true;
+    // no native fence fd attribute, so EGL owns the fd and it can be duplicated out later
+    EGLSyncKHR sync = eglCreateSyncKHR(platData.display, EGL_SYNC_NATIVE_FENCE_ANDROID, nullptr);
+    if (sync == EGL_NO_SYNC_KHR) {
+        PLUGIN_LOG_E("eglCreateSyncKHR EGL_SYNC_NATIVE_FENCE_ANDROID failed %d", eglGetError());
+        return fence;
+    }
+    // the fd is not available before the sync is queued into the command stream
+    glFlush();
+    fence.handle = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(sync));
+#endif
+    return fence;
+}
+
+void DeviceGLES::DestroyPlatformGpuFence(const PlatformGpuFence& fence)
+{
+#if RENDER_GLES_NATIVE_FENCE_AVAILABLE
+    if (!fence.nativeFence || !fence.handle) {
+        return;
+    }
+    const auto& platData = static_cast<const DevicePlatformDataGLES&>(eglState_.GetPlatformData());
+    eglDestroySyncKHR(platData.display, reinterpret_cast<EGLSyncKHR>(static_cast<uintptr_t>(fence.handle)));
+#endif
+}
+
+IRenderFrameUtil::NativeFence DeviceGLES::ExportNativeFence(const GpuSemaphore& semaphore, const bool signaled) const
+{
+    using ExportResult = IRenderFrameUtil::ExportResult;
+    const auto& semaphorePlat = static_cast<const GpuSemaphoreGles&>(semaphore).GetPlatformData();
+    // the frame did run, but creating its native fence failed
+    if (semaphorePlat.nativeFence && (semaphorePlat.sync == 0U)) {
+        return {ExportResult::FAILED, -1};
+    }
+    if (!signaled) {
+        return {ExportResult::NOT_SIGNALED, -1};
+    }
+    // a GLsync has no descriptor
+    if (!semaphorePlat.nativeFence) {
+        return {ExportResult::NOT_SUPPORTED, -1};
+    }
+#if RENDER_GLES_NATIVE_FENCE_AVAILABLE
+    // needs only the display, so no context has to be current on the calling thread
+    const auto& platData = static_cast<const DevicePlatformDataGLES&>(eglState_.GetPlatformData());
+    const EGLint fd = eglDupNativeFenceFDANDROID(
+        platData.display, reinterpret_cast<EGLSyncKHR>(static_cast<uintptr_t>(semaphorePlat.sync)));
+    if (fd == EGL_NO_NATIVE_FENCE_FD_ANDROID) {
+        PLUGIN_LOG_E("eglDupNativeFenceFDANDROID failed %d", eglGetError());
+        return {ExportResult::FAILED, -1};
+    }
+    return {ExportResult::EXPORTED, static_cast<int32_t>(fd)};
+#else
+    return {ExportResult::NOT_SUPPORTED, -1};
+#endif
+}
+
+DeviceGLES::NativeFenceWait DeviceGLES::WaitPlatformNativeFenceFd(int32_t fd)
+{
+#if RENDER_GLES_NATIVE_FENCE_AVAILABLE
+    const auto& platData = static_cast<const DevicePlatformDataGLES&>(eglState_.GetPlatformData());
+    if (!platData.hasNativeFenceSyncExt || (fd < 0)) {
+        return NativeFenceWait::UNSUPPORTED;
+    }
+    // eglCreateSyncKHR takes ownership of the fd on success, so every later result consumes it
+    EGLint attribs[] = {EGL_SYNC_NATIVE_FENCE_FD_ANDROID, fd, EGL_NONE};
+    EGLSyncKHR sync = eglCreateSyncKHR(platData.display, EGL_SYNC_NATIVE_FENCE_ANDROID, attribs);
+    if (sync == EGL_NO_SYNC_KHR) {
+        PLUGIN_LOG_E("eglCreateSyncKHR from native fence fd failed %d", eglGetError());
+        return NativeFenceWait::UNSUPPORTED;
+    }
+    auto result = NativeFenceWait::QUEUED;
+    if (eglWaitSyncKHR(platData.display, sync, 0) == EGL_FALSE) {
+        PLUGIN_LOG_E("eglWaitSyncKHR failed %d, waiting on the CPU instead", eglGetError());
+        result = ClientWaitNativeFenceSync(platData.display, sync);
+    }
+    // the wait is queued or done, the sync object is no longer needed
+    eglDestroySyncKHR(platData.display, sync);
+    return result;
+#else
+    PLUGIN_UNUSED(fd);
+    return NativeFenceWait::UNSUPPORTED;
+#endif
 }
 
 unique_ptr<GpuBuffer> DeviceGLES::CreateGpuBuffer(const GpuBufferDesc& desc)

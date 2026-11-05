@@ -1,0 +1,84 @@
+#version 460 core
+#extension GL_ARB_separate_shader_objects : enable
+#extension GL_ARB_shading_language_420pack : enable
+
+// includes
+#include "3d/shaders/common/3d_dm_structures_common.h"
+#include "common/gs_struct_common.h"
+#include "common/gs_common.h"
+
+#define LUME_GS_EDIT_LAYOUT 1
+#include "common/gs_edit_common.h"
+
+/*
+layout(set = 0, binding = 0, std430) readonly restrict buffer inGSData
+{
+    // read-only input GS data
+    GsSplatData gsData[];
+};
+
+layout(set = 0, binding = 1, std430) restrict buffer editGsData0Buffer
+{
+    // read-write GS data used during editin, ping-pong
+    GsSplatData editGsData0[];
+};
+
+layout(set = 0, binding = 2, std430) restrict buffer editGsData1Buffer
+{
+    // read-write GS data used during editin, ping-pong
+    GsSplatData editGsData1[];
+};
+
+layout(set = 0, binding = 3, std430) restrict buffer selectionIndexBuffer
+{
+    // mask for selecting splats, write in selection shaders, read everywhere else
+    uint selectionMask[];
+};
+
+layout(set = 0, binding = 4, std430) restrict buffer indirectDispatchCounterBuffer
+{
+    // counter and indirect args to keep track of splat counts during editing
+    IndirectEditDispatchCounterBuffer indirectCounter;
+};
+
+layout(set = 0, binding = 5, std430) readonly restrict buffer actionDataStructBuffer
+{
+    ActionCameraDataStruct actionDataStruct[];
+};
+
+layout(set = 0, binding = 6, std140) readonly uniform uCameraMatrices
+{
+    // camera data
+    GsCameraUboStruct cameraUbo;
+};
+
+layout(set = 0, binding = 7, std140) readonly uniform uGSDynamicDataBuffer
+{
+    // per-GS model data, like model matrices
+    GsDynamicDataStruct gsDynamicDatas[GS_MAX_NUM_GS_OBJECTS];
+};
+
+*/
+
+layout(push_constant, std430) uniform uEditPushConstant {
+    GsEditPushConstantData uPc;
+};
+
+layout(local_size_x = GS_EDIT_WORKGROUP_SIZE, local_size_y = 1, local_size_z = 1) in;
+void main()
+{
+    const uint globalId = gl_GlobalInvocationID.x;
+
+    const uint maskValue = selectionMask[globalId + 1u];
+
+    if (globalId < indirectCounter.counter) {
+        selectionMask[globalId + 1u] = maskValue == 1u ? 0u : 1u;
+
+        if (maskValue == 0u) {
+            // the inverted splat will be selected, increment counter
+            atomicAdd(selectionMask[0], 1u);
+        }
+    } else {
+        selectionMask[globalId + 1] = 0u;
+    }
+}

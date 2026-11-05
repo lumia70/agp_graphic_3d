@@ -1378,6 +1378,46 @@ bool DeviceVk::AllowThreadedProcessing() const
     return true;
 }
 
+bool DeviceVk::CanImportNativeFence() const
+{
+    return extFunctions_.vkImportSemaphoreFdKHR != nullptr;
+}
+
+bool DeviceVk::CanExportNativeFence() const
+{
+    return extFunctions_.vkGetSemaphoreFdKHR != nullptr;
+}
+
+IRenderFrameUtil::NativeFence DeviceVk::ExportNativeFence(const GpuSemaphore& semaphore, const bool signaled) const
+{
+    using ExportResult = IRenderFrameUtil::ExportResult;
+    const auto& semaphorePlat = static_cast<const GpuSemaphoreVk&>(semaphore).GetPlatformData();
+    if ((!extFunctions_.vkGetSemaphoreFdKHR) || (!semaphorePlat.exportable)) {
+        return {ExportResult::NOT_SUPPORTED, -1};
+    }
+    // SYNC_FD export needs a pending or completed signal operation
+    if (!signaled) {
+        return {ExportResult::NOT_SIGNALED, -1};
+    }
+    const VkSemaphoreGetFdInfoKHR getFdInfo{
+        VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR,    // sType
+        nullptr,                                        // pNext
+        semaphorePlat.semaphore,                        // semaphore
+        VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT,  // handleType
+    };
+    int fd = -1;
+    const VkResult result = extFunctions_.vkGetSemaphoreFdKHR(plat_.device, &getFdInfo, &fd);
+    if (result != VK_SUCCESS) {
+        PLUGIN_LOG_E("vkGetSemaphoreFdKHR failed %d", static_cast<int32_t>(result));
+        return {ExportResult::FAILED, -1};
+    }
+    // fd -1 with VK_SUCCESS means the payload has already signaled
+    if (fd < 0) {
+        return {ExportResult::ALREADY_SIGNALED, -1};
+    }
+    return {ExportResult::EXPORTED, static_cast<int32_t>(fd)};
+}
+
 const DeviceVk::FeatureConfigurations& DeviceVk::GetFeatureConfigurations() const
 {
     return featureConfigurations_;

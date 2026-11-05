@@ -1525,8 +1525,7 @@ void RenderBackendMln::ReclaimCompletedFrames()
         waitDesc.timelineCount = 1;
         waitDesc.timelines = &submitTimeline_;
         waitDesc.values = &oldest.timelineValue;
-        constexpr uint64_t RECLAIM_WAIT_TIMEOUT_NS = 5000000000ULL;  // 5 seconds
-        MlnStatus waitResult = MlnWaitForTimelines(mlnDevice, &waitDesc, RECLAIM_WAIT_TIMEOUT_NS);
+        MlnStatus waitResult = MlnWaitForTimelines(mlnDevice, &waitDesc, UINT64_MAX);
         if (waitResult == MLN_STATUS_TIMEOUT) {
             MLN_LOG_ERR("ReclaimCompletedFrames: TIMEOUT 5s waiting for frame (timelineValue=%llu) — "
                         "force-destroying %zu SGs, %zu DGs, %zu OGs, %zu RTs",
