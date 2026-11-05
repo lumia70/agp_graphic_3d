@@ -74,7 +74,10 @@
 #endif
 
 // Rofs Data.
-extern "C" const void* const GS_BIN[];
+// The standalone LumeApp build embeds the blob as a plain byte array
+// (LumeApp/tools/gs_assets/pack_gs_rofs.py); upstream emits an object whose
+// symbol convention differs, so the array form is declared here.
+extern "C" const unsigned char GS_BIN[];
 extern "C" const uint64_t GS_BIN_SIZE;
 
 CORE_BEGIN_NAMESPACE()
