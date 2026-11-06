@@ -1506,6 +1506,20 @@ void DrawFrame()
 
     PollGsRenderPath();
 
+    // LumeGS renders with the scene main camera, not with the custom node's
+    // shared camera data: keep the scene camera in sync with the orbit camera.
+    if (g_renderPath == 1 && g_lume.ecs && g_cameraEntity != CORE_NS::Entity {} &&
+        g_lume.graphicsContext) {
+        float ex = 0.0f;
+        float ey = 0.0f;
+        float ez = 0.0f;
+        g_orbitCam.GetPosition(ex, ey, ez);
+        g_lume.graphicsContext->GetSceneUtil().CameraLookAt(*g_lume.ecs, g_cameraEntity,
+            { ex, ey, ez },
+            { g_orbitCam.targetX, g_orbitCam.targetY, g_orbitCam.targetZ },
+            { g_orbitCam.upX, g_orbitCam.upY, g_orbitCam.upZ });
+    }
+
     // GsSystem creates the splat render targets from the main camera's
     // renderResolution. The camera is created during engine init, when the
     // surface size is still unknown, so refresh it once the real size is known

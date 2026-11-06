@@ -7,7 +7,7 @@ struct Index {
   private intervalId: number = -1;
   // Order must match kDemoModels[] in render_main.cpp.
   @State modelIndex: number = 3;
-  @State firstPerson: boolean = true;
+  @State firstPerson: boolean = false;
   @State budgetIndex: number = 1;
 
   private static readonly MODELS: string[] = [
