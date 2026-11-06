@@ -6,7 +6,7 @@ struct Index {
   private xComponentId: string = 'lumeapp_xcomponent';
   private intervalId: number = -1;
   // Order must match kDemoModels[] in render_main.cpp.
-  @State modelIndex: number = 4;
+  @State modelIndex: number = 3;
   @State firstPerson: boolean = true;
   @State budgetIndex: number = 1;
 

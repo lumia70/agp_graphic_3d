@@ -411,6 +411,10 @@ void GsSystem::Uninitialize()
 
 bool GsSystem::Update(bool frameRenderingQueued, uint64_t time, uint64_t delta)
 {
+    static uint32_t diagUpd = 0;
+    if (((++diagUpd) % 120u) == 0u) {
+        CORE_LOG_E("GS diag: Update called (active=%{public}d)", active_ ? 1 : 0);
+    }
     frameRenderingQueued = false;
     if (!active_) {
         return frameRenderingQueued;

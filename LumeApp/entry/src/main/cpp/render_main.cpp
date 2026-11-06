@@ -34,6 +34,8 @@
 #include <3d/ecs/components/transform_component.h>
 #include <plugin_gs/ecs/components/gs_component.h>
 #include <plugin_gs/ecs/components/gs_configuration_component.h>
+#include <plugin_gs/ecs/systems/gs_system.h>
+#include <plugin_gs/ecs/systems/intf_gs_tiling_system.h>
 #include "gaussian_splat_data.h"
 
 // --- LumeBase ---
@@ -893,7 +895,7 @@ static const DemoModelConfig kDemoModels[] = {
     { "", 60.0f, 0.0f, 0.0f, false, {}, {}, {}, {}, 0.0f, 0.0f, "lod/syp_uav_0611" },
 };
 static constexpr int kDemoModelCount = (int)(sizeof(kDemoModels) / sizeof(kDemoModels[0]));
-static int g_modelIndex = 4;  // LOD scene by default (must track kDemoModels order)
+static int g_modelIndex = 3;  // doll.glb by default (must track kDemoModels order)
 static int g_pendingModelIndex = -1;  // set from ArkTS, applied on the render thread
 static int g_pendingCameraMode = -1;  // -1 = use the model default, 0 = orbit, 1 = first person
 // LOD splat budget, switchable from ArkTS (dropdown) and remembered across model
@@ -1019,6 +1021,8 @@ static void SetFirstPerson(bool enabled)
 static int g_renderPath = 1;
 static CORE_NS::Entity g_gsConfigEntity {};
 static RENDER_NS::RenderHandleReference g_gsRngHandle;
+static BASE_NS::string g_gsModelFile { "doll.glb" };
+static bool g_gsModelDirty = false;
 static CORE_NS::Entity g_gsModelEntity {};
 static uint32_t g_gsLogCounter = 0;
 
@@ -1028,6 +1032,13 @@ static void InitGsRenderPath(const char* modelFile)
         return;
     }
     auto& ecs = *g_lume.ecs;
+    {
+        auto* gsSys = CORE_NS::GetSystem<GS::IGsSystem>(ecs);
+        auto* tileSys = CORE_NS::GetSystem<GS::IGsTilingSystem>(ecs);
+        const auto systems = ecs.GetSystems();
+        LOGI("GS path: systems=%{public}zu gsSystem=%{public}d tilingSystem=%{public}d",
+            systems.size(), gsSys != nullptr, tileSys != nullptr);
+    }
     auto* cfgMgr = CORE_NS::GetManager<GS::IGsConfigurationComponentManager>(ecs);
     auto* gsMgr = CORE_NS::GetManager<GS::IGsComponentManager>(ecs);
     auto* tfMgr = CORE_NS::GetManager<CORE3D_NS::ITransformComponentManager>(ecs);
@@ -1082,8 +1093,23 @@ static void PollGsRenderPath()
         return;
     }
     if (g_gsModelEntity == CORE_NS::Entity {}) {
-        InitGsRenderPath("doll.glb");  // first frame after the ECS exists
+        InitGsRenderPath(g_gsModelFile.c_str());  // first frame after the ECS exists
         return;
+    }
+    if (g_gsModelDirty) {
+        g_gsModelDirty = false;
+        auto* gsMgr = CORE_NS::GetManager<GS::IGsComponentManager>(*g_lume.ecs);
+        if (gsMgr) {
+            gsMgr->Destroy(g_gsModelEntity);
+            gsMgr->Create(g_gsModelEntity);
+            if (auto gs = gsMgr->Write(g_gsModelEntity)) {
+                const BASE_NS::string uri =
+                    BASE_NS::string("file://") + g_filesDir.c_str() + "/assets/" + g_gsModelFile.c_str();
+                gs->gsPath = uri;
+                gs->computeLods = false;
+                LOGI("GS path: switching to '%{public}s'", uri.c_str());
+            }
+        }
     }
     auto* gsMgr = CORE_NS::GetManager<GS::IGsComponentManager>(*g_lume.ecs);
     if (!gsMgr) {
@@ -1092,6 +1118,12 @@ static void PollGsRenderPath()
     auto gs = gsMgr->Read(g_gsModelEntity);
     if (!gs || ((++g_gsLogCounter) % 60u) != 0u) {
         return;
+    }
+    {
+        auto* gsSys = CORE_NS::GetSystem<GS::IGsSystem>(*g_lume.ecs);
+        auto* tileSys = CORE_NS::GetSystem<GS::IGsTilingSystem>(*g_lume.ecs);
+        LOGI("GS path: systems=%{public}zu gsSystem=%{public}d tilingSystem=%{public}d",
+            g_lume.ecs->GetSystems().size(), gsSys != nullptr, tileSys != nullptr);
     }
     LOGI("GS path: loaded=%{public}d primitiveValid=%{public}d", gs->isLoaded ? 1 : 0,
         gs->isPrimitiveValid ? 1 : 0);
@@ -1487,7 +1519,14 @@ void DrawFrame()
             lastH = (uint32_t)g_lume.height;
             g_lume.graphicsContext->GetSceneUtil().UpdateCameraViewport(
                 *g_lume.ecs, g_cameraEntity, { lastW, lastH });
-            LOGI("GS path: camera render resolution %ux%u", lastW, lastH);
+            // GsSystem reads CameraComponent::renderResolution (not the viewport)
+            // to size the splat render targets; set it explicitly.
+            if (auto* camMgr = CORE_NS::GetManager<CORE3D_NS::ICameraComponentManager>(*g_lume.ecs)) {
+                if (auto camHandle = camMgr->Write(g_cameraEntity)) {
+                    camHandle->renderResolution = { lastW, lastH };
+                }
+            }
+            LOGI("GS path: camera render resolution %{public}u x %{public}u", lastW, lastH);
         }
     }
 
@@ -1866,6 +1905,12 @@ static napi_value NapiSetModel(napi_env env, napi_callback_info info)
         // Accept either the full file name ("doll.glb") or the short name ("doll").
         if (name == file || (name.size() >= 3 && file.compare(0, name.size(), name) == 0)) {
             g_pendingModelIndex = i;
+            if (g_renderPath == 1 && kDemoModels[i].scene == nullptr) {
+                // LumeGS renders one model at a time; follow the dropdown for
+                // single-model entries (the LOD scene needs the tiling path).
+                g_gsModelFile = file.c_str();
+                g_gsModelDirty = true;
+            }
             LOGI("setModel: %{public}s -> index %{public}d", name.c_str(), i);
             return nullptr;
         }
