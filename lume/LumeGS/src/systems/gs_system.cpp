@@ -412,8 +412,9 @@ void GsSystem::Uninitialize()
 bool GsSystem::Update(bool frameRenderingQueued, uint64_t time, uint64_t delta)
 {
     static uint32_t diagUpd = 0;
-    if (((++diagUpd) % 120u) == 0u) {
-        CORE_LOG_E("GS diag: Update called (active=%{public}d)", active_ ? 1 : 0);
+    ++diagUpd;
+    if (diagUpd <= 5u || (diagUpd % 300u) == 0u) {
+        CORE_LOG_E("GS diag: update called %d", (int)diagUpd);
     }
     frameRenderingQueued = false;
     if (!active_) {
@@ -845,10 +846,11 @@ bool GsSystem::Update(bool frameRenderingQueued, uint64_t time, uint64_t delta)
     {
         static uint32_t diagRt = 0;
         if (((++diagRt) % 120u) == 0u) {
-            CORE_LOG_E("GS diag(sys): res=%{public}u x %{public}u prev=%{public}u x %{public}u scale=0x%{public}x hostValid=%{public}d prims=%{public}zu",
-                renderResolutionFromCC_.x, renderResolutionFromCC_.y, previousResolution_.x, previousResolution_.y,
-                dataStoreGs_->GetGsScaleFactor(), EntityUtil::IsValid(renderTargetHostEntity_) ? 1 : 0,
-                dataStoreGs_->GetGsPrimitives().size());
+            CORE_LOG_E("GS diag sys: res=%d,%d prev=%d,%d scale=%d host=%d prims=%d",
+                (int)renderResolutionFromCC_.x, (int)renderResolutionFromCC_.y, (int)previousResolution_.x,
+                (int)previousResolution_.y, (int)dataStoreGs_->GetGsScaleFactor(),
+                EntityUtil::IsValid(renderTargetHostEntity_) ? 1 : 0,
+                (int)dataStoreGs_->GetGsPrimitives().size());
         }
     }
     // Check if render targets need rebuild based on effective render size
@@ -857,7 +859,12 @@ bool GsSystem::Update(bool frameRenderingQueued, uint64_t time, uint64_t delta)
     const Math::UVec2 effectiveRenderSize = Math::UVec2(
         static_cast<uint32_t>(renderResolutionFromCC_.x / upscaleRatio),
         static_cast<uint32_t>(renderResolutionFromCC_.y / upscaleRatio));
-    if (effectiveRenderSize != previousResolution_ && dataStoreGs_->GetGsScaleFactor() != 0xFFFFffffu) {
+    // Also (re)create when the render data has no targets yet: the first pass
+    // creates them into the temporary load render data, and those handles are
+    // not carried over to the primitive's render data, so the effective size
+    // check alone leaves them null forever.
+    if ((effectiveRenderSize != previousResolution_ || !renderData->gaussianRenderTarget0) &&
+        dataStoreGs_->GetGsScaleFactor() != 0xFFFFffffu) {
         RemoveGsRenderTargets(renderData, renderTargetHostEntity_, loadCtx);
         // Pass original output resolution to avoid precision loss in target1 creation
         GS::CreateGsRenderTargets(renderData, renderTargetHostEntity_, loadCtx, renderResolutionFromCC_, true);
