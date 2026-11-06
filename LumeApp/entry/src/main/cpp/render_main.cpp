@@ -27,6 +27,13 @@
 #include "splat_loader.h"
 #include "sog_loader.h"
 #include "lod_streamer.h"
+
+// LumeGS render path (isolated from the legacy custom splat pipeline). For now
+// it only loads the model through the plugin's ECS components so the loading
+// pipeline can be validated; the render node is wired next.
+#include <3d/ecs/components/transform_component.h>
+#include <plugin_gs/ecs/components/gs_component.h>
+#include <plugin_gs/ecs/components/gs_configuration_component.h>
 #include "gaussian_splat_data.h"
 
 // --- LumeBase ---
@@ -1008,6 +1015,72 @@ static void SetFirstPerson(bool enabled)
 }
 
 // ---- LOD scene streaming ----
+// Render path selector: 0 = legacy custom splat pipeline, 1 = LumeGS.
+static int g_renderPath = 1;
+static CORE_NS::Entity g_gsConfigEntity {};
+static CORE_NS::Entity g_gsModelEntity {};
+static uint32_t g_gsLogCounter = 0;
+
+static void InitGsRenderPath(const char* modelFile)
+{
+    if (!g_lume.ecs) {
+        return;
+    }
+    auto& ecs = *g_lume.ecs;
+    auto* cfgMgr = CORE_NS::GetManager<GS::IGsConfigurationComponentManager>(ecs);
+    auto* gsMgr = CORE_NS::GetManager<GS::IGsComponentManager>(ecs);
+    auto* tfMgr = CORE_NS::GetManager<CORE3D_NS::ITransformComponentManager>(ecs);
+    if (!cfgMgr || !gsMgr || !tfMgr) {
+        LOGE("GS path: component managers missing (cfg=%d gs=%d tf=%d)", cfgMgr != nullptr,
+            gsMgr != nullptr, tfMgr != nullptr);
+        return;
+    }
+    if (g_gsConfigEntity == CORE_NS::Entity {}) {
+        g_gsConfigEntity = ecs.GetEntityManager().Create();
+        cfgMgr->Create(g_gsConfigEntity);
+        if (auto cfg = cfgMgr->Write(g_gsConfigEntity)) {
+            cfg->useGpuSort = true;
+        }
+        LOGI("GS path: configuration entity created");
+    }
+    if (g_gsModelEntity == CORE_NS::Entity {}) {
+        g_gsModelEntity = ecs.GetEntityManager().Create();
+        tfMgr->Create(g_gsModelEntity);
+        if (auto tf = tfMgr->Write(g_gsModelEntity)) {
+            tf->position = { 0.0f, 0.0f, 0.0f };
+            tf->scale = { 1.0f, 1.0f, 1.0f };
+        }
+        gsMgr->Create(g_gsModelEntity);
+    }
+    if (auto gs = gsMgr->Write(g_gsModelEntity)) {
+        const BASE_NS::string uri = BASE_NS::string("file://") + g_filesDir.c_str() + "/assets/" + modelFile;
+        gs->gsPath = uri;
+        gs->computeLods = false;
+        LOGI("GS path: loading '%{public}s'", uri.c_str());
+    }
+}
+
+static void PollGsRenderPath()
+{
+    if (g_renderPath != 1 || !g_lume.ecs) {
+        return;
+    }
+    if (g_gsModelEntity == CORE_NS::Entity {}) {
+        InitGsRenderPath("doll.glb");  // first frame after the ECS exists
+        return;
+    }
+    auto* gsMgr = CORE_NS::GetManager<GS::IGsComponentManager>(*g_lume.ecs);
+    if (!gsMgr) {
+        return;
+    }
+    auto gs = gsMgr->Read(g_gsModelEntity);
+    if (!gs || ((++g_gsLogCounter) % 60u) != 0u) {
+        return;
+    }
+    LOGI("GS path: loaded=%{public}d primitiveValid=%{public}d", gs->isLoaded ? 1 : 0,
+        gs->isPrimitiveValid ? 1 : 0);
+}
+
 static lod::Streamer g_lodStreamer;
 static bool g_lodActive = false;
 static float g_lastLodView[16] = {};
@@ -1382,6 +1455,8 @@ void DrawFrame()
                 lod.poolSize, lod.generation);
         }
     }
+
+    PollGsRenderPath();
 
     // TickFrame updates internal time and drives all ECS systems.
     CORE_NS::IEcs* ecsArr[] = { g_lume.ecs.get() };

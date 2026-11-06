@@ -749,6 +749,7 @@ target_include_directories(lumeapp PRIVATE
     ${ENGINE_ROOT}/LumeRender/api
     ${ENGINE_ROOT}/Lume_3D/api
     ${ENGINE_ROOT}/LumeMeta/include
+    ${ENGINE_ROOT}/LumeGS/api
 )
 
 # Allow unresolved symbols from Render/3D/Meta — they are resolved at runtime via dlopen
