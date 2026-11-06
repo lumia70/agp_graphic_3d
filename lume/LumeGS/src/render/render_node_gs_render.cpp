@@ -1474,13 +1474,21 @@ void RenderNodeGsRender::PreExecuteFrame()
         CORE_LOG_E("RenderNodeGsRender: dataStoreEdit_ Created");
     }
 
+    static uint32_t diagCounter = 0;
+    const bool diagLog = ((++diagCounter) % 120u) == 0u;
     if (!dataStore_) {
+        if (diagLog) {
+            CORE_LOG_E("GS diag: data store missing (%s)", stores_.dataStoreNamePrefix.c_str());
+        }
         gsHandlesCache_.Invalidate();
         return;
     }
 
     cameraIdx_ = GetCameraIdx();
     if (cameraIdx_ == RenderSceneDataConstants::INVALID_INDEX) {
+        if (diagLog) {
+            CORE_LOG_E("GS diag: camera index INVALID");
+        }
         camerasValidCanRender_ = false;
         return;
     }
@@ -1688,6 +1696,10 @@ void RenderNodeGsRender::ExecuteFrame(RENDER_NS::IRenderCommandList& cmdList)
 
     auto& primitives = dataStore_->GetGsPrimitives();
     if (primitives.empty()) {
+        static uint32_t diagEmpty = 0;
+        if (((++diagEmpty) % 120u) == 0u) {
+            CORE_LOG_E("GS diag: no primitives in data store");
+        }
         dataStore_->SetDynamicRendering(false);
         return;
     }
@@ -1703,6 +1715,22 @@ void RenderNodeGsRender::ExecuteFrame(RENDER_NS::IRenderCommandList& cmdList)
     const bool tiledMode = renderData->isTiled && gpuSortAvailable && renderData->tilePool;
 
     if (!gsHandlesCache_.IsValid(gpuSortAvailable)) {
+        static uint32_t diagHandles = 0;
+        if (diagHandles < 4u || ((diagHandles % 120u) == 0u)) {
+            const auto& h = gsHandlesCache_;
+            CORE_LOG_E("GS diag: handles INVALID prim=%zu gpuSort=%d | cache=%d viewZ=%d idx0=%d idx1=%d "
+                       "splat=%d sh=%d rt0=%d rt1=%d rt2=%d rt3=%d rtBB=%d stat=%d samp=%d sortCnt=%d "
+                       "sort0=%d sort1=%d astc=%zu",
+                primitives.size(), gpuSortAvailable ? 1 : 0, h.dataStorageCacheHandle ? 1 : 0,
+                h.viewZStoreCacheHandle ? 1 : 0, h.gsIndicesRef ? 1 : 0, h.gsIndicesRef2 ? 1 : 0,
+                h.gsSplatData ? 1 : 0, h.gsHarmonicsDataRef ? 1 : 0, h.gaussianRenderTarget0 ? 1 : 0,
+                h.gaussianRenderTarget1 ? 1 : 0, h.gaussianRenderTarget2 ? 1 : 0,
+                h.gaussianRenderTarget3 ? 1 : 0, h.gaussianRenderTargetBB ? 1 : 0,
+                h.gaussianRenderTargetStatusUbo ? 1 : 0, h.sampler ? 1 : 0,
+                h.gpuSortBuffers.sortCountBuffer ? 1 : 0, h.gpuSortBuffers.sortKeyIndexBuffer0 ? 1 : 0,
+                h.gpuSortBuffers.sortKeyIndexBuffer1 ? 1 : 0, h.gsShASTCDataRefs.size());
+        }
+        ++diagHandles;
         dataStore_->SetDynamicRendering(false);
         return;
     }
@@ -2417,6 +2445,11 @@ void RenderNodeGsRender::RecordGaussianDraw(
     vb.byteSize = numGs * sizeof(Math::UVec4);
     cmdList.BindVertexBuffers({ vb });
 
+    static uint32_t diagDraw = 0;
+    if (((++diagDraw) % 120u) == 0u) {
+        CORE_LOG_E("GS diag: draw numGs=%u gpuSort=%d tiled=%d", numGs,
+            renderData->CanUseGpuSort() ? 1 : 0, renderData->isTiled ? 1 : 0);
+    }
     if (renderData->CanUseGpuSort() && !renderData->anyComputeLods) {
         cmdList.DrawIndirect(gpuSortIndirectDrawBuffer_.GetHandle(), 0u, 1u, 0u);
     } else {

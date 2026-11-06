@@ -1474,6 +1474,23 @@ void DrawFrame()
 
     PollGsRenderPath();
 
+    // GsSystem creates the splat render targets from the main camera's
+    // renderResolution. The camera is created during engine init, when the
+    // surface size is still unknown, so refresh it once the real size is known
+    // (and on resize).
+    if (g_renderPath == 1 && g_lume.ecs && g_cameraEntity != CORE_NS::Entity {} &&
+        g_lume.width > 0 && g_lume.height > 0) {
+        static uint32_t lastW = 0;
+        static uint32_t lastH = 0;
+        if (lastW != (uint32_t)g_lume.width || lastH != (uint32_t)g_lume.height) {
+            lastW = (uint32_t)g_lume.width;
+            lastH = (uint32_t)g_lume.height;
+            g_lume.graphicsContext->GetSceneUtil().UpdateCameraViewport(
+                *g_lume.ecs, g_cameraEntity, { lastW, lastH });
+            LOGI("GS path: camera render resolution %ux%u", lastW, lastH);
+        }
+    }
+
     // TickFrame updates internal time and drives all ECS systems.
     CORE_NS::IEcs* ecsArr[] = { g_lume.ecs.get() };
     bool needsRender = g_lume.engine->TickFrame(
