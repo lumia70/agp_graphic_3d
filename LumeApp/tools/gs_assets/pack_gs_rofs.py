@@ -40,8 +40,8 @@ def collect(repo, spv_dir, empty):
                 files[prefix + "/" + rel] = src
 
     if not empty:
-        add_tree(os.path.join(assets, "shaders", "shader"), "shader")
-        add_tree(os.path.join(assets, "shaders", "computeshader"), "computeshader")
+        add_tree(os.path.join(assets, "shaders", "shader"), "shaders/shader")
+        add_tree(os.path.join(assets, "shaders", "computeshader"), "shaders/computeshader")
         add_tree(os.path.join(assets, "pipelinelayouts"), "pipelinelayouts")
         add_tree(os.path.join(assets, "vertexinputdeclarations"), "vertexinputdeclarations")
         # Generated SPIR-V (same relative path, .spv suffix).
@@ -52,7 +52,7 @@ def collect(repo, spv_dir, empty):
                         continue
                     src = os.path.join(dirpath, name)
                     rel = os.path.relpath(src, spv_dir).replace(os.sep, "/")
-                    files[rel] = src
+                    files["shaders/" + rel] = src
     return files
 
 
