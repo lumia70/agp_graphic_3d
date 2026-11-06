@@ -359,7 +359,7 @@ target_include_directories(Lume_3D
     PRIVATE ${LUME_3D_DIR}/src
             ${LUME_3D_DIR}/assets
             ${ENGINE_ROOT}/LumeEngine/ecshelper
-            ${ENGINE_ROOT}/LumeEngine/src
+        ${ENGINE_ROOT}/LumeEngine/src
 )
 
 target_compile_definitions(Lume_3D PUBLIC
@@ -670,6 +670,7 @@ target_include_directories(LumeGS
         ${LUME_GS_DIR}/api
     PRIVATE
         ${LUME_GS_DIR}/src
+        ${ENGINE_ROOT}/LumeEngine/src
         ${LUME_GS_DIR}/assets
         ${LUME_GS_DIR}/api/plugin_gs
         ${LUME_GS_DIR}/src/loader
@@ -680,8 +681,11 @@ target_include_directories(LumeGS
         ${CMAKE_CURRENT_SOURCE_DIR}/shims
 )
 
-target_compile_definitions(LumeGS PRIVATE
-    CORE_PLUGIN=1
+# Built in static-plugin mode like LumeRender/Lume_3D: the library registers
+# itself through DEFINE_STATIC_PLUGIN() when it is loaded, so the app's
+# LoadPlugins({}) picks it up without an explicit name lookup.
+target_compile_options(LumeGS PRIVATE
+    "-DCORE_STATIC_PLUGIN_HEADER=\"static_plugin_decl.h\""
 )
 
 target_compile_options(LumeGS PRIVATE
@@ -725,6 +729,7 @@ set_source_files_properties(gaussian_splat_data.cpp
 
 target_link_libraries(lumeapp PUBLIC
     LumeEngine
+    LumeGS
     LumeBase
     libace_napi.z.so
     libace_ndk.z.so

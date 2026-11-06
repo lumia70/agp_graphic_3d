@@ -37,6 +37,8 @@
 #include <render/intf_render_context.h>
 #include <meta/interface/intf_object_registry.h>
 
+#include CORE_STATIC_PLUGIN_HEADER
+
 #include "loader/gs_loader.h"
 #include "plugin_gs/ecs/components/gs_component.h"
 #include "plugin_gs/ecs/components/gs_configuration_component.h"
@@ -617,4 +619,8 @@ PLUGIN_DATA(GSPlugin) {
     GS::UnregisterInterfaces,
     { GS::PLUGIN_DEPENDENCIES },
 };
-}
+} // extern "C"
+
+// Static registration (CORE_STATIC_PLUGIN_HEADER): makes LoadPlugins({}) see
+// this library's plugin the same way it sees LumeRender / Lume_3D.
+DEFINE_STATIC_PLUGIN(GSPlugin);
