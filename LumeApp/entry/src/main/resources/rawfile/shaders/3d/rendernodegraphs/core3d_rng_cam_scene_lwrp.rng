@@ -46,6 +46,10 @@
             ]
         },
         {
+            "typeName": "RenderNodeGsRender",
+            "nodeName": "CORE3D_RN_CAM_GS"
+        },
+        {
             "typeName": "RenderNodeDefaultMaterialRenderSlot",
             "nodeName": "CORE3D_RN_CAM_DM_SO_LWRP",
             "renderDataStore": {

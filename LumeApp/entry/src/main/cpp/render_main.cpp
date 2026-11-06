@@ -1059,7 +1059,10 @@ static void InitGsRenderPath(const char* modelFile)
         gs->computeLods = false;
         LOGI("GS path: loading '%{public}s'", uri.c_str());
     }
-    if (!g_gsRngHandle && g_lume.renderContext) {
+    // The GS node is inserted into the camera scene RNG (see
+    // core3d_rng_cam_scene_lwrp.rng); a separate RNG runs after the scene pass
+    // and would only feed the quad stale targets.
+    if (false && !g_gsRngHandle && g_lume.renderContext) {
         auto& rngMgr = g_lume.renderContext->GetRenderNodeGraphManager();
         RENDER_NS::RenderNodeGraphDesc rngDesc {};
         rngDesc.renderNodeGraphName = "GaussianSplatGS_RNG";
