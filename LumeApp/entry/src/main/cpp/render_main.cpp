@@ -1018,6 +1018,7 @@ static void SetFirstPerson(bool enabled)
 // Render path selector: 0 = legacy custom splat pipeline, 1 = LumeGS.
 static int g_renderPath = 1;
 static CORE_NS::Entity g_gsConfigEntity {};
+static RENDER_NS::RenderHandleReference g_gsRngHandle;
 static CORE_NS::Entity g_gsModelEntity {};
 static uint32_t g_gsLogCounter = 0;
 
@@ -1057,6 +1058,18 @@ static void InitGsRenderPath(const char* modelFile)
         gs->gsPath = uri;
         gs->computeLods = false;
         LOGI("GS path: loading '%{public}s'", uri.c_str());
+    }
+    if (!g_gsRngHandle && g_lume.renderContext) {
+        auto& rngMgr = g_lume.renderContext->GetRenderNodeGraphManager();
+        RENDER_NS::RenderNodeGraphDesc rngDesc {};
+        rngDesc.renderNodeGraphName = "GaussianSplatGS_RNG";
+        RENDER_NS::RenderNodeDesc nodeDesc {};
+        nodeDesc.typeName = "RenderNodeGsRender";
+        nodeDesc.nodeName = "GsRenderNode";
+        rngDesc.nodes.push_back(BASE_NS::move(nodeDesc));
+        g_gsRngHandle = rngMgr.Create(
+            RENDER_NS::IRenderNodeGraphManager::RenderNodeGraphUsageType::RENDER_NODE_GRAPH_STATIC, rngDesc);
+        LOGI("GS path: render node graph %{public}s", g_gsRngHandle ? "valid" : "INVALID");
     }
 }
 
@@ -1477,15 +1490,20 @@ void DrawFrame()
 
         auto rngs = g_lume.graphicsContext->GetRenderNodeGraphs(*g_lume.ecs);
 
-        // Append gaussian splatting RNG if available
-        if (g_lume.splatRngHandle) {
+        // Append gaussian splatting RNGs (legacy custom node and/or LumeGS node)
+        if (g_lume.splatRngHandle || g_gsRngHandle) {
             // Build a combined list: scene RNGs + splat RNG
             BASE_NS::vector<RENDER_NS::RenderHandleReference> allRngs;
-            allRngs.reserve(rngs.size() + 1);
+            allRngs.reserve(rngs.size() + 2);
             for (size_t i = 0; i < rngs.size(); i++) {
                 allRngs.push_back(rngs[i]);
             }
-            allRngs.push_back(g_lume.splatRngHandle);
+            if (g_lume.splatRngHandle) {
+                allRngs.push_back(g_lume.splatRngHandle);
+            }
+            if (g_gsRngHandle) {
+                allRngs.push_back(g_gsRngHandle);
+            }
             g_lume.renderer->RenderFrame(
                 BASE_NS::array_view<const RENDER_NS::RenderHandleReference>(allRngs.data(), allRngs.size()));
         } else {
