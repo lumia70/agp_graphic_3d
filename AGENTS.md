@@ -94,7 +94,7 @@ Linux OHOS 产品化构建示例（从提供该脚本的完整产品源码根，
 | 新增 JS 类型、代理属性、NAPI 包装 | [ScenePluginAddon](docs/knowledge/ScenePluginAddon.md) | [kits/js](kits/js/AGENTS.md) | 类注册、对象缓存、线程安全回调、ETS 同步 |
 | ECS 组件/系统、glTF、材质、动画 | [Lume3D](docs/knowledge/Lume3D.md) | [Lume_3D](lume/Lume_3D/AGENTS.md)、[LumeEngine](lume/LumeEngine/AGENTS.md) | 组件管理器、系统顺序、序列化、fuzz |
 | RenderNode、RenderDataStore、GPU、Shader、插件/ROFS | [渲染资源与插件链路](docs/knowledge/render-resource-plugin-pipeline.md) | [LumeRender](lume/LumeRender/AGENTS.md)、[Lume 路由](lume/AGENTS.md)、[Camera Preview](camera_preview_plugin/AGENTS.md) | 双后端、资源屏障、UID/注册、资产编译 |
-| 3DGS/高斯泼溅、splat 渲染、PLY 加载、splat 色彩/排序问题 | [3DGS 渲染集成经验](docs/knowledge/3dgs-rendering-integration.md)、[移动端与桌面差异](docs/knowledge/3dgs-mobile-vs-desktop.md)、[演示资产清单](docs/knowledge/3dgs-demo-assets.md)、[演示实现与踩坑总结](docs/knowledge/3dgs-demo-summary.md)、[大场景 LOD 交接](docs/knowledge/3dgs-lod-status.md) | [LumeRender](lume/LumeRender/AGENTS.md) | 码值空间混合、深度排序精度、SH 阶数、与 web 参考对齐 |
+| 3DGS/高斯泼溅、splat 渲染、PLY 加载、splat 色彩/排序问题 | [3DGS 渲染集成经验](docs/knowledge/3dgs-rendering-integration.md)、[移动端与桌面差异](docs/knowledge/3dgs-mobile-vs-desktop.md)、[演示资产清单](docs/knowledge/3dgs-demo-assets.md)、[演示实现与踩坑总结](docs/knowledge/3dgs-demo-summary.md)、[大场景 LOD 交接](docs/knowledge/3dgs-lod-status.md)、[LumeGS 接入现状](docs/knowledge/lumegs-integration-status.md) | [LumeRender](lume/LumeRender/AGENTS.md) | 码值空间混合、深度排序精度、SH 阶数、与 web 参考对齐 |
 | 构建目标、单测、fuzz、XTS、设备验证 | [构建与验证地图](docs/knowledge/build-test-validation.md) | 目标模块最近的 `AGENTS.md` | 选择最近目标并准确报告环境缺口 |
 
 专项资料：
@@ -111,7 +111,7 @@ Linux OHOS 产品化构建示例（从提供该脚本的完整产品源码根，
 | Surface、SurfaceBuffer、Swapchain、TextureLayer、offscreen、camera preview | `platform-adapter-binding.md`、`3d_widget_adapter/AGENTS.md`、`3d_scene_adapter/AGENTS.md` |
 | ECS、component manager、system graph、glTF、animation、material | `Lume3D.md`、`Lume_3D/AGENTS.md`、`LumeEngine/AGENTS.md` |
 | RenderNode、RenderDataStore、GPU resource、shader、SPIR-V、ROFS、plugin UID | `render-resource-plugin-pipeline.md`、`LumeRender/AGENTS.md`、`lume/AGENTS.md` |
-| 3DGS、gaussian splat、splat、PLY、泼溅、splat 排序、splat 颜色、演示模型资产、大场景 LOD | `3dgs-rendering-integration.md`、`3dgs-demo-assets.md`、`3dgs-demo-summary.md`、`3dgs-lod-status.md`、`LumeRender/AGENTS.md` |
+| 3DGS、gaussian splat、splat、PLY、泼溅、splat 排序、splat 颜色、演示模型资产、大场景 LOD | `3dgs-rendering-integration.md`、`3dgs-demo-assets.md`、`3dgs-demo-summary.md`、`3dgs-lod-status.md`、`lumegs-integration-status.md`、`LumeRender/AGENTS.md` |
 | fuzz、XTS、真实设备、测试目标、构建命令 | `build-test-validation.md` |
 
 ## 项目约束
