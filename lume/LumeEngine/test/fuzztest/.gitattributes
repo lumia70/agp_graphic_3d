@@ -1,2 +1,0 @@
-*.ktx filter=lfs diff=lfs merge=lfs -text
-*.astc filter=lfs diff=lfs merge=lfs -text
