@@ -838,6 +838,15 @@ bool GsSystem::Update(bool frameRenderingQueued, uint64_t time, uint64_t delta)
     }
 
     GS::GsRenderData* renderData = dataStoreGs_->GetGsRenderData();
+    {
+        static uint32_t diagRt = 0;
+        if (((++diagRt) % 120u) == 0u) {
+            CORE_LOG_E("GS diag(sys): res=%{public}u x %{public}u prev=%{public}u x %{public}u scale=0x%{public}x hostValid=%{public}d prims=%{public}zu",
+                renderResolutionFromCC_.x, renderResolutionFromCC_.y, previousResolution_.x, previousResolution_.y,
+                dataStoreGs_->GetGsScaleFactor(), EntityUtil::IsValid(renderTargetHostEntity_) ? 1 : 0,
+                dataStoreGs_->GetGsPrimitives().size());
+        }
+    }
     // Check if render targets need rebuild based on effective render size
     // (considers output resolution, scale factor, and upscale factor)
     const float upscaleRatio = dataStoreGs_->GetGsScaleFactor() * dataStoreGs_->GetXegUpscaleFactor();
