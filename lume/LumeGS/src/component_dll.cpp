@@ -70,10 +70,8 @@
 #include "render/retro/render_effects_retro_node.h"
 #include "render/watercolor/render_effects_watercolor_node.h"
 #include "util/gs_picking.h"
+#include "webp/image_loader_webp.h"
 
-#ifdef __OHOS_PLATFORM__
-// TODO(LumeApp): ImageKit WebP loader replaces the libwebp one.
-#endif
 
 // Rofs Data.
 // The standalone LumeApp build embeds the blob as a plain byte array
@@ -105,6 +103,8 @@ static constexpr CORE_NS::IImageLoaderManager::ImageLoaderTypeInfo WEBP_LOADER {
     { CORE_NS::IImageLoaderManager::ImageLoaderTypeInfo::UID },
     nullptr,
     BASE_NS::Uid { "4171ec62-57ec-47be-bcd2-0d481e27ce69" },
+    WebPPlugin::CreateImageLoaderWebP,
+    WebPPlugin::IMAGE_TYPES,
 };
 #endif
 } // namespace

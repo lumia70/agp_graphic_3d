@@ -18,7 +18,7 @@
 
 #include "common/gs_common.h"
 #include "common/gs_struct_common.h"
-#include <3d/shaders/common/3d_dm_structures_common.h>
+#include "3d/shaders/common/3d_dm_structures_common.h"
 
 #ifdef VULKAN
 #define SH_C0 0.28209479177387814f

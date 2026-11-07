@@ -660,6 +660,7 @@ add_library(LumeGS SHARED
     ${LUME_GS_DIR}/src/util/gs_picking.cpp
     ${LUME_GS_DIR}/src/util/gs_serialization.cpp
     ${LUME_GS_DIR}/src/util/gs_vertex_blob.cpp
+    ${LUME_GS_DIR}/src/webp/image_loader_webp_imagekit.cpp
     ${LUME_GS_DIR}/version.cpp
     ${ENGINE_ROOT}/LumeEngine/api/core/property_tools/property_data.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/generated/gs_rofs_embed.cpp

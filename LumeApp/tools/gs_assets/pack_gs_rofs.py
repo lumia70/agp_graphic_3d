@@ -44,11 +44,11 @@ def collect(repo, spv_dir, empty):
         add_tree(os.path.join(assets, "shaders", "computeshader"), "shaders/computeshader")
         add_tree(os.path.join(assets, "pipelinelayouts"), "pipelinelayouts")
         add_tree(os.path.join(assets, "vertexinputdeclarations"), "vertexinputdeclarations")
-        # Generated SPIR-V (same relative path, .spv suffix).
+        # Generated SPIR-V and its reflection (same relative path, .spv[.lsb] suffix).
         if spv_dir and os.path.isdir(spv_dir):
             for dirpath, _dirs, names in os.walk(spv_dir):
                 for name in names:
-                    if not name.endswith(".spv"):
+                    if not name.endswith((".spv", ".spv.lsb")):
                         continue
                     src = os.path.join(dirpath, name)
                     rel = os.path.relpath(src, spv_dir).replace(os.sep, "/")

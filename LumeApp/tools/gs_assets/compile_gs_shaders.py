@@ -20,6 +20,9 @@ import subprocess
 import sys
 import tempfile
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from gen_gs_lsb import load_pipeline_push_sizes, write_lsb
+
 INCLUDE_ROOTS = [
     ("lume", "LumeGS", "assets", "app", "shaders"),
     ("lume", "Lume_3D", "api"),
@@ -70,14 +73,10 @@ def main():
     out_root = os.path.abspath(args.out) if args.out else os.path.join(
         repo, "LumeApp", "entry", ".cxx", "gs_assets")
     includes = [os.path.join(repo, *parts) for parts in INCLUDE_ROOTS]
+    push_sizes = load_pipeline_push_sizes(repo)
 
     failures = []
     count = 0
-    # NOTE: gs3d_compute_spherical_harmonics(.pack).comp do not compile with a
-    # plain glslang invocation (the include chain hides uPc); they are only used
-    # for dynamic per-frame SH recompute, so they are skipped for now.
-    SKIP = {"computeshader\\gs3d_compute_spherical_harmonics.comp",
-            "computeshader\\gs3d_compute_spherical_harmonics_pack.comp"}
     for dirpath, _dirs, files in os.walk(shader_root):
         for name in files:
             ext = os.path.splitext(name)[1].lower()
@@ -85,15 +84,14 @@ def main():
                 continue
             src = os.path.join(dirpath, name)
             rel = os.path.relpath(src, shader_root)
-            if rel in SKIP:
-                print("skip " + rel)
-                continue
             dst = os.path.join(out_root, rel + ".spv")
             err = compile_one(src, dst, includes, args.glslang)
             count += 1
             if err:
                 failures.append((rel, err))
             else:
+                rel_spv = rel.replace(os.sep, "/") + ".spv"
+                write_lsb(dst, push_sizes.get(rel_spv))
                 print("ok   " + rel)
     print("compiled %d shader stages, %d failed" % (count, len(failures)))
     for rel, err in failures:
