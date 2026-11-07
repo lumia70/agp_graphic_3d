@@ -1030,26 +1030,30 @@ static CORE_NS::Entity g_gsModelEntity {};
 static uint32_t g_gsLogCounter = 0;
 static bool g_gsWasRenderable = false;
 
-// LumeGS tiled LOD state. One entity per (leaf, level) is created lazily.
-// Visible leaves first show the coarsest level as a fallback, then refine; a
-// ring of surrounding leaves keeps its coarsest tile preloaded so fast camera
-// rotation does not expose the clear colour.
+// Dedicated LumeGS tiled LOD host state, mirroring the system-side GSPlugin:
+// RebuildTileSelection -> ProcessPendingTileCreates -> ProcessVisibleTiles ->
+// ProcessPreloadTiles, then RequestRender on camera/tile/residency/loading flags.
 static lod::Scene g_gsLodScene;
 static std::vector<CORE_NS::Entity> g_gsLodTileEntities;
-static std::vector<int> g_gsLodFineLevel;      // desired fine level per leaf, -1 = hidden
-static std::vector<int> g_gsLodFineShownLevel; // fine level currently visible, -1 = none
-static std::vector<uint8_t> g_gsLodCoarseShown; // coarse fallback currently visible
+static std::vector<int> g_gsLodFineLevel;      // desired visible fine level, -1 = hidden
+static std::vector<uint8_t> g_gsLodPreload;    // surrounding ring leaf
+static std::vector<int> g_gsLodShownLevel;     // level currently visible, -1 = none
 static std::vector<uint8_t> g_gsLodTilePending; // per leaf*8, create queued
+static std::vector<uint32_t> g_gsLodVisibleOrder; // nearest-first visible leaves
+static std::vector<uint32_t> g_gsLodRingOrder;    // nearest-first preload ring
 struct GsLodPendingCreate {
     uint32_t leaf = 0;
     int level = 0;
-    bool visible = false;
     bool preload = false;
 };
 static std::vector<GsLodPendingCreate> g_gsLodPending;
 static size_t g_gsLodPendingHead = 0;
 static bool g_gsLodActive = false;
-static std::chrono::steady_clock::time_point g_gsLodForceUntil {};
+static bool g_gsLodSelectionDirty = true;
+static float g_gsLodLastView[16] {};
+static float g_gsLodLastProj[16] {};
+static uint32_t g_gsLodLastBudget = 0;
+static size_t g_gsLodLastResident = static_cast<size_t>(-1);
 
 static bool EnsureGsConfiguration()
 {
@@ -1522,13 +1526,19 @@ static void DestroyGsLodTiles()
     }
     g_gsLodTileEntities.clear();
     g_gsLodFineLevel.clear();
-    g_gsLodFineShownLevel.clear();
-    g_gsLodCoarseShown.clear();
+    g_gsLodPreload.clear();
+    g_gsLodShownLevel.clear();
     g_gsLodTilePending.clear();
+    g_gsLodVisibleOrder.clear();
+    g_gsLodRingOrder.clear();
     g_gsLodPending.clear();
     g_gsLodPendingHead = 0;
+    g_gsLodSelectionDirty = true;
+    std::memset(g_gsLodLastView, 0, sizeof(g_gsLodLastView));
+    std::memset(g_gsLodLastProj, 0, sizeof(g_gsLodLastProj));
+    g_gsLodLastBudget = 0;
+    g_gsLodLastResident = static_cast<size_t>(-1);
     g_gsLodScene = lod::Scene {};
-    g_gsLodForceUntil = {};
     g_gsLodActive = false;
 
     // The single-model path resets isTiled/tilePool on the render data while
@@ -1570,13 +1580,19 @@ static bool LoadGsLodScene(const DemoModelConfig& cfg)
     const size_t leafCount = g_gsLodScene.leaves.size();
     g_gsLodTileEntities.assign(leafCount * 8u, CORE_NS::Entity {});
     g_gsLodFineLevel.assign(leafCount, -1);
-    g_gsLodFineShownLevel.assign(leafCount, -1);
-    g_gsLodCoarseShown.assign(leafCount, 0);
+    g_gsLodPreload.assign(leafCount, 0);
+    g_gsLodShownLevel.assign(leafCount, -1);
     g_gsLodTilePending.assign(leafCount * 8u, 0);
+    g_gsLodVisibleOrder.clear();
+    g_gsLodRingOrder.clear();
     g_gsLodPending.clear();
     g_gsLodPendingHead = 0;
+    g_gsLodSelectionDirty = true;
+    std::memset(g_gsLodLastView, 0, sizeof(g_gsLodLastView));
+    std::memset(g_gsLodLastProj, 0, sizeof(g_gsLodLastProj));
+    g_gsLodLastBudget = 0;
+    g_gsLodLastResident = static_cast<size_t>(-1);
     g_gsLodActive = true;
-    g_gsLodForceUntil = std::chrono::steady_clock::now() + std::chrono::seconds(30);
     g_forceRenderFrames = 30;
     LOGI("GS LOD: leaves=%{public}zu files=%{public}zu levels=%{public}d budget=%{public}u",
         g_gsLodScene.leaves.size(), g_gsLodScene.files.size(), g_gsLodScene.levelCount,
@@ -1584,40 +1600,73 @@ static bool LoadGsLodScene(const DemoModelConfig& cfg)
     return true;
 }
 
-// Host-side LOD selection. Visible leaves first get a coarsest-level fallback,
-// the surrounding ring is preloaded at the coarsest level, and finer levels are
-// created/streamed afterwards in bounded batches. GsTilingSystem owns the
-// actual SOG decode, pool residency and eviction.
-static void UpdateGsLodTiles()
+// ---------------------------------------------------------------------------
+// LumeGS tiled LOD host state machine (mirrors the system-side GSPlugin):
+//   RebuildTileSelection
+//   ProcessPendingTileCreates
+//   ProcessVisibleTiles
+//   ProcessPreloadTiles
+//   cameraChanged/tileStateChanged/residencyChanged/unresolved -> RequestRender
+// ---------------------------------------------------------------------------
+
+static void EnqueueGsLodTile(uint32_t leafIndex, int level, bool preload)
+{
+    if (leafIndex >= g_gsLodScene.leaves.size() || level < 0) {
+        return;
+    }
+    const lod::Leaf& leaf = g_gsLodScene.leaves[leafIndex];
+    if (level >= leaf.levels) {
+        return;
+    }
+    const lod::Slice& slice = leaf.lods[level];
+    if (slice.file < 0 || slice.count == 0 ||
+        static_cast<size_t>(slice.file) >= g_gsLodScene.files.size()) {
+        return;
+    }
+    const size_t key = static_cast<size_t>(leafIndex) * 8u + static_cast<size_t>(level);
+    if (g_gsLodTileEntities[key] != CORE_NS::Entity {} || g_gsLodTilePending[key] != 0) {
+        return;
+    }
+    g_gsLodTilePending[key] = 1;
+    g_gsLodPending.push_back({ leafIndex, level, preload });
+}
+
+// RebuildTileSelection: strict visible leaves/levels, plus a surrounding ring of
+// coarsest-level preload tiles. Only runs when camera/projection/budget changed.
+static bool RebuildGsLodSelection()
 {
     if (!g_gsLodActive || !g_lume.ecs || g_gsLodScene.leaves.empty()) {
-        return;
+        return false;
     }
-    auto* tileSys = CORE_NS::GetSystem<GS::IGsTilingSystem>(*g_lume.ecs);
-    if (!tileSys) {
-        return;
+    const uint32_t budget = g_lodBudgetPreference.load();
+    const bool cameraChanged =
+        std::memcmp(g_gsLodLastView, g_gaussianCameraData.view, sizeof(g_gsLodLastView)) != 0 ||
+        std::memcmp(g_gsLodLastProj, g_gaussianCameraData.proj, sizeof(g_gsLodLastProj)) != 0 ||
+        budget != g_gsLodLastBudget;
+    if (!cameraChanged && !g_gsLodSelectionDirty) {
+        return false;
     }
-    auto& em = g_lume.ecs->GetEntityManager();
-    const size_t leafCount = g_gsLodScene.leaves.size();
 
     lod::Selection sel;
     lod::CullVisible(
         g_gsLodScene, g_gaussianCameraData.view, g_gaussianCameraData.proj, g_gaussianCameraData.cameraPos, sel);
-    const uint32_t budget = g_lodBudgetPreference.load();
     const float scale = lod::ChooseScale(g_gsLodScene, sel, budget);
     lod::AssignLevels(g_gsLodScene, sel, scale);
 
-    std::vector<int> desiredFine(leafCount, -1);
+    const size_t leafCount = g_gsLodScene.leaves.size();
+    g_gsLodFineLevel.assign(leafCount, -1);
+    g_gsLodPreload.assign(leafCount, 0);
+    g_gsLodVisibleOrder.clear();
+    g_gsLodRingOrder.clear();
     std::vector<uint8_t> visible(leafCount, 0);
     for (const auto& item : sel.items) {
         if (item.leaf < leafCount) {
-            desiredFine[item.leaf] = item.level;
+            g_gsLodFineLevel[item.leaf] = item.level;
             visible[item.leaf] = 1;
+            g_gsLodVisibleOrder.push_back(item.leaf);
         }
     }
 
-    // Surrounding ring: widen the projection slightly and preload the coarsest
-    // level of nearby leaves that are just outside the strict frustum.
     float ringProj[16];
     std::memcpy(ringProj, g_gaussianCameraData.proj, sizeof(ringProj));
     ringProj[0] /= 1.3f;
@@ -1625,63 +1674,63 @@ static void UpdateGsLodTiles()
     lod::Selection ringSel;
     lod::CullVisible(
         g_gsLodScene, g_gaussianCameraData.view, ringProj, g_gaussianCameraData.cameraPos, ringSel);
-
-    constexpr size_t kFastVisibleCoarse = 64;
     constexpr size_t kRingPreloadMax = 256;
-    constexpr size_t kCreatePerUpdate = 32;
-
-    auto enqueue = [&](uint32_t leafIndex, int level, bool visibleTile, bool preload) {
-        if (leafIndex >= leafCount || level < 0) {
-            return;
-        }
-        const lod::Leaf& leaf = g_gsLodScene.leaves[leafIndex];
-        if (level >= leaf.levels) {
-            return;
-        }
-        const lod::Slice& slice = leaf.lods[level];
-        if (slice.file < 0 || slice.count == 0 ||
-            static_cast<size_t>(slice.file) >= g_gsLodScene.files.size()) {
-            return;
-        }
-        const size_t key = static_cast<size_t>(leafIndex) * 8u + static_cast<size_t>(level);
-        if (g_gsLodTileEntities[key] != CORE_NS::Entity {} || g_gsLodTilePending[key] != 0) {
-            return;
-        }
-        g_gsLodTilePending[key] = 1;
-        g_gsLodPending.push_back({ leafIndex, level, visibleTile, preload });
-    };
-
-    // 1) nearest visible coarse fallback, 2) surrounding coarse ring,
-    // 3) remaining visible coarse tiles, 4) visible fine levels.
-    const size_t fastVisible = sel.items.size() < kFastVisibleCoarse ? sel.items.size() : kFastVisibleCoarse;
-    for (size_t ii = 0; ii < fastVisible; ii++) {
-        const auto& item = sel.items[ii];
-        enqueue(item.leaf, g_gsLodScene.leaves[item.leaf].levels - 1, true, false);
-    }
-    size_t ringCount = 0;
     for (const auto& item : ringSel.items) {
-        if (ringCount >= kRingPreloadMax) {
+        if (g_gsLodRingOrder.size() >= kRingPreloadMax) {
             break;
         }
         if (item.leaf >= leafCount || visible[item.leaf] != 0) {
             continue;
         }
-        enqueue(item.leaf, g_gsLodScene.leaves[item.leaf].levels - 1, false, true);
-        ringCount++;
+        g_gsLodPreload[item.leaf] = 1;
+        g_gsLodRingOrder.push_back(item.leaf);
     }
-    for (size_t ii = fastVisible; ii < sel.items.size(); ii++) {
-        const auto& item = sel.items[ii];
-        enqueue(item.leaf, g_gsLodScene.leaves[item.leaf].levels - 1, true, false);
+
+    // Nearest visible coarse fallback -> surrounding coarse ring -> remaining
+    // coarse fallbacks -> visible fine levels.
+    constexpr size_t kFastVisibleCoarse = 64;
+    const size_t fastVisible =
+        g_gsLodVisibleOrder.size() < kFastVisibleCoarse ? g_gsLodVisibleOrder.size() : kFastVisibleCoarse;
+    for (size_t ii = 0; ii < fastVisible; ii++) {
+        const uint32_t leafIndex = g_gsLodVisibleOrder[ii];
+        EnqueueGsLodTile(leafIndex, g_gsLodScene.leaves[leafIndex].levels - 1, false);
     }
-    for (const auto& item : sel.items) {
-        const int coarse = g_gsLodScene.leaves[item.leaf].levels - 1;
-        if (item.level != coarse) {
-            enqueue(item.leaf, item.level, true, false);
+    for (const uint32_t leafIndex : g_gsLodRingOrder) {
+        EnqueueGsLodTile(leafIndex, g_gsLodScene.leaves[leafIndex].levels - 1, true);
+    }
+    for (size_t ii = fastVisible; ii < g_gsLodVisibleOrder.size(); ii++) {
+        const uint32_t leafIndex = g_gsLodVisibleOrder[ii];
+        EnqueueGsLodTile(leafIndex, g_gsLodScene.leaves[leafIndex].levels - 1, false);
+    }
+    for (const uint32_t leafIndex : g_gsLodVisibleOrder) {
+        const int fine = g_gsLodFineLevel[leafIndex];
+        const int coarse = g_gsLodScene.leaves[leafIndex].levels - 1;
+        if (fine != coarse) {
+            EnqueueGsLodTile(leafIndex, fine, false);
         }
     }
 
-    // Create a bounded number of tile entities per update.
+    std::memcpy(g_gsLodLastView, g_gaussianCameraData.view, sizeof(g_gsLodLastView));
+    std::memcpy(g_gsLodLastProj, g_gaussianCameraData.proj, sizeof(g_gsLodLastProj));
+    g_gsLodLastBudget = budget;
+    g_gsLodSelectionDirty = false;
+
+    LOGI("GS LOD select: vis=%{public}d total=%{public}u scale=%{public}d ring=%{public}d pending=%{public}d",
+        (int)g_gsLodVisibleOrder.size(), sel.total, (int)(scale * 1000.0f), (int)g_gsLodRingOrder.size(),
+        (int)(g_gsLodPending.size() - g_gsLodPendingHead));
+    return true;
+}
+
+// ProcessPendingTileCreates: bounded per-frame tile entity creation.
+static bool ProcessPendingGsLodTileCreates(GS::IGsTilingSystem* tileSys)
+{
+    if (!tileSys || !g_lume.ecs) {
+        return false;
+    }
+    auto& em = g_lume.ecs->GetEntityManager();
+    constexpr size_t kCreatePerUpdate = 32;
     size_t created = 0;
+    bool changed = false;
     while (g_gsLodPendingHead < g_gsLodPending.size() && created < kCreatePerUpdate) {
         const GsLodPendingCreate pending = g_gsLodPending[g_gsLodPendingHead++];
         const size_t key = static_cast<size_t>(pending.leaf) * 8u + static_cast<size_t>(pending.level);
@@ -1707,95 +1756,170 @@ static void UpdateGsLodTiles()
         comp.count = slice.count;
         comp.aabbMin = BASE_NS::Math::Vec3(leaf.bmin[0], leaf.bmin[1], leaf.bmin[2]);
         comp.aabbMax = BASE_NS::Math::Vec3(leaf.bmax[0], leaf.bmax[1], leaf.bmax[2]);
-        comp.visible = pending.visible;
+        comp.visible = false;
         comp.preload = pending.preload;
         tileSys->CreateTile(entity, comp);
         g_gsLodTileEntities[key] = entity;
         created++;
+        changed = true;
     }
     if (g_gsLodPendingHead > 4096u && g_gsLodPendingHead * 2u > g_gsLodPending.size()) {
-        g_gsLodPending.erase(g_gsLodPending.begin(),
-            g_gsLodPending.begin() + static_cast<std::ptrdiff_t>(g_gsLodPendingHead));
+        g_gsLodPending.erase(
+            g_gsLodPending.begin(), g_gsLodPending.begin() + static_cast<std::ptrdiff_t>(g_gsLodPendingHead));
         g_gsLodPendingHead = 0;
     }
+    return changed;
+}
 
-    bool selectionChanged = false;
-    size_t residentFine = 0;
-    size_t residentCoarse = 0;
-    for (size_t i = 0; i < leafCount; i++) {
+// ProcessVisibleTiles: one visible level per visible leaf. Prefer the desired
+// fine level when resident, otherwise the coarsest resident fallback; when
+// neither exists yet show the fine tile (its load will request another frame).
+static bool ProcessVisibleGsLodTiles(GS::IGsTilingSystem* tileSys, size_t& residentCount, bool& unresolved)
+{
+    if (!tileSys || !g_lume.ecs) {
+        return false;
+    }
+    bool changed = false;
+    for (size_t i = 0; i < g_gsLodScene.leaves.size(); i++) {
         const lod::Leaf& leaf = g_gsLodScene.leaves[i];
-        const int coarseLevel = leaf.levels > 0 ? leaf.levels - 1 : -1;
-        const int fineWant = desiredFine[i];
-        if (g_gsLodFineLevel[i] != fineWant) {
-            selectionChanged = true;
-        }
-        g_gsLodFineLevel[i] = fineWant;
+        const int fine = g_gsLodFineLevel[i];
+        const int coarse = leaf.levels > 0 ? leaf.levels - 1 : -1;
 
-        const auto fineEntity = fineWant >= 0
-                                    ? g_gsLodTileEntities[i * 8u + static_cast<size_t>(fineWant)]
-                                    : CORE_NS::Entity {};
-        const auto coarseEntity = coarseLevel >= 0
-                                      ? g_gsLodTileEntities[i * 8u + static_cast<size_t>(coarseLevel)]
-                                      : CORE_NS::Entity {};
-        const bool fineResident = fineEntity != CORE_NS::Entity {} && tileSys->IsTileResident(fineEntity);
-
-        if (fineWant >= 0) {
-            const int previouslyShown = g_gsLodFineShownLevel[i];
-            if (previouslyShown >= 0 && previouslyShown != fineWant) {
-                const auto oldFine = g_gsLodTileEntities[i * 8u + static_cast<size_t>(previouslyShown)];
-                if (oldFine != CORE_NS::Entity {}) {
-                    tileSys->SetTileVisible(oldFine, false);
-                }
-            }
-            if (fineEntity != CORE_NS::Entity {}) {
-                tileSys->SetTileVisible(fineEntity, true);
-                if (fineResident) {
-                    residentFine++;
-                }
-            }
-            if (coarseLevel >= 0 && coarseLevel != fineWant && coarseEntity != CORE_NS::Entity {}) {
-                const bool showCoarse = !fineResident;
-                tileSys->SetTileVisible(coarseEntity, showCoarse);
-                if (showCoarse && tileSys->IsTileResident(coarseEntity)) {
-                    residentCoarse++;
-                }
-                g_gsLodCoarseShown[i] = showCoarse ? 1 : 0;
-            } else {
-                g_gsLodCoarseShown[i] = 0;
-            }
-            g_gsLodFineShownLevel[i] = fineWant;
-        } else {
-            const int shownFine = g_gsLodFineShownLevel[i];
-            if (shownFine >= 0) {
-                const auto entity = g_gsLodTileEntities[i * 8u + static_cast<size_t>(shownFine)];
+        if (fine < 0) {
+            const int shown = g_gsLodShownLevel[i];
+            if (shown >= 0) {
+                const auto entity = g_gsLodTileEntities[i * 8u + static_cast<size_t>(shown)];
                 if (entity != CORE_NS::Entity {}) {
                     tileSys->SetTileVisible(entity, false);
                 }
+                g_gsLodShownLevel[i] = -1;
+                changed = true;
             }
-            if (coarseEntity != CORE_NS::Entity {}) {
-                tileSys->SetTileVisible(coarseEntity, false);
-            }
-            g_gsLodFineShownLevel[i] = -1;
-            g_gsLodCoarseShown[i] = 0;
+            continue;
         }
+
+        int show = fine;
+        bool found = false;
+        for (int level = fine; level <= coarse; level++) {
+            const auto entity = g_gsLodTileEntities[i * 8u + static_cast<size_t>(level)];
+            if (entity != CORE_NS::Entity {} && tileSys->IsTileResident(entity)) {
+                show = level;
+                found = true;
+                break;
+            }
+        }
+        const auto fineEntity = g_gsLodTileEntities[i * 8u + static_cast<size_t>(fine)];
+        const bool fineResident =
+            fineEntity != CORE_NS::Entity {} && tileSys->IsTileResident(fineEntity);
+        if (!fineResident) {
+            unresolved = true;
+        }
+        if (!found) {
+            // Nothing resident yet; keep/create the fine tile and let the
+            // unresolved flag keep frames coming.
+            show = fine;
+        }
+
+        const auto entity = g_gsLodTileEntities[i * 8u + static_cast<size_t>(show)];
+        if (entity != CORE_NS::Entity {}) {
+            if (g_gsLodShownLevel[i] != show) {
+                const int old = g_gsLodShownLevel[i];
+                if (old >= 0) {
+                    const auto oldEntity = g_gsLodTileEntities[i * 8u + static_cast<size_t>(old)];
+                    if (oldEntity != CORE_NS::Entity {}) {
+                        tileSys->SetTileVisible(oldEntity, false);
+                    }
+                }
+                tileSys->SetTileVisible(entity, true);
+                g_gsLodShownLevel[i] = show;
+                changed = true;
+            }
+            if (tileSys->IsTileResident(entity)) {
+                residentCount++;
+            }
+        }
+    }
+    return changed;
+}
+
+// ProcessPreloadTiles: the surrounding ring stays invisible and preloaded.
+static bool ProcessPreloadGsLodTiles(GS::IGsTilingSystem* tileSys, size_t& residentCount, bool& unresolved)
+{
+    if (!tileSys) {
+        return false;
+    }
+    bool changed = false;
+    for (const uint32_t leafIndex : g_gsLodRingOrder) {
+        if (leafIndex >= g_gsLodScene.leaves.size() || g_gsLodPreload[leafIndex] == 0 ||
+            g_gsLodFineLevel[leafIndex] >= 0) {
+            continue;
+        }
+        const lod::Leaf& leaf = g_gsLodScene.leaves[leafIndex];
+        const int coarse = leaf.levels > 0 ? leaf.levels - 1 : -1;
+        if (coarse < 0) {
+            continue;
+        }
+        const auto entity = g_gsLodTileEntities[leafIndex * 8u + static_cast<size_t>(coarse)];
+        if (entity == CORE_NS::Entity {}) {
+            unresolved = true;
+            continue;
+        }
+        if (tileSys->IsTileResident(entity)) {
+            residentCount++;
+        } else {
+            unresolved = true;
+        }
+        // Preload tiles must stay invisible.
+        const int shown = g_gsLodShownLevel[leafIndex];
+        if (shown >= 0) {
+            const auto shownEntity = g_gsLodTileEntities[leafIndex * 8u + static_cast<size_t>(shown)];
+            if (shownEntity != CORE_NS::Entity {}) {
+                tileSys->SetTileVisible(shownEntity, false);
+            }
+            g_gsLodShownLevel[leafIndex] = -1;
+            changed = true;
+        }
+    }
+    return changed;
+}
+
+static void UpdateGsLodTiles()
+{
+    if (!g_gsLodActive || !g_lume.ecs || g_gsLodScene.leaves.empty()) {
+        return;
+    }
+    auto* tileSys = CORE_NS::GetSystem<GS::IGsTilingSystem>(*g_lume.ecs);
+    if (!tileSys) {
+        return;
     }
 
-    const auto now = std::chrono::steady_clock::now();
-    if (selectionChanged) {
-        static auto lastSelectLog = std::chrono::steady_clock::time_point {};
-        if (std::chrono::duration_cast<std::chrono::milliseconds>(now - lastSelectLog).count() > 1000) {
-            lastSelectLog = now;
-            LOGI("GS LOD select: vis=%{public}d cull=%{public}d scale=%{public}d total=%{public}u "
-                 "sel=%{public}d ring=%{public}d fineRes=%{public}d coarseRes=%{public}d pending=%{public}d",
-                (int)sel.items.size(), (int)sel.culled, (int)(scale * 1000.0f), sel.total, (int)sel.items.size(),
-                (int)ringCount, (int)residentFine, (int)residentCoarse,
-                (int)(g_gsLodPending.size() - g_gsLodPendingHead));
-        }
-        g_gsLodForceUntil = now + std::chrono::seconds(30);
+    const bool selectionChanged = RebuildGsLodSelection();
+    const bool tilesCreated = ProcessPendingGsLodTileCreates(tileSys);
+
+    size_t residentCount = 0;
+    bool unresolvedVisible = false;
+    const bool visibleChanged = ProcessVisibleGsLodTiles(tileSys, residentCount, unresolvedVisible);
+
+    bool unresolvedPreload = false;
+    const bool preloadChanged = ProcessPreloadGsLodTiles(tileSys, residentCount, unresolvedPreload);
+
+    const bool residencyChanged = residentCount != g_gsLodLastResident;
+    g_gsLodLastResident = residentCount;
+
+    const bool needRender = selectionChanged || tilesCreated || visibleChanged || preloadChanged ||
+                            residencyChanged || unresolvedVisible || unresolvedPreload;
+    if (needRender) {
+        // Same trigger as the system host: a field change (or an unresolved tile)
+        // requests exactly the next frame.
+        g_lume.ecs->RequestRender();
         g_forceRenderFrames = 3;
     }
-    if (now < g_gsLodForceUntil) {
-        g_forceRenderFrames = 3;
+
+    if (selectionChanged || visibleChanged) {
+        LOGI("GS LOD state: vis=%{public}d ring=%{public}d res=%{public}d unresolved=%d/%d pending=%{public}d",
+            (int)g_gsLodVisibleOrder.size(), (int)g_gsLodRingOrder.size(), (int)residentCount,
+            unresolvedVisible ? 1 : 0, unresolvedPreload ? 1 : 0,
+            (int)(g_gsLodPending.size() - g_gsLodPendingHead));
     }
 }
 

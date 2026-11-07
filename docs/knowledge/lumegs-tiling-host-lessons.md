@@ -138,6 +138,7 @@ renderSharpeningCoefficient = 0.75
   host 侧只记 desired state；或者完整移植系统 host 的 `ProcessVisibleTiles`/
   `ProcessPreloadTiles`/`RequestRender` 状态机。
 - 拖拽后的 coarse/fine 切换仍有可见内容跳变，需要对比系统 host 的 fallback hold 策略。
+- **边界天空是正常的，不是 host bug**：这组 LOD 是无人机采集的有限区域，初始相机在空中俯视；大角度 yaw 会把视线转出采集范围。此时 `GS LOD state: vis=102 ring=118 res=220` 说明仍有一圈边缘 tile 可见，其余是背景/天空；`vis=0` 表示完全转出场景。判断异常要看相机是否仍在 scene bounds 内、边缘 tile 是否可见，而不是把背景当失败。
 
 ## 未完成
 
