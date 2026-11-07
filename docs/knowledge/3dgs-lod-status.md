@@ -270,7 +270,7 @@ set 1499642 live gaussians (pool 1596136, 54 dirty ranges, 54 new blocks,
 | Pool 模式 | 共享全局 `g_gaussianPoolMode` | dirty range 为 0 不再全量重传（旧行为是一次 128 MB 重传 + 100 ms 内联排序，表现为白闪） |
 | 排序同步 | 节点 `dataEpoch_`/`orderVersion_` | 异步排序结果带 epoch，过期丢弃；排序索引仅在新顺序落地时上传 |
 | 其它 | 节点 | 实例化 `Draw(4, visibleCount)` + triangle strip；`MapBuffer` 后按 dirty range patch |
-| 调参入口 | UI 下拉菜单 | 模型 / 相机模式 / 预算（1.5M / 900k / 600k）；**默认 LOD 场景 + 900k + 第一人称** |
+| 调参入口 | UI 下拉菜单 | 模型 / 相机模式 / 预算（1.5M / 1M / 600k）；**默认 LOD 场景 + 1M + 第一人称** |
 
 ### 11.2 实测性能画像（本机 Vulkan，1280×2598）
 
