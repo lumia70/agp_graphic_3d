@@ -13,6 +13,7 @@
 #include <native_window/external_window.h>
 #include <rawfile/raw_file_manager.h>
 
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -32,8 +33,10 @@
 // it only loads the model through the plugin's ECS components so the loading
 // pipeline can be validated; the render node is wired next.
 #include <3d/ecs/components/transform_component.h>
+#include <3d/ecs/systems/intf_node_system.h>
 #include <plugin_gs/ecs/components/gs_component.h>
 #include <plugin_gs/ecs/components/gs_configuration_component.h>
+#include <plugin_gs/ecs/components/gs_tiling_component.h>
 #include <plugin_gs/ecs/systems/gs_system.h>
 #include <plugin_gs/ecs/systems/intf_gs_tiling_system.h>
 #include "gaussian_splat_data.h"
@@ -899,8 +902,8 @@ static int g_modelIndex = 3;  // doll.glb by default (must track kDemoModels ord
 static int g_pendingModelIndex = -1;  // set from ArkTS, applied on the render thread
 static int g_pendingCameraMode = -1;  // -1 = use the model default, 0 = orbit, 1 = first person
 // LOD splat budget, switchable from ArkTS (dropdown) and remembered across model
-// switches: 1.5M is the densest, 900k is the default that keeps the UI responsive.
-static std::atomic<uint32_t> g_lodBudgetPreference { 900000 };
+// switches: 1.5M is the densest, 1M is the default (matches the scene's mobile cap).
+static std::atomic<uint32_t> g_lodBudgetPreference { 1000000 };
 
 // Robust framing statistics. Raw bounds are misleading: a few outlier
 // gaussians (room walls, an environment sphere) can stretch them far beyond
@@ -1025,6 +1028,56 @@ static BASE_NS::string g_gsModelFile { "doll.glb" };
 static bool g_gsModelDirty = false;
 static CORE_NS::Entity g_gsModelEntity {};
 static uint32_t g_gsLogCounter = 0;
+static bool g_gsWasRenderable = false;
+
+// LumeGS tiled LOD state. One entity per (leaf, level) is created lazily.
+// Visible leaves first show the coarsest level as a fallback, then refine; a
+// ring of surrounding leaves keeps its coarsest tile preloaded so fast camera
+// rotation does not expose the clear colour.
+static lod::Scene g_gsLodScene;
+static std::vector<CORE_NS::Entity> g_gsLodTileEntities;
+static std::vector<int> g_gsLodFineLevel;      // desired fine level per leaf, -1 = hidden
+static std::vector<int> g_gsLodFineShownLevel; // fine level currently visible, -1 = none
+static std::vector<uint8_t> g_gsLodCoarseShown; // coarse fallback currently visible
+static std::vector<uint8_t> g_gsLodTilePending; // per leaf*8, create queued
+struct GsLodPendingCreate {
+    uint32_t leaf = 0;
+    int level = 0;
+    bool visible = false;
+    bool preload = false;
+};
+static std::vector<GsLodPendingCreate> g_gsLodPending;
+static size_t g_gsLodPendingHead = 0;
+static bool g_gsLodActive = false;
+static std::chrono::steady_clock::time_point g_gsLodForceUntil {};
+
+static bool EnsureGsConfiguration()
+{
+    if (!g_lume.ecs) {
+        return false;
+    }
+    auto& ecs = *g_lume.ecs;
+    auto* cfgMgr = CORE_NS::GetManager<GS::IGsConfigurationComponentManager>(ecs);
+    if (!cfgMgr) {
+        return false;
+    }
+    if (g_gsConfigEntity == CORE_NS::Entity {}) {
+        g_gsConfigEntity = ecs.GetEntityManager().Create();
+        cfgMgr->Create(g_gsConfigEntity);
+        if (auto cfg = cfgMgr->Write(g_gsConfigEntity)) {
+            // Match the system-side GSPlugin configuration: GPU sort (required
+            // by the tiled pool), 24-bit keys, sRGB conversion and its quality
+            // tuning.
+            cfg->useGpuSort = true;
+            cfg->use24BitGpuSort = true;
+            cfg->convertGsColorSrgb = true;
+            cfg->renderCovarianceStddev = 2.25f;
+            cfg->renderSharpeningCoefficient = 0.75f;
+        }
+        LOGI("GS path: configuration entity created");
+    }
+    return true;
+}
 
 static void InitGsRenderPath(const char* modelFile)
 {
@@ -1039,25 +1092,28 @@ static void InitGsRenderPath(const char* modelFile)
         LOGI("GS path: systems=%{public}zu gsSystem=%{public}d tilingSystem=%{public}d",
             systems.size(), gsSys != nullptr, tileSys != nullptr);
     }
-    auto* cfgMgr = CORE_NS::GetManager<GS::IGsConfigurationComponentManager>(ecs);
     auto* gsMgr = CORE_NS::GetManager<GS::IGsComponentManager>(ecs);
     auto* tfMgr = CORE_NS::GetManager<CORE3D_NS::ITransformComponentManager>(ecs);
-    if (!cfgMgr || !gsMgr || !tfMgr) {
-        LOGE("GS path: component managers missing (cfg=%d gs=%d tf=%d)", cfgMgr != nullptr,
-            gsMgr != nullptr, tfMgr != nullptr);
+    if (!EnsureGsConfiguration() || !gsMgr || !tfMgr) {
+        LOGE("GS path: component managers missing (cfg=%d gs=%d tf=%d)",
+            g_gsConfigEntity != CORE_NS::Entity {}, gsMgr != nullptr, tfMgr != nullptr);
         return;
     }
-    if (g_gsConfigEntity == CORE_NS::Entity {}) {
-        g_gsConfigEntity = ecs.GetEntityManager().Create();
-        cfgMgr->Create(g_gsConfigEntity);
-        if (auto cfg = cfgMgr->Write(g_gsConfigEntity)) {
-            cfg->useGpuSort = true;
-        }
-        LOGI("GS path: configuration entity created");
-    }
     if (g_gsModelEntity == CORE_NS::Entity {}) {
-        g_gsModelEntity = ecs.GetEntityManager().Create();
-        tfMgr->Create(g_gsModelEntity);
+        // The composite material is rendered as a regular render mesh, so the
+        // entity needs the full scene-node component set (world matrix in
+        // particular). A bare entity with only Transform + GsComponent is not
+        // picked up by RenderSystem.
+        auto* nodeSystem = CORE_NS::GetSystem<CORE3D_NS::INodeSystem>(ecs);
+        if (nodeSystem) {
+            if (auto* node = nodeSystem->CreateNode()) {
+                g_gsModelEntity = node->GetEntity();
+            }
+        }
+        if (g_gsModelEntity == CORE_NS::Entity {}) {
+            g_gsModelEntity = ecs.GetEntityManager().Create();
+            tfMgr->Create(g_gsModelEntity);
+        }
         if (auto tf = tfMgr->Write(g_gsModelEntity)) {
             tf->position = { 0.0f, 0.0f, 0.0f };
             tf->scale = { 1.0f, 1.0f, 1.0f };
@@ -1068,6 +1124,7 @@ static void InitGsRenderPath(const char* modelFile)
         const BASE_NS::string uri = BASE_NS::string("file://") + g_filesDir.c_str() + "/assets/" + modelFile;
         gs->gsPath = uri;
         gs->computeLods = false;
+        gs->gsScaleFactor = 1;  // full resolution: the legacy path was full-res
         LOGI("GS path: loading '%{public}s'", uri.c_str());
     }
     // The GS node is inserted into the camera scene RNG (see
@@ -1089,34 +1146,47 @@ static void InitGsRenderPath(const char* modelFile)
 
 static void PollGsRenderPath()
 {
-    if (g_renderPath != 1 || !g_lume.ecs) {
+    if (g_renderPath != 1 || !g_lume.ecs || g_gsLodActive) {
         return;
     }
     if (g_gsModelEntity == CORE_NS::Entity {}) {
         InitGsRenderPath(g_gsModelFile.c_str());  // first frame after the ECS exists
         return;
     }
-    if (g_gsModelDirty) {
-        g_gsModelDirty = false;
-        auto* gsMgr = CORE_NS::GetManager<GS::IGsComponentManager>(*g_lume.ecs);
-        if (gsMgr) {
-            gsMgr->Destroy(g_gsModelEntity);
-            gsMgr->Create(g_gsModelEntity);
-            if (auto gs = gsMgr->Write(g_gsModelEntity)) {
-                const BASE_NS::string uri =
-                    BASE_NS::string("file://") + g_filesDir.c_str() + "/assets/" + g_gsModelFile.c_str();
-                gs->gsPath = uri;
-                gs->computeLods = false;
-                LOGI("GS path: switching to '%{public}s'", uri.c_str());
-            }
-        }
-    }
     auto* gsMgr = CORE_NS::GetManager<GS::IGsComponentManager>(*g_lume.ecs);
     if (!gsMgr) {
         return;
     }
+    if (g_gsModelDirty) {
+        g_gsModelDirty = false;
+        g_gsWasRenderable = false;
+        gsMgr->Destroy(g_gsModelEntity);
+        gsMgr->Create(g_gsModelEntity);
+        if (auto gs = gsMgr->Write(g_gsModelEntity)) {
+            const BASE_NS::string uri =
+                BASE_NS::string("file://") + g_filesDir.c_str() + "/assets/" + g_gsModelFile.c_str();
+            gs->gsPath = uri;
+            gs->computeLods = false;
+            gs->gsScaleFactor = 1;
+            LOGI("GS path: switching to '%{public}s'", uri.c_str());
+        }
+    }
     auto gs = gsMgr->Read(g_gsModelEntity);
-    if (!gs || ((++g_gsLogCounter) % 60u) != 0u) {
+    if (!gs) {
+        return;
+    }
+    // Loading is async and finishes after the startup render-on-demand window.
+    // Schedule frames when the primitive becomes renderable so the first
+    // composed GS image is actually drawn.
+    const bool renderable = gs->isLoaded && gs->isPrimitiveValid;
+    if (renderable && !g_gsWasRenderable) {
+        g_gsWasRenderable = true;
+        g_forceRenderFrames = 30;
+        LOGI("GS path: model renderable, scheduling frames");
+    } else if (!renderable) {
+        g_gsWasRenderable = false;
+    }
+    if (((++g_gsLogCounter) % 60u) != 0u) {
         return;
     }
     {
@@ -1132,6 +1202,29 @@ static void PollGsRenderPath()
 static lod::Streamer g_lodStreamer;
 static bool g_lodActive = false;
 static float g_lastLodView[16] = {};
+
+// Drop the LumeGS model entity (and the composite mesh attached to it) when
+// switching to the legacy LOD path. The GS node stays in the scene RNG but has
+// no primitives to draw.
+static void DestroyGsRenderPath()
+{
+    if (!g_lume.ecs || g_gsModelEntity == CORE_NS::Entity {}) {
+        return;
+    }
+    auto& ecs = *g_lume.ecs;
+    auto* nodeSystem = CORE_NS::GetSystem<CORE3D_NS::INodeSystem>(ecs);
+    if (nodeSystem) {
+        if (auto* node = nodeSystem->GetNode(g_gsModelEntity)) {
+            nodeSystem->DestroyNode(*node);
+        }
+    } else {
+        ecs.GetEntityManager().Destroy(g_gsModelEntity);
+    }
+    g_gsModelEntity = {};
+    g_gsWasRenderable = false;
+    g_gsModelDirty = false;
+    LOGI("GS path: model entity destroyed");
+}
 
 static bool FileExists(const std::string& path)
 {
@@ -1309,6 +1402,393 @@ static void ReleaseSplatModel()
     g_lume.splatLoaded = false;
 }
 
+static std::string ResolveLodDir(const DemoModelConfig& cfg)
+{
+    std::string dir = g_filesDir + "/assets/" + cfg.scene;
+    if (!FileExists(dir + "/lod-meta.json")) {
+        const std::string fallback =
+            g_filesDir + "/assets/lod_fallback/" + std::string(SceneBaseName(cfg.scene));
+        if (FileExists(fallback + "/lod-meta.json")) {
+            dir = fallback;
+        }
+    }
+    return dir;
+}
+
+// Reuse the legacy LOD camera framing (metadata position/lookAt, first-person
+// eye, scene-sized clip planes) for the LumeGS tiling path.
+static void ApplyGsLodCamera(const lod::Scene& scene, const DemoModelConfig& cfg)
+{
+    SetClearColor(0.62f, 0.72f, 0.82f);
+    g_gaussianBackground[0] = 0.62f;
+    g_gaussianBackground[1] = 0.72f;
+    g_gaussianBackground[2] = 0.82f;
+    g_gaussianBackground[3] = 1.0f;
+
+    g_orbitCam.fovYDeg = cfg.fovYDeg;
+    g_orbitCam.shDeg1 = cfg.shDeg1;
+    g_orbitCam.shDeg23 = cfg.shDeg23;
+
+    float bx = scene.camPos[0] - scene.camLookAt[0];
+    float by = scene.camPos[1] - scene.camLookAt[1];
+    float bz = scene.camPos[2] - scene.camLookAt[2];
+    float len = std::sqrt(bx * bx + by * by + bz * bz);
+    if (len < 1e-3f) {
+        bx = 0.0f;
+        by = 0.0f;
+        bz = 1.0f;
+        len = 1.0f;
+    }
+    g_orbitCam.backX = bx / len;
+    g_orbitCam.backY = by / len;
+    g_orbitCam.backZ = bz / len;
+    // right = normalize(up x back), up = back x right
+    float rx = 1.0f * g_orbitCam.backZ - 0.0f * g_orbitCam.backY;
+    float ry = 0.0f * g_orbitCam.backX - 0.0f * g_orbitCam.backZ;
+    float rz = 0.0f * g_orbitCam.backY - 1.0f * g_orbitCam.backX;
+    float rl = std::sqrt(rx * rx + ry * ry + rz * rz);
+    if (rl < 1e-4f) {
+        rx = 1.0f;
+        ry = 0.0f;
+        rz = 0.0f;
+        rl = 1.0f;
+    }
+    g_orbitCam.rightX = rx / rl;
+    g_orbitCam.rightY = ry / rl;
+    g_orbitCam.rightZ = rz / rl;
+    g_orbitCam.upX = g_orbitCam.backY * g_orbitCam.rightZ - g_orbitCam.backZ * g_orbitCam.rightY;
+    g_orbitCam.upY = g_orbitCam.backZ * g_orbitCam.rightX - g_orbitCam.backX * g_orbitCam.rightZ;
+    g_orbitCam.upZ = g_orbitCam.backX * g_orbitCam.rightY - g_orbitCam.backY * g_orbitCam.rightX;
+
+    // First-person pose: the pivot is the eye itself (the view direction is
+    // still towards lookAt). Switching to orbit later backs off by `len`.
+    g_orbitCam.targetX = scene.camPos[0];
+    g_orbitCam.targetY = scene.camPos[1];
+    g_orbitCam.targetZ = scene.camPos[2];
+    g_orbitCam.distance = 0.0f;
+
+    float ex = scene.boundsMax[0] - scene.boundsMin[0];
+    float ey = scene.boundsMax[1] - scene.boundsMin[1];
+    float ez = scene.boundsMax[2] - scene.boundsMin[2];
+    const float diag = std::sqrt(ex * ex + ey * ey + ez * ez);
+    g_orbitCam.nearPlane = 0.1f;
+    g_orbitCam.farPlane = (len + diag) * 2.0f;
+    g_orbitCam.minDistance = std::max(1.0f, diag * 0.002f);
+    g_orbitCam.insideDistance = std::max(1.0f, diag * 0.05f);
+    g_orbitCam.farDistance = len;
+    g_orbitCam.insideView = false;
+    g_orbitCam.firstPerson = true;
+    g_orbitCam.fpMoveScale = std::max(0.05f, diag * 0.0008f);
+    g_orbitCam.fpBackoff = len;
+    g_orbitCam.pivotX = scene.camLookAt[0];
+    g_orbitCam.pivotY = scene.camLookAt[1];
+    g_orbitCam.pivotZ = scene.camLookAt[2];
+    g_orbitCam.hasPivot = true;
+    for (int i = 0; i < 3; i++) {
+        const float margin = (scene.boundsMax[i] - scene.boundsMin[i]) * 0.15f;
+        g_orbitCam.boundsMin[i] = scene.boundsMin[i] - margin;
+        g_orbitCam.boundsMax[i] = scene.boundsMax[i] + margin;
+    }
+    g_orbitCam.hasBounds = true;
+    g_orbitCam.LogState("gs-lod-initial");
+
+    // The LumeGS render node uses the ECS scene camera. Keep its clip planes
+    // and FOV in sync with the (scene-sized) LOD framing instead of the
+    // small-model defaults (zFar = 100).
+    if (g_lume.ecs && g_cameraEntity != CORE_NS::Entity {}) {
+        if (auto* camMgr = CORE_NS::GetManager<CORE3D_NS::ICameraComponentManager>(*g_lume.ecs)) {
+            if (auto cam = camMgr->Write(g_cameraEntity)) {
+                cam->yFov = cfg.fovYDeg * BASE_NS::Math::DEG2RAD;
+                cam->zNear = g_orbitCam.nearPlane;
+                cam->zFar = g_orbitCam.farPlane;
+            }
+        }
+    }
+}
+
+static void DestroyGsLodTiles()
+{
+    if (g_lume.ecs) {
+        auto* tileSys = CORE_NS::GetSystem<GS::IGsTilingSystem>(*g_lume.ecs);
+        for (auto& entity : g_gsLodTileEntities) {
+            if (entity != CORE_NS::Entity {}) {
+                if (tileSys) {
+                    tileSys->DestroyTile(entity);
+                }
+                g_lume.ecs->GetEntityManager().Destroy(entity);
+                entity = {};
+            }
+        }
+    }
+    g_gsLodTileEntities.clear();
+    g_gsLodFineLevel.clear();
+    g_gsLodFineShownLevel.clear();
+    g_gsLodCoarseShown.clear();
+    g_gsLodTilePending.clear();
+    g_gsLodPending.clear();
+    g_gsLodPendingHead = 0;
+    g_gsLodScene = lod::Scene {};
+    g_gsLodForceUntil = {};
+    g_gsLodActive = false;
+    LOGI("GS LOD: tiles destroyed");
+}
+
+static bool LoadGsLodScene(const DemoModelConfig& cfg)
+{
+    if (!g_lume.ecs || !cfg.scene) {
+        return false;
+    }
+    const std::string dir = ResolveLodDir(cfg);
+    LOGI("GS LOD scene dir: %{public}s", dir.c_str());
+    lod::Scene scene;
+    if (!scene.Load(dir) || scene.leaves.empty()) {
+        LOGE("GS LOD: scene load failed");
+        return false;
+    }
+    if (!EnsureGsConfiguration()) {
+        LOGE("GS LOD: GS configuration missing");
+        return false;
+    }
+
+    // Only drop the previous presentation after the metadata parsed, so a bad
+    // scene keeps whatever was on screen.
+    ReleaseSplatModel();
+    DestroyGsLodTiles();
+    ApplyGsLodCamera(scene, cfg);
+
+    g_gsLodScene = BASE_NS::move(scene);
+    const size_t leafCount = g_gsLodScene.leaves.size();
+    g_gsLodTileEntities.assign(leafCount * 8u, CORE_NS::Entity {});
+    g_gsLodFineLevel.assign(leafCount, -1);
+    g_gsLodFineShownLevel.assign(leafCount, -1);
+    g_gsLodCoarseShown.assign(leafCount, 0);
+    g_gsLodTilePending.assign(leafCount * 8u, 0);
+    g_gsLodPending.clear();
+    g_gsLodPendingHead = 0;
+    g_gsLodActive = true;
+    g_gsLodForceUntil = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    g_forceRenderFrames = 30;
+    LOGI("GS LOD: leaves=%{public}zu files=%{public}zu levels=%{public}d budget=%{public}u",
+        g_gsLodScene.leaves.size(), g_gsLodScene.files.size(), g_gsLodScene.levelCount,
+        g_lodBudgetPreference.load());
+    return true;
+}
+
+// Host-side LOD selection. Visible leaves first get a coarsest-level fallback,
+// the surrounding ring is preloaded at the coarsest level, and finer levels are
+// created/streamed afterwards in bounded batches. GsTilingSystem owns the
+// actual SOG decode, pool residency and eviction.
+static void UpdateGsLodTiles()
+{
+    if (!g_gsLodActive || !g_lume.ecs || g_gsLodScene.leaves.empty()) {
+        return;
+    }
+    auto* tileSys = CORE_NS::GetSystem<GS::IGsTilingSystem>(*g_lume.ecs);
+    if (!tileSys) {
+        return;
+    }
+    auto& em = g_lume.ecs->GetEntityManager();
+    const size_t leafCount = g_gsLodScene.leaves.size();
+
+    lod::Selection sel;
+    lod::CullVisible(
+        g_gsLodScene, g_gaussianCameraData.view, g_gaussianCameraData.proj, g_gaussianCameraData.cameraPos, sel);
+    const uint32_t budget = g_lodBudgetPreference.load();
+    const float scale = lod::ChooseScale(g_gsLodScene, sel, budget);
+    lod::AssignLevels(g_gsLodScene, sel, scale);
+
+    std::vector<int> desiredFine(leafCount, -1);
+    std::vector<uint8_t> visible(leafCount, 0);
+    for (const auto& item : sel.items) {
+        if (item.leaf < leafCount) {
+            desiredFine[item.leaf] = item.level;
+            visible[item.leaf] = 1;
+        }
+    }
+
+    // Surrounding ring: widen the projection slightly and preload the coarsest
+    // level of nearby leaves that are just outside the strict frustum.
+    float ringProj[16];
+    std::memcpy(ringProj, g_gaussianCameraData.proj, sizeof(ringProj));
+    ringProj[0] /= 1.3f;
+    ringProj[5] /= 1.3f;
+    lod::Selection ringSel;
+    lod::CullVisible(
+        g_gsLodScene, g_gaussianCameraData.view, ringProj, g_gaussianCameraData.cameraPos, ringSel);
+
+    constexpr size_t kFastVisibleCoarse = 64;
+    constexpr size_t kRingPreloadMax = 256;
+    constexpr size_t kCreatePerUpdate = 32;
+
+    auto enqueue = [&](uint32_t leafIndex, int level, bool visibleTile, bool preload) {
+        if (leafIndex >= leafCount || level < 0) {
+            return;
+        }
+        const lod::Leaf& leaf = g_gsLodScene.leaves[leafIndex];
+        if (level >= leaf.levels) {
+            return;
+        }
+        const lod::Slice& slice = leaf.lods[level];
+        if (slice.file < 0 || slice.count == 0 ||
+            static_cast<size_t>(slice.file) >= g_gsLodScene.files.size()) {
+            return;
+        }
+        const size_t key = static_cast<size_t>(leafIndex) * 8u + static_cast<size_t>(level);
+        if (g_gsLodTileEntities[key] != CORE_NS::Entity {} || g_gsLodTilePending[key] != 0) {
+            return;
+        }
+        g_gsLodTilePending[key] = 1;
+        g_gsLodPending.push_back({ leafIndex, level, visibleTile, preload });
+    };
+
+    // 1) nearest visible coarse fallback, 2) surrounding coarse ring,
+    // 3) remaining visible coarse tiles, 4) visible fine levels.
+    const size_t fastVisible = sel.items.size() < kFastVisibleCoarse ? sel.items.size() : kFastVisibleCoarse;
+    for (size_t ii = 0; ii < fastVisible; ii++) {
+        const auto& item = sel.items[ii];
+        enqueue(item.leaf, g_gsLodScene.leaves[item.leaf].levels - 1, true, false);
+    }
+    size_t ringCount = 0;
+    for (const auto& item : ringSel.items) {
+        if (ringCount >= kRingPreloadMax) {
+            break;
+        }
+        if (item.leaf >= leafCount || visible[item.leaf] != 0) {
+            continue;
+        }
+        enqueue(item.leaf, g_gsLodScene.leaves[item.leaf].levels - 1, false, true);
+        ringCount++;
+    }
+    for (size_t ii = fastVisible; ii < sel.items.size(); ii++) {
+        const auto& item = sel.items[ii];
+        enqueue(item.leaf, g_gsLodScene.leaves[item.leaf].levels - 1, true, false);
+    }
+    for (const auto& item : sel.items) {
+        const int coarse = g_gsLodScene.leaves[item.leaf].levels - 1;
+        if (item.level != coarse) {
+            enqueue(item.leaf, item.level, true, false);
+        }
+    }
+
+    // Create a bounded number of tile entities per update.
+    size_t created = 0;
+    while (g_gsLodPendingHead < g_gsLodPending.size() && created < kCreatePerUpdate) {
+        const GsLodPendingCreate pending = g_gsLodPending[g_gsLodPendingHead++];
+        const size_t key = static_cast<size_t>(pending.leaf) * 8u + static_cast<size_t>(pending.level);
+        g_gsLodTilePending[key] = 0;
+        if (g_gsLodTileEntities[key] != CORE_NS::Entity {}) {
+            continue;
+        }
+        const lod::Leaf& leaf = g_gsLodScene.leaves[pending.leaf];
+        if (pending.level < 0 || pending.level >= leaf.levels) {
+            continue;
+        }
+        const lod::Slice& slice = leaf.lods[pending.level];
+        if (slice.file < 0 || slice.count == 0 ||
+            static_cast<size_t>(slice.file) >= g_gsLodScene.files.size()) {
+            continue;
+        }
+        CORE_NS::Entity entity = em.Create();
+        GS::GsTilingComponent comp;
+        const std::string uri = std::string("file://") + g_gsLodScene.dir + "/" +
+                                g_gsLodScene.files[static_cast<size_t>(slice.file)];
+        comp.uri = BASE_NS::string(uri.c_str());
+        comp.offset = slice.offset;
+        comp.count = slice.count;
+        comp.aabbMin = BASE_NS::Math::Vec3(leaf.bmin[0], leaf.bmin[1], leaf.bmin[2]);
+        comp.aabbMax = BASE_NS::Math::Vec3(leaf.bmax[0], leaf.bmax[1], leaf.bmax[2]);
+        comp.visible = pending.visible;
+        comp.preload = pending.preload;
+        tileSys->CreateTile(entity, comp);
+        g_gsLodTileEntities[key] = entity;
+        created++;
+    }
+    if (g_gsLodPendingHead > 4096u && g_gsLodPendingHead * 2u > g_gsLodPending.size()) {
+        g_gsLodPending.erase(g_gsLodPending.begin(),
+            g_gsLodPending.begin() + static_cast<std::ptrdiff_t>(g_gsLodPendingHead));
+        g_gsLodPendingHead = 0;
+    }
+
+    bool selectionChanged = false;
+    size_t residentFine = 0;
+    size_t residentCoarse = 0;
+    for (size_t i = 0; i < leafCount; i++) {
+        const lod::Leaf& leaf = g_gsLodScene.leaves[i];
+        const int coarseLevel = leaf.levels > 0 ? leaf.levels - 1 : -1;
+        const int fineWant = desiredFine[i];
+        if (g_gsLodFineLevel[i] != fineWant) {
+            selectionChanged = true;
+        }
+        g_gsLodFineLevel[i] = fineWant;
+
+        const auto fineEntity = fineWant >= 0
+                                    ? g_gsLodTileEntities[i * 8u + static_cast<size_t>(fineWant)]
+                                    : CORE_NS::Entity {};
+        const auto coarseEntity = coarseLevel >= 0
+                                      ? g_gsLodTileEntities[i * 8u + static_cast<size_t>(coarseLevel)]
+                                      : CORE_NS::Entity {};
+        const bool fineResident = fineEntity != CORE_NS::Entity {} && tileSys->IsTileResident(fineEntity);
+
+        if (fineWant >= 0) {
+            const int previouslyShown = g_gsLodFineShownLevel[i];
+            if (previouslyShown >= 0 && previouslyShown != fineWant) {
+                const auto oldFine = g_gsLodTileEntities[i * 8u + static_cast<size_t>(previouslyShown)];
+                if (oldFine != CORE_NS::Entity {}) {
+                    tileSys->SetTileVisible(oldFine, false);
+                }
+            }
+            if (fineEntity != CORE_NS::Entity {}) {
+                tileSys->SetTileVisible(fineEntity, true);
+                if (fineResident) {
+                    residentFine++;
+                }
+            }
+            if (coarseLevel >= 0 && coarseLevel != fineWant && coarseEntity != CORE_NS::Entity {}) {
+                const bool showCoarse = !fineResident;
+                tileSys->SetTileVisible(coarseEntity, showCoarse);
+                if (showCoarse && tileSys->IsTileResident(coarseEntity)) {
+                    residentCoarse++;
+                }
+                g_gsLodCoarseShown[i] = showCoarse ? 1 : 0;
+            } else {
+                g_gsLodCoarseShown[i] = 0;
+            }
+            g_gsLodFineShownLevel[i] = fineWant;
+        } else {
+            const int shownFine = g_gsLodFineShownLevel[i];
+            if (shownFine >= 0) {
+                const auto entity = g_gsLodTileEntities[i * 8u + static_cast<size_t>(shownFine)];
+                if (entity != CORE_NS::Entity {}) {
+                    tileSys->SetTileVisible(entity, false);
+                }
+            }
+            if (coarseEntity != CORE_NS::Entity {}) {
+                tileSys->SetTileVisible(coarseEntity, false);
+            }
+            g_gsLodFineShownLevel[i] = -1;
+            g_gsLodCoarseShown[i] = 0;
+        }
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    if (selectionChanged) {
+        static auto lastSelectLog = std::chrono::steady_clock::time_point {};
+        if (std::chrono::duration_cast<std::chrono::milliseconds>(now - lastSelectLog).count() > 1000) {
+            lastSelectLog = now;
+            LOGI("GS LOD select: vis=%{public}d cull=%{public}d scale=%{public}d total=%{public}u "
+                 "sel=%{public}d ring=%{public}d fineRes=%{public}d coarseRes=%{public}d pending=%{public}d",
+                (int)sel.items.size(), (int)sel.culled, (int)(scale * 1000.0f), sel.total, (int)sel.items.size(),
+                (int)ringCount, (int)residentFine, (int)residentCoarse,
+                (int)(g_gsLodPending.size() - g_gsLodPendingHead));
+        }
+        g_gsLodForceUntil = now + std::chrono::seconds(30);
+        g_forceRenderFrames = 3;
+    }
+    if (now < g_gsLodForceUntil) {
+        g_forceRenderFrames = 3;
+    }
+}
+
 void LoadSplatModel()
 {
     ReleaseSplatModel();
@@ -1466,7 +1946,32 @@ void DrawFrame()
     if (g_pendingModelIndex >= 0 && g_pendingModelIndex < kDemoModelCount &&
         g_pendingModelIndex != g_modelIndex) {
         g_modelIndex = g_pendingModelIndex;
-        LoadSplatModel();
+        const bool wantsLod = kDemoModels[g_modelIndex].scene != nullptr;
+        if (wantsLod) {
+            // Parse metadata and set up the LumeGS tiling path first. Only hide
+            // the previous presentation after success, so a malformed
+            // default.scene.json keeps the current model instead of going black.
+            if (LoadGsLodScene(kDemoModels[g_modelIndex])) {
+                g_renderPath = 1;
+                DestroyGsRenderPath();
+            } else {
+                LOGE("LOD scene failed to start; keeping previous model");
+                g_renderPath = 1;
+            }
+        } else {
+            g_renderPath = 1;
+            if (g_gsLodActive) {
+                DestroyGsLodTiles();
+            }
+            g_gsModelFile = kDemoModels[g_modelIndex].file;
+            if (g_gsModelEntity == CORE_NS::Entity {}) {
+                // PollGsRenderPath will create the node for this file.
+                g_gsModelDirty = false;
+            } else {
+                g_gsModelDirty = true;
+            }
+            LoadSplatModel();
+        }
         g_forceRenderFrames = 30;
     }
     g_pendingModelIndex = -1;
@@ -1474,6 +1979,12 @@ void DrawFrame()
     // Update shared camera data for the gaussian splatting RenderNode
     if (g_lume.width > 0 && g_lume.height > 0) {
         g_orbitCam.UpdateSharedCameraData((uint32_t)g_lume.width, (uint32_t)g_lume.height);
+    }
+
+    // LumeGS tiled LOD: pick per-leaf levels and toggle tile visibility. The
+    // GsTilingSystem worker handles SOG decode / pool residency.
+    if (g_gsLodActive) {
+        UpdateGsLodTiles();
     }
 
     // LOD scene: feed the streamer when the view changed and pick up newly
@@ -1514,9 +2025,21 @@ void DrawFrame()
         float ey = 0.0f;
         float ez = 0.0f;
         g_orbitCam.GetPosition(ex, ey, ez);
+        // In first person the eye IS the pivot (target == eye), so looking at
+        // the orbit target would produce a zero-length look direction and a
+        // degenerate view matrix. Look forward along -back instead.
+        float tx = g_orbitCam.targetX;
+        float ty = g_orbitCam.targetY;
+        float tz = g_orbitCam.targetZ;
+        if (g_orbitCam.firstPerson) {
+            constexpr float kLookAhead = 10.0f;
+            tx = ex - g_orbitCam.backX * kLookAhead;
+            ty = ey - g_orbitCam.backY * kLookAhead;
+            tz = ez - g_orbitCam.backZ * kLookAhead;
+        }
         g_lume.graphicsContext->GetSceneUtil().CameraLookAt(*g_lume.ecs, g_cameraEntity,
             { ex, ey, ez },
-            { g_orbitCam.targetX, g_orbitCam.targetY, g_orbitCam.targetZ },
+            { tx, ty, tz },
             { g_orbitCam.upX, g_orbitCam.upY, g_orbitCam.upZ });
     }
 

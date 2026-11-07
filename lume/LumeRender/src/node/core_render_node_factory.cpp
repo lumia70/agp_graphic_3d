@@ -32,6 +32,9 @@
 #include "node/render_node_shader_passes_generic.h"
 #include "node/render_node_single_post_process.h"
 #include "node/render_node_staging.h"
+#if defined(LUMEAPP_ENABLE_LEGACY_GS_NODE)
+#include "node/render_node_gaussian_splatting.h"
+#endif
 #include "nodecontext/render_node_manager.h"
 
 using namespace CORE_NS;
@@ -67,5 +70,10 @@ void RegisterCoreRenderNodes(RenderNodeManager& renderNodeManager)
     renderNodeManager.AddRenderNodeFactory(FillRenderNodeType<RenderNodeDefaultAccelerationStructureStaging>());
     renderNodeManager.AddRenderNodeFactory(FillRenderNodeType<RenderNodeRenderPostProcessesGeneric>());
     renderNodeManager.AddRenderNodeFactory(FillRenderNodeType<RenderNodeQueueTransfer>());
+#if defined(LUMEAPP_ENABLE_LEGACY_GS_NODE)
+    // LumeApp-only bridge for the legacy tiled LOD scene until the LumeGS
+    // tiling host path is wired (see docs/knowledge/lumegs-integration-status.md).
+    renderNodeManager.AddRenderNodeFactory(FillRenderNodeType<RenderNodeGaussianSplatting>());
+#endif
 }
 RENDER_END_NAMESPACE()

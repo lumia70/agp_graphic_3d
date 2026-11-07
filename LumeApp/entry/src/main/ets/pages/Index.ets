@@ -16,9 +16,9 @@ struct Index {
   private static readonly MODEL_LABELS: string[] = [
     'Model: Bowl PLY', 'Model: Bowl SOG', 'Model: Godzilla', 'Model: Doll', 'Model: City LOD'
   ];
-  private static readonly BUDGETS: number[] = [1500000, 900000, 600000];
+  private static readonly BUDGETS: number[] = [1500000, 1000000, 600000];
   private static readonly BUDGET_LABELS: string[] = [
-    'Splats: 1.5M (sharp)', 'Splats: 900k (balanced)', 'Splats: 600k (fast)'
+    'Splats: 1.5M (sharp)', 'Splats: 1M (balanced)', 'Splats: 600k (fast)'
   ];
 
   aboutToAppear(): void {
@@ -66,7 +66,7 @@ struct Index {
     { value: 'Camera: First-person' }, { value: 'Camera: Orbit' }
   ];
   private static readonly BUDGET_OPTIONS: SelectOption[] = [
-    { value: 'Splats: 1.5M (sharp)' }, { value: 'Splats: 900k (balanced)' },
+    { value: 'Splats: 1.5M (sharp)' }, { value: 'Splats: 1M (balanced)' },
     { value: 'Splats: 600k (fast)' }
   ];
 

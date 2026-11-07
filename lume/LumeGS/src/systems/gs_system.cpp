@@ -882,7 +882,13 @@ bool GsSystem::Update(bool frameRenderingQueued, uint64_t time, uint64_t delta)
         if (previousResolution_.y == 0U) {
             previousResolution_.y = 1U;
         }
+#if defined(LUMEAPP_GS_TILING_FULL_RES)
+        // LumeApp: the legacy custom pipeline rendered at full resolution;
+        // keep tiled LOD at the same resolution instead of 2x upscaling.
+        dataStoreGs_->SetGsScaleFactor(1U);
+#else
         dataStoreGs_->SetGsScaleFactor(2U);
+#endif
         GS::CreateGsRenderTargets(renderData, renderTargetHostEntity_, loadCtx, previousResolution_);
     }
 

@@ -588,6 +588,10 @@ target_compile_definitions(LumeRender PUBLIC
     VK_USE_PLATFORM_OHOS=1
 )
 
+# App-only bridge for the legacy tiled LOD render node (product builds do not
+# define this).
+target_compile_definitions(LumeRender PRIVATE LUMEAPP_ENABLE_LEGACY_GS_NODE=1)
+
 # VMA implementation must be compiled in exactly one .cpp in LumeRender
 set_source_files_properties(
     ${LUME_RENDER_DIR}/src/vulkan/gpu_memory_allocator_vk.cpp
@@ -701,6 +705,9 @@ target_compile_options(LumeGS PRIVATE
     -Wno-missing-field-initializers
     -Wno-c++11-narrowing
 )
+
+# LumeApp: keep tiled LOD at full resolution (the legacy pipeline was full-res).
+target_compile_definitions(LumeGS PRIVATE LUMEAPP_GS_TILING_FULL_RES=1)
 
 target_link_libraries(LumeGS PUBLIC
     LumeEngine

@@ -1855,12 +1855,6 @@ void GsTilingSystem::ApplyInitialPoolConfig()
     freeSplatRanges_.clear();
 
     CORE_LOG_I("GsTilingSystem: pool initialized to %u slots, %u splats.", maxPoolTiles_, splatPoolCapacity_);
-
-    dataStoreGs_->SetTilePoolConfig(maxPoolTiles_, splatsPerTile_);
-    if (GsTilePool* pool = dataStoreGs_->GetTilePool()) {
-        pool->splatCapacity = splatPoolCapacity_;
-        pool->sortCapacity = sortPoolCapacity_;
-    }
 }
 
 void GsTilingSystem::RegisterPoolPrimitive(RenderDataStoreDefaultGS& internalDs)
@@ -1874,6 +1868,12 @@ void GsTilingSystem::RegisterPoolPrimitive(RenderDataStoreDefaultGS& internalDs)
     poolPrim.active = true;
     poolPrim.codecVersion = 1u;
     poolPrim.cropBoxProperties.cropBoxChanged = false;
+    // The tiled pool is a container for world-space tiles; its own AABB must
+    // cover the whole scene, otherwise the render node culls the entire pool
+    // before per-tile culling runs. Individual tiles keep their own AABBs.
+    constexpr float kPoolAabbExtent = 1.0e30f;
+    poolPrim.aabbMin = BASE_NS::Math::Vec3(-kPoolAabbExtent, -kPoolAabbExtent, -kPoolAabbExtent);
+    poolPrim.aabbMax = BASE_NS::Math::Vec3(kPoolAabbExtent, kPoolAabbExtent, kPoolAabbExtent);
     dataStoreGs_->AddGsPrimitive(BASE_NS::move(poolPrim));
     poolEntityRegistered_ = true;
 
@@ -1896,6 +1896,31 @@ void GsTilingSystem::InitializePool()
         return;
     }
     loadRd->isTiled = true;
+
+    // Configure the pool on the render data that is about to become current,
+    // and share the same pool object with both buffers so a FlipValidGsRenderData
+    // cannot leave the tiling worker looking at a render data without a pool.
+    GsRenderData* currentRd = internalDs->GetGsRenderData();
+    if (!loadRd->tilePool) {
+        if (currentRd && currentRd->tilePool) {
+            loadRd->tilePool = currentRd->tilePool;
+        } else {
+            loadRd->tilePool = BASE_NS::make_shared<GsTilePool>();
+        }
+    }
+    GsTilePool& pool = *loadRd->tilePool;
+    pool.maxTiles = maxPoolTiles_;
+    pool.splatsPerTile = splatsPerTile_;
+    pool.splatCapacity = splatPoolCapacity_;
+    pool.sortCapacity = sortPoolCapacity_;
+    pool.resourceVersion++;
+    pool.freeSlots.resize(pool.maxTiles);
+    for (uint32_t ii = 0; ii < pool.maxTiles; ii++) {
+        pool.freeSlots[ii] = static_cast<int32_t>(ii);
+    }
+    if (currentRd) {
+        currentRd->tilePool = loadRd->tilePool;
+    }
 
     GsLoadContext ctx;
     InitializeLoadContext(*loadRd, ctx);
