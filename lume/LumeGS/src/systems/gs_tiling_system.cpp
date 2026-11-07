@@ -1874,7 +1874,14 @@ void GsTilingSystem::RegisterPoolPrimitive(RenderDataStoreDefaultGS& internalDs)
     constexpr float kPoolAabbExtent = 1.0e30f;
     poolPrim.aabbMin = BASE_NS::Math::Vec3(-kPoolAabbExtent, -kPoolAabbExtent, -kPoolAabbExtent);
     poolPrim.aabbMax = BASE_NS::Math::Vec3(kPoolAabbExtent, kPoolAabbExtent, kPoolAabbExtent);
-    dataStoreGs_->AddGsPrimitive(BASE_NS::move(poolPrim));
+    // Re-entering tiled mode after a single-model render must reuse the pool
+    // primitive instead of adding a duplicate; the single-model path resets the
+    // tiled render data but leaves this primitive in the store.
+    if (GsPrimitive* existing = FindPoolPrimitive()) {
+        *existing = BASE_NS::move(poolPrim);
+    } else {
+        dataStoreGs_->AddGsPrimitive(BASE_NS::move(poolPrim));
+    }
     poolEntityRegistered_ = true;
 
     internalDs.FlipValidGsRenderData();
@@ -1884,8 +1891,18 @@ void GsTilingSystem::RegisterPoolPrimitive(RenderDataStoreDefaultGS& internalDs)
 void GsTilingSystem::InitializePool()
 {
     CORE_LOG_I("LSGS: PrepareSubmissions, InitializePool %u", lastAppliedQualityLevel_);
-    if (poolInitialized_ || !dataStoreGs_ || !renderContext_ || !dsStaging_) {
+    if (!dataStoreGs_ || !renderContext_ || !dsStaging_) {
         return;
+    }
+    if (poolInitialized_) {
+        const auto* rd = dataStoreGs_->GetGsRenderData();
+        if (rd && rd->isTiled && dataStoreGs_->GetTilePool()) {
+            return;
+        }
+        // A single-model render reset isTiled/tilePool on the render data while
+        // this system stayed initialized; rebuild the pool for the next tiled
+        // scene instead of silently skipping it.
+        poolInitialized_ = false;
     }
 
     ApplyInitialPoolConfig();
@@ -3075,10 +3092,18 @@ BASE_NS::vector<GsTilingSystem::PreparedSubmission> GsTilingSystem::PrepareSubmi
     BASE_NS::vector<PreparedSubmission> prepared;
     prepared.reserve(candidates.size());
 
+    const auto isPoolReady = [this]() {
+        if (!poolInitialized_ || !dataStoreGs_) {
+            return false;
+        }
+        const auto* rd = dataStoreGs_->GetGsRenderData();
+        return rd && rd->isTiled && dataStoreGs_->GetTilePool() != nullptr;
+    };
+
     for (const auto& cand : candidates) {
-        if (!poolInitialized_) {
+        if (!isPoolReady()) {
             InitializePool();
-            if (!poolInitialized_) {
+            if (!isPoolReady()) {
                 EnqueueTileRequest(cand.entity);
                 continue;
             }

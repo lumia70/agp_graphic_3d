@@ -112,9 +112,37 @@ renderSharpeningCoefficient = 0.75
 8. **预算/画质**：1M 默认；`LUMEAPP_GS_TILING_FULL_RES` 与 `gsScaleFactor=1` 保持全分辨率；配置对齐系统侧。
 9. **JSON/权限**：`default.scene.json` 严格 JSON；设备文件 owner 必须是 App 实际 UID（本机 20020212），否则日志会表现为 `LOD: missing ...`。
 
+## 2026-11-07 续作：LOD 重入与拖拽
+
+### 修复：LOD → Doll → LOD 第二次 LOD 无内容
+
+单模型路径会把 render data 的 `isTiled=false`/`tilePool.reset()`，但 `GsTilingSystem` 的
+`poolInitialized_`/`tileData_`/queue 仍保留；第二次 LOD 直接跳过 `InitializePool`，没有 pool/SOG。
+修复：
+
+- `DestroyGsLodTiles` 对 `IGsTilingSystem` 做一次 `Uninitialize()`/`Initialize()`，清空
+  tileData/queue/residency/pool，并销毁/重建 pool entity；
+- `PrepareSubmissions` 用 `isPoolReady()`（`isTiled && GetTilePool()`）判断，而不是只看
+  `poolInitialized_`；
+- `RegisterPoolPrimitive` 在重入时复用已有 pool primitive，避免重复添加。
+
+验证：第二次 LOD 重新出现 `pool initialized`、SOG 解码，截图 mean ≈ `[116.1, 121.2, 112.5]`。
+
+### 拖拽卡顿/回弹的当前结论
+
+- `ORBITCAM[move]` 日志中 `back/target` 单调，没有相机输入反方向回弹；不是 `Tumble` 的问题。
+- 卡顿的主要来源：host 每帧对 940 fine + 256 ring 全量调用 `SetTileVisible`（worker 每帧上千事件）。
+- 尝试在 host 侧按 visible 状态门控 `SetTileVisible` 后，首帧/coarse fallback 在切换后出现天空，已回退；
+  当前保留全量调用以保证重入和首帧稳定。
+- 下一步优先在 tiling worker 内做 `SetTileVisible` 去重/合并（同一 tile 相同状态不产生事件），而不是
+  host 侧只记 desired state；或者完整移植系统 host 的 `ProcessVisibleTiles`/
+  `ProcessPreloadTiles`/`RequestRender` 状态机。
+- 拖拽后的 coarse/fine 切换仍有可见内容跳变，需要对比系统 host 的 fallback hold 策略。
+
 ## 未完成
 
 - 用系统 host 的 `RequestRender` 状态位替换当前 30s 连续渲染窗口；
 - 把 `LoadScene`/pool/sort 预热移到 App/场景加载阶段，进一步隐藏首次 433 MB pool 成本；
 - ring 覆盖范围（1.3× FOV / 256）和 1.5M/600k 预算的实测调参；
+- tiling worker 内 `SetTileVisible` 去重/合并；coarse fallback hold；
 - 移除 legacy LOD bridge、清理 App 侧一次性日志、完整 `hb build graphic_3d`/XTS/真机矩阵验证。

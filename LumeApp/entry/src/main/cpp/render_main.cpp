@@ -1530,6 +1530,16 @@ static void DestroyGsLodTiles()
     g_gsLodScene = lod::Scene {};
     g_gsLodForceUntil = {};
     g_gsLodActive = false;
+
+    // The single-model path resets isTiled/tilePool on the render data while
+    // the tiling system keeps its queues/residency state. Cyclic the system
+    // lifecycle here so a later LOD entry starts with a clean pool/queue.
+    if (g_lume.ecs) {
+        if (auto* tileSys = CORE_NS::GetSystem<GS::IGsTilingSystem>(*g_lume.ecs)) {
+            tileSys->Uninitialize();
+            tileSys->Initialize();
+        }
+    }
     LOGI("GS LOD: tiles destroyed");
 }
 
