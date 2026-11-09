@@ -2,7 +2,7 @@
 
 > 更新时间：2026-11-09
 > 基线 commit：`c9c5485c`（fix: lod not render well on 2x gsScaleFactor pipeline）
-> 工作区状态：**2x 白屏修复、B 回切修复、Doll 切换缓存/预热已提交**；临时诊断日志已移除
+> 工作区状态：基线 `48175b56`（2x 白屏/B 回切/Doll 缓存）；当前工作区含异步解码（未提交）
 > 关联文档：[LumeGS 接入现状](lumegs-integration-status.md)、[tiling host 渐进加载与首帧经验](lumegs-tiling-host-lessons.md)
 
 ---
@@ -15,7 +15,7 @@
 | 1x 全分辨率（`gsScaleFactor=1` + `LUMEAPP_GS_TILING_FULL_RES=1`） | ✅ 稳定，出画正常 |
 | 2x 默认分辨率（系统侧同款默认值） | ✅ 白屏根因已修复并提交（`c9c5485c`），可出画（截图 mean ≈ 117.5） |
 | Doll → City 冷启动白屏 | ✅ 根因已确认并修复（§4.2），设备 8/8 冷启动 + 8/8 回切通过（未提交） |
-| 切 Doll 后 5s 内滑动卡顿 | ✅ 基本解决：SplatData 单条缓存 + `g_forceRenderFrames` 30→8；切换帧 <100ms，0.8s 首滑 gap 98–103ms（§4.3） |
+| 切 Doll 后 5s 内滑动卡顿 | ✅ 已解决：SplatData 单条缓存 + `g_forceRenderFrames` 30→8 + 首次加载 worker 异步解码；切换帧 <100ms（§4.3） |
 | 2x 画质 | ❌ 遗留（§4.1） |
 | 设备安装版本 | ✅ 已安装当前工作区构建（含 B 修复 + 临时日志） |
 
@@ -323,31 +323,40 @@ loading side 的 `isMaterialValid=false`（pool entity 已换，mesh 必须重�
   触摸事件被饿死。改为 8 后，干净场景首个 MOVE 延迟从 759ms 降到约 **91–147ms**
   （个别 legacy 200–350ms 帧仍可能到约 230ms）。
 
-已做（本次提交）：
+已提交（`48175b56`）：
 
 - `g_forceRenderFrames` 30 → 8（模型切换后、`model renderable` 两处）。
 - 问题 B 的 host mesh 重建 + GsSystem re-adopt，顺带修复 host entity id 复用导致的
   composite mesh 丢失。
 - **单条 SplatData 缓存（移动语义，零拷贝）**：`ReleaseSplatModel()` 把当前 CPU 数据
   移入 `g_cachedSplatData`；再次切回同一文件时 `LoadSplatModel()` 直接移出。
-  默认流程 Doll → City → Doll 的第二次切换不再同步解码。
 
-实测结果（City → Doll）：
+当前工作区（待提交）：**首次未缓存模型的 worker 异步解码**
 
-| 指标 | 修复前 | 修复后 |
-| --- | --- | --- |
-| `doll.glb` 解码 | 487–637ms（同步） | **0ms（cache）** |
-| 切换帧 `total` | 540–770ms | **<100ms（未触发慢帧日志）** |
-| `model renderable` 首帧 | 140–150ms | 149ms（legacy 首次上传/排序） |
-| 0.8s 首滑 touch gap | 759ms | **98–103ms** |
-| 连续 City↔Doll 3 轮 | — | 3/3 Doll 正常（mean 71.9） |
+- `LoadSplatModel()` 只创建 `SplatDecodeTask`；`DecodeSplatFile()` 在 `std::thread`
+  中执行，`DrawFrame()` 每帧 `PollSplatDecode()` 应用结果。
+- 代际号 + 单 worker 队列处理快速连续切换：过期结果丢弃，最新请求排队。
+- `ReleaseSplatModel()` / 缓存命中会提升代际号，取消在途解码；
+  `DestroyEngine()` 里 `StopSplatDecode()` join。
 
-仍待做（只影响首次加载未缓存的模型，或进一步压缩 149ms）：
+实测：
 
-1. 把 legacy 解码/上传移到 worker（覆盖首次切换非缓存模型的情况）；
-2. 或让 LumeGS Doll 真正出画，去掉 legacy 双路径；
-3. 如仍嫌 149ms 首帧重，可保留 legacy RNG/GPU 资源跨 LOD 复用；
-4. 切换期间显示 loading 仅作为 UX 兜底，不算修复。
+| 场景 | 结果 |
+| --- | --- |
+| City → Doll（缓存） | 解码 0ms，切换帧 <100ms，0.8s 首滑 gap 98–103ms |
+| City → Godzilla（1.07M `.splat`，未缓存） | worker 解码约 1.04s；最终画面正常（mean 104.5） |
+| City → Bowl SOG（750k，未缓存） | worker 解码约 0.67s；画面正常（mean 125.8） |
+| 快速切换（Bowl → 0.1s → Godzilla） | 最终 Godzilla 正常，无崩溃 |
+| 连续 City↔Doll 3 轮 | 3/3 Doll 正常（mean 71.9） |
+
+注意：异步解码期间如果用户拖拽，解码完成时 `ApplySplatModelData()` 会重新设置
+初始 framing，拖拽结果会被覆盖；如需保留，可在应用时保留当前朝向或显示 loading。
+
+仍待做：
+
+1. LumeGS Doll 回切 composite 黑屏（见下），去掉 legacy 双路径；
+2. `model renderable` 后 legacy 首次上传约 149ms；
+3. 解码期间的 loading/交互保留（UX）。
 
 #### LumeGS-only Doll 的额外发现
 
@@ -442,10 +451,10 @@ python -c "from PIL import Image,ImageStat; im=Image.open(r'C:\...\a.jpeg').conv
 
 1. ~~**问题 B**：验证「回切后 composite mesh 是否挂在新的 pool entity 上」~~ ✅
    已确认并修复（`HasComponent` 校验），设备 8/8 + 8/8 通过。
-2. ~~**问题 C**：复现「切 Doll 后 5s 内滑动卡顿」~~ ✅ 已基本解决：
-   `g_forceRenderFrames` 30→8 + SplatData 零拷贝缓存；City→Doll 切换帧 <100ms，
-   0.8s 首滑 gap 98–103ms。首次加载未缓存模型仍会同步解码（~0.5s），
-   如需覆盖可再做 worker 异步解码。
+2. ~~**问题 C**：复现「切 Doll 后 5s 内滑动卡顿」~~ ✅ 已解决：
+   `g_forceRenderFrames` 30→8 + SplatData 零拷贝缓存 + 首次加载 worker 异步解码；
+   City→Doll 切换帧 <100ms，0.8s 首滑 gap 98–103ms。剩余仅解码期间的 loading/交互保留
+   与 legacy 首次上传 ~149ms。
 3. **问题 A**：先关 sharpening（0 或 0.25）做 A/B；再修 combine 帧邻居纹理不一致。
 4. 三项都验证后，删除 `TEMP-DIAG` 日志，补 `lumegs-tiling-host-lessons.md` 的结论与未完成项。
 

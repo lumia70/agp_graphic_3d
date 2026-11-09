@@ -13,11 +13,14 @@
 #include <native_window/external_window.h>
 #include <rawfile/raw_file_manager.h>
 
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <string>
+#include <thread>
+#include <utility>
 #include <vector>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -153,6 +156,11 @@ std::string g_filesDir;  // app sandbox writable directory
 static std::string g_cachedSplatPath;
 static SplatData g_cachedSplatData;
 static std::string g_splatDataInUsePath;
+
+// In-flight single-model decode generation. Release/cache hits bump it so a
+// worker that finishes late cannot overwrite a newer model.
+static uint32_t g_splatDecodeGeneration = 0;
+static bool g_splatDecodeQueued = false;
 
 // ---------------------------------------------------------------------------
 // Orbit Camera for 3DGS scene exploration
@@ -1390,6 +1398,10 @@ void LoadLodScene(const DemoModelConfig& cfg)
 
 static void ReleaseSplatModel()
 {
+    // Any decode still running belongs to the model we are leaving.
+    ++g_splatDecodeGeneration;
+    g_splatDecodeQueued = false;
+
     // Release the RNG first: it owns the RenderNode (and its GPU buffers),
     // which must not outlive the CPU-side splat arrays.
     if (g_lodActive) {
@@ -1940,6 +1952,92 @@ static void UpdateGsLodTiles()
     }
 }
 
+struct SplatDecodeTask {
+    std::string path;
+    DemoModelConfig cfg;
+    uint32_t generation = 0;
+};
+
+static std::thread g_splatDecodeThread;
+static std::atomic<bool> g_splatDecodeDone { false };
+static std::atomic<bool> g_splatDecodeOk { false };
+static SplatData g_splatDecodeData;
+static SplatDecodeTask g_splatDecodeTask;
+static SplatDecodeTask g_splatDecodeQueuedTask;
+
+static bool DecodeSplatFile(const SplatDecodeTask& task, SplatData& out)
+{
+    if (strstr(task.cfg.file, ".glb") != nullptr) {
+        return LoadUwaSplatGlb(task.path.c_str(), out);
+    }
+    if (strstr(task.cfg.file, ".sog") != nullptr) {
+        // SH rest costs 48 floats per gaussian; only decode it when the model
+        // configuration actually evaluates higher bands.
+        return sog::LoadSogFile(task.path.c_str(), out, 100.0f,
+            task.cfg.shDeg1 > 0.0f || task.cfg.shDeg23 > 0.0f);
+    }
+    if (strstr(task.cfg.file, ".splat") != nullptr) {
+        return LoadSplatFile(task.path.c_str(), out);
+    }
+    return LoadStandard3DgsPly(task.path.c_str(), out, 100.0f);
+}
+
+static void StartSplatDecode(const SplatDecodeTask& task)
+{
+    g_splatDecodeTask = task;
+    g_splatDecodeDone.store(false, std::memory_order_relaxed);
+    g_splatDecodeOk.store(false, std::memory_order_relaxed);
+    g_splatDecodeData = SplatData {};
+    g_splatDecodeThread = std::thread([task]() {
+        SplatData data;
+        const bool ok = DecodeSplatFile(task, data);
+        g_splatDecodeData = std::move(data);
+        g_splatDecodeOk.store(ok, std::memory_order_relaxed);
+        g_splatDecodeDone.store(true, std::memory_order_release);
+    });
+}
+
+static void ApplySplatModelData(const SplatDecodeTask& task);
+
+static void PollSplatDecode()
+{
+    if (!g_splatDecodeThread.joinable()) {
+        if (g_splatDecodeQueued) {
+            g_splatDecodeQueued = false;
+            StartSplatDecode(g_splatDecodeQueuedTask);
+        }
+        return;
+    }
+    if (!g_splatDecodeDone.load(std::memory_order_acquire)) {
+        return;
+    }
+    g_splatDecodeThread.join();
+
+    const bool stale = g_splatDecodeTask.generation != g_splatDecodeGeneration;
+    if (!stale && g_splatDecodeOk.load(std::memory_order_relaxed)) {
+        g_lume.splatData = std::move(g_splatDecodeData);
+        g_splatDataInUsePath = g_splatDecodeTask.path;
+        ApplySplatModelData(g_splatDecodeTask);
+    } else if (!stale) {
+        LOGE("Failed to load splat model: %{public}s", g_splatDecodeTask.path.c_str());
+    }
+    g_splatDecodeData = SplatData {};
+
+    if (g_splatDecodeQueued) {
+        g_splatDecodeQueued = false;
+        StartSplatDecode(g_splatDecodeQueuedTask);
+    }
+}
+
+static void StopSplatDecode()
+{
+    if (g_splatDecodeThread.joinable()) {
+        g_splatDecodeThread.join();
+    }
+    g_splatDecodeQueued = false;
+    g_splatDecodeData = SplatData {};
+}
+
 void LoadSplatModel()
 {
     ReleaseSplatModel();
@@ -1954,40 +2052,37 @@ void LoadSplatModel()
     g_gaussianBackground[1] = 0.047f;
     g_gaussianBackground[2] = 0.024f;
     g_gaussianBackground[3] = 1.0f;
-    std::string path = g_filesDir + "/assets/" + cfg.file;
+    const std::string path = g_filesDir + "/assets/" + cfg.file;
     LOGI("Loading splat model: %{public}s", path.c_str());
 
-    bool loaded = false;
-    const auto decodeStart = std::chrono::high_resolution_clock::now();
+    ++g_splatDecodeGeneration;
+    g_splatDecodeQueued = false;
+
     const bool fromCache = !g_cachedSplatPath.empty() && g_cachedSplatPath == path &&
                            !g_cachedSplatData.gaussians.empty();
     if (fromCache) {
         g_lume.splatData = std::move(g_cachedSplatData);
         g_cachedSplatData = SplatData {};
-        loaded = true;
-    } else if (strstr(cfg.file, ".glb") != nullptr) {
-        loaded = LoadUwaSplatGlb(path.c_str(), g_lume.splatData);
-    } else if (strstr(cfg.file, ".sog") != nullptr) {
-        // SH rest costs 48 floats per gaussian; only decode it when the model
-        // configuration actually evaluates higher bands.
-        loaded = sog::LoadSogFile(path.c_str(), g_lume.splatData, 100.0f,
-            cfg.shDeg1 > 0.0f || cfg.shDeg23 > 0.0f);
-    } else if (strstr(cfg.file, ".splat") != nullptr) {
-        loaded = LoadSplatFile(path.c_str(), g_lume.splatData);
-    } else {
-        loaded = LoadStandard3DgsPly(path.c_str(), g_lume.splatData, 100.0f);
-    }
-
-    if (!loaded) {
-        LOGE("Failed to load splat model: %{public}s", path.c_str());
+        g_splatDataInUsePath = path;
+        LOGI("Splat cache: %{public}u gaussians", g_lume.splatData.gaussianCount);
+        ApplySplatModelData(SplatDecodeTask { path, cfg, g_splatDecodeGeneration });
         return;
     }
 
-    g_splatDataInUsePath = path;
-    const auto decodeMs = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::high_resolution_clock::now() - decodeStart).count();
-    LOGI("Splat %{public}s: %{public}u gaussians, %{public}u ms", fromCache ? "cache" : "decode",
-        g_lume.splatData.gaussianCount, (uint32_t)decodeMs);
+    SplatDecodeTask task { path, cfg, g_splatDecodeGeneration };
+    if (g_splatDecodeThread.joinable()) {
+        // Keep the render thread responsive: let the current worker finish, then
+        // start the latest request (the stale result is discarded by generation).
+        g_splatDecodeQueuedTask = task;
+        g_splatDecodeQueued = true;
+    } else {
+        StartSplatDecode(task);
+    }
+}
+
+static void ApplySplatModelData(const SplatDecodeTask& task)
+{
+    const DemoModelConfig& cfg = task.cfg;
 
     g_lume.splatLoaded = true;
     LOGI("Splat loaded: %{public}u gaussians, bounds=(%{public}.2f,%{public}.2f,%{public}.2f)-(%{public}.2f,%{public}.2f,%{public}.2f)",
@@ -2093,6 +2188,9 @@ void LoadSplatModel()
         SetFirstPerson(g_pendingCameraMode != 0);
         g_pendingCameraMode = -1;
     }
+
+    // Show the newly decoded model even when the app is otherwise idle.
+    g_forceRenderFrames = 8;
 }
 
 // ---------------------------------------------------------------------------
@@ -2104,6 +2202,8 @@ void DrawFrame()
     if (!g_lume.ready || !g_lume.engine) {
         return;
     }
+
+    PollSplatDecode();
 
     // Apply a pending model switch requested from ArkTS (main thread -> here,
     // so the RNG/GPU resources are created and released on one thread only).
@@ -2287,6 +2387,7 @@ void DrawFrame()
 void DestroyEngine()
 {
     LOGI("Destroying engine resources...");
+    StopSplatDecode();
     g_lume.ready = false;
 
     // Destroy in reverse init order.
