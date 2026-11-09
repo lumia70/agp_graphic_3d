@@ -374,7 +374,16 @@ void GS::CreateGsRenderTargets(GS::GsRenderData* renderData, CORE_NS::Entity tar
     }
 
     if (renderData->isMaterialValid && !resolutionRecreate) {
-        return;
+        // The composite mesh lives on the host entity. On tiled re-entry the pool
+        // entity is recreated, while CloneGsRenderData() may still carry a true
+        // isMaterialValid flag from the previous (single-model) pass. Only skip
+        // when the mesh component is actually attached to this host; otherwise
+        // rebuild it, or the scene renders into targets that never reach screen.
+        if (loadCtx.renderMeshManager_ && loadCtx.renderMeshManager_->HasComponent(targetEntity)) {
+            return;
+        }
+        CORE_LOG_I("CreateGsRenderTargets: host mesh missing, rebuilding.");
+        renderData->isMaterialValid = false;
     }
 
     renderData->isMaterialValid = true;

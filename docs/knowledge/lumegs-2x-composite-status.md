@@ -1,8 +1,8 @@
-# LumeGS 2x 渲染：白屏根因、当前修复与遗留问题（交接）
+# LumeGS 2x 渲染：现状、三个遗留问题分析与下一步（交接）
 
-> 生成时间：2026-11-08
-> 基线 commit：`255ed734`（feat: add dedicated LumeGS tiling host state machine）
-> 工作区状态：**4 个文件未提交**（见 §3），当前构建/安装的是 **2x 修复版**
+> 更新时间：2026-11-09
+> 基线 commit：`c9c5485c`（fix: lod not render well on 2x gsScaleFactor pipeline）
+> 工作区状态：**2x 白屏修复、B 回切修复、Doll 切换缓存/预热已提交**；临时诊断日志已移除
 > 关联文档：[LumeGS 接入现状](lumegs-integration-status.md)、[tiling host 渐进加载与首帧经验](lumegs-tiling-host-lessons.md)
 
 ---
@@ -13,9 +13,11 @@
 | --- | --- |
 | LumeGS tiling LOD 主链路（渐进加载 / coarse fallback / ring preload / 状态机） | ✅ 已跑通并提交（`111a7895`/`90054941`/`255ed734`） |
 | 1x 全分辨率（`gsScaleFactor=1` + `LUMEAPP_GS_TILING_FULL_RES=1`） | ✅ 稳定，出画正常 |
-| 2x 默认分辨率（系统侧同款默认值） | ✅ **白屏根因已定位并修复**，可出画（截图 mean ≈ 117.5） |
-| 2x 画质与切换体验 | ❌ 遗留 3 个问题（§4），未解决 |
-| 代码提交 | ⏳ 修复只在工作区，未 commit |
+| 2x 默认分辨率（系统侧同款默认值） | ✅ 白屏根因已修复并提交（`c9c5485c`），可出画（截图 mean ≈ 117.5） |
+| Doll → City 冷启动白屏 | ✅ 根因已确认并修复（§4.2），设备 8/8 冷启动 + 8/8 回切通过（未提交） |
+| 切 Doll 后 5s 内滑动卡顿 | ✅ 基本解决：SplatData 单条缓存 + `g_forceRenderFrames` 30→8；切换帧 <100ms，0.8s 首滑 gap 98–103ms（§4.3） |
+| 2x 画质 | ❌ 遗留（§4.1） |
+| 设备安装版本 | ✅ 已安装当前工作区构建（含 B 修复 + 临时日志） |
 
 三个遗留问题（用户 2026-11-08 反馈）：
 
@@ -25,179 +27,380 @@
 
 ---
 
-## 2. 根因：tiling 目标被「缩放两次」
+## 2. 已修复：2x tiling 目标被「缩放两次」
 
-### 2.1 现象
-
-2x 下 Doll 单模型正常，tiling LOD 全白（截图 mean ≈ 194，纯天空/背景色），
-但 `GS diag sys` 显示 pool/SOG/可见 tile 全部正常：
-
-```text
-GS diag sys: res=1280,2598 prev=640,1299 scale=2 ...
-```
-
-### 2.2 调用链与错位点
+### 2.1 根因
 
 ```text
 GsSystem::Update()                          lume/LumeGS/src/systems/gs_system.cpp
-  ├─ upscaleRatio      = gsScaleFactor * xegUpscaleFactor        // 2 * 1 = 2
-  ├─ effectiveRenderSize = renderResolutionFromCC_ / upscaleRatio // 1280x2598 -> 640x1299
-  ├─ previousResolution_ = effectiveRenderSize                   // 存的是"已缩放"尺寸
-  └─ tiling-only 分支（无 renderTargetHostEntity_）
-       CreateGsRenderTargets(renderData, host, loadCtx, previousResolution_)   // ← 640x1299
-         └─ CreateGsRenderImages()  lume/LumeGS/src/util/gs_loading.cpp:166
-              renderSize = resolution / scaleFactor / upscaleFactor            // 640/2 -> 320x650
+  ├─ upscaleRatio        = gsScaleFactor * xegUpscaleFactor        // 2 * 1 = 2
+  ├─ effectiveRenderSize = renderResolutionFromCC_ / upscaleRatio  // 1280x2598 -> 640x1299
+  ├─ previousResolution_ = effectiveRenderSize                     // 存的是"已缩放"尺寸
+  └─ tiling-only 分支
+       CreateGsRenderTargets(..., previousResolution_)             // ← 640x1299
+         └─ CreateGsRenderImages()                                 // 内部再除 gsScaleFactor
+              renderSize = resolution / scaleFactor / upscaleFactor // 640/2 -> 320x650
 ```
 
-最终 `gaussianRenderTarget0` 只有 **320x650**，而 render node 仍按 640x1299 绘制，
-composite 采样一张尺寸不匹配的目标 → 全白。Doll 走的是 full resolution 分支
-（1280x2598 传进去，内部除 2 得 640x1299），所以单模型正常。
+render node 仍按 640x1299 绘制，composite 采样 320x650 → 全白。
 
-修复前日志铁证：
+### 2.2 修复（已提交）
 
-```text
-Gs diag images: res=640x1299 scale=2 upscale=1.00 render=320x650   // 双重缩放
-Gs diag target0: 320x650 valid=1
-```
+- `lume/LumeGS/src/systems/gs_system.cpp`：tiling 分支传 `renderResolutionFromCC_`，由
+  `CreateGsRenderImages` 自己除缩放系数（`gs_system.cpp:892-896`）。
+- `lume/LumeGS/src/util/gs_loading.cpp`：`GsRenderStatusUbo renderStatusUbo {};` 零初始化，
+  并显式设置 `enableXegUpscale`（`gs_loading.cpp:209-220`）。
+  未初始化值非零会让 2x composite 去采样 `uGSTex1`（XEG 输出，本工程未启用）。
+- 回到 2x 默认：`render_main.cpp` 删除两处 `gs->gsScaleFactor = 1;`，
+  `CMakeLists.txt` 删除 `LUMEAPP_GS_TILING_FULL_RES=1`。
 
-### 2.3 修复（`gs_system.cpp`，工作区未提交）
+修复后：`GS diag sys: res=1280,2598 prev=640,1299 scale=2`，target 640x1299，
+截图 mean ≈ 117.5（正常地形 110–125）。
 
-```cpp
-// 之前
-GS::CreateGsRenderTargets(renderData, renderTargetHostEntity_, loadCtx, previousResolution_);
-// 现在：CreateGsRenderImages 内部自己会除 gsScaleFactor，这里必须传原始输出分辨率
-GS::CreateGsRenderTargets(renderData, renderTargetHostEntity_, loadCtx, renderResolutionFromCC_);
-```
+### 2.3 已排除
 
-修复后 tiling target 正确生成 **640x1299**，2x 出画：截图 mean ≈ 117.5，地形正常。
+- 不是 host/LumeGS 混编问题（旧/新 host × 旧/新 LumeGS 四组矩阵都白屏）。
+- 不是 shader/assets 回归（`0c0fc610` 之后未变）。
+- 不是 pool/SOG/tile 未加载（诊断日志全部正常）。
 
-### 2.4 顺带修掉的第二处隐患（`gs_loading.cpp:209`）
+---
 
-```cpp
-GsRenderStatusUbo renderStatusUbo;        // 之前：未初始化
-GsRenderStatusUbo renderStatusUbo {};     // 现在：零初始化
-...
-renderStatusUbo.enableXegUpscale = renderData->enableXegUpscale ? 1u : 0u;
-```
+## 3. 关键运行机制（分析三个问题的前提）
 
-`enableXegUpscale` 原为未初始化值，非零时 2x 分支的 composite shader 会去采样
-`uGSTex1`（XEG 输出，本工程未启用）→ 也可能白屏。注意：`UpdateRenderStatusUbo`
-（`render_node_gs_render.cpp:902`）每帧用 push constant 走 compute 覆盖同一个 UBO，
-所以这处主要影响「UBO 刚创建、compute 还没跑」的前几帧。
+### 3.1 2x composite 的两种路径
 
-### 2.5 回到 2x 默认的两处改动
+`lume/LumeGS/assets/app/shaders/shader/gs3d_gaussian_splatting.frag`：
 
-| 文件 | 改动 | 含义 |
+| 条件 | 路径 | 说明 |
 | --- | --- | --- |
-| `render_main.cpp`（2 处：`InitGsRenderPath` / `PollGsRenderPath`） | 删除 `gs->gsScaleFactor = 1;` | 不再强制 1x，走 LumeGS 默认 2x |
-| `CMakeLists.txt` | 删除 `target_compile_definitions(LumeGS PRIVATE LUMEAPP_GS_TILING_FULL_RES=1)` | 同上，去掉全分辨率宏 |
+| `renderScaleFactor <= 1.001` | 直接采样 `uGSTex0` | 1x |
+| `enableXegUpscale==1 && renderScaleFactor>1.001` | 采样 `uGSTex1` | XEG，本工程关闭 |
+| `jitterFrameRendered != 4` | 对 `uGSTex0` 做 5-tap 模糊 | 预览/运动帧 |
+| `jitterFrameRendered == 4` | 4 张 jitter target 按子像素混合 | 静态收敛帧 |
+
+- `UpdateRenderStatusUbo` 每渲染帧用 push constant 覆盖 status UBO
+  （`render_node_gs_render.cpp:902-933`），写入 `jitterRendered_ + 1`。
+- 渲染目标按 `jitterRendered_` 轮转 0..3（`SetGsColorAttachment`，`render_node_gs_render.cpp:2372-2405`）。
+- `useRenderIfDirty_` 是 `static constexpr bool { true }`
+  （`render_node_gs_render.h:566`）：**相机静止**时会连续渲染 4 帧 jitter 后停在
+  `jitterRendered_==4`，composite 使用 4 帧混合；**相机运动**时走 preview 帧，
+  每次把 `jitterRendered_` 置 0，composite 只能走 5-tap 模糊路径。
+- `SetGsScaleFactor` 只生效一次（`render_data_store_default_gs.cpp:610-619`），
+  同一个 data store 生命周期内无法按模式切换 1x/2x。
+- `GsComponent` 默认值（`api/plugin_gs/ecs/components/gs_component.h`）：
+  `gsScaleFactor=2`、`gsEnableDepthPass=false`、`convertGsColorSrgb=true`。
+  app 在 `render_main.cpp:1077-1079` 覆盖为 `covariance=2.25`、`sharpening=0.75`
+  （对齐系统侧 GSPlugin）。
+
+### 3.2 模型切换与 render data 双缓冲
+
+- `LoadGsLodScene()` **先** `DestroyGsLodTiles()`，**后** `DestroyGsRenderPath()`
+  （`render_main.cpp:2082-2088`）。
+- `DestroyGsLodTiles()` 对 `IGsTilingSystem` 做 `Uninitialize()/Initialize()`
+  （`render_main.cpp:1545-1550`），`Uninitialize()` 会销毁 `poolEntity_`
+  （`gs_tiling_system.cpp:1277-1319`），重入时 `Initialize()` 创建**新的 pool entity**。
+- `GsTilingSystem::InitializePool()` 用 `GetSafeLoadingGsRenderData()` 把当前 active
+  render data **整体浅拷贝**到 loading side（`gs_tiling_system.cpp:1911`），
+  然后 `RegisterPoolPrimitive()` 立刻 `FlipValidGsRenderData()`
+  （`gs_tiling_system.cpp:1880-1887`）。
+- `CloneGsRenderData()` 是 `*to = *from` 浅拷贝
+  （`render_data_store_default_gs.cpp:1282`），会连同
+  `gsMaterial` / `gsMesh` / `gaussianRenderTarget0..3` / `gaussianRenderTargetStatusUbo` /
+  `isMaterialValid` / `convertGsColorSrgb` / `gsEnableDepthPass` 一起复制。
+- `GS::CreateGsRenderTargets()` 的早退条件只有一个：
+  `if (renderData->isMaterialValid && !resolutionRecreate) return;`
+  （`gs_loading.cpp:376-380`）。**它不检查 host entity 是否变化、mesh 是否真的还在。**
 
 ---
 
-## 3. 当前工作区差异（`git diff` 摘要）
+## 4. 三个遗留问题分析
 
-```text
- LumeApp/entry/src/main/cpp/CMakeLists.txt   | 2 --
- LumeApp/entry/src/main/cpp/render_main.cpp  | 2 --
- lume/LumeGS/src/systems/gs_system.cpp       | 6 +++++-
- lume/LumeGS/src/util/gs_loading.cpp         | 5 ++++-
- 4 files changed, 9 insertions(+), 6 deletions(-)
+### 4.1 问题 A：2x 颜色偏怪、精细度略差于 1x
+
+**结论：部分是 2x 设计必然，但有一个代码级可疑点。**
+
+#### A-1（代码级，优先验证）combine 帧的 sharpening 邻居取错纹理
+
+`gs3d_gaussian_splatting.frag`：
+
+```glsl
+// 静态收敛帧：center 是 4 张 target 的子像素混合
+const vec4 sampleColor = GetJitterCombinedSample(texCoords, fullResPixelCoord);
+// 但 ApplySharpening 内部只从 uGSTex0 取 top/bottom/left/right
+const vec4 sharpened = ApplySharpening(sampleColor, texCoords, pixelOffset, sharpCoef);
 ```
 
-另有未跟踪文件 `docs/knowledge/.gitignore`，以及本文件。
-**建议提交信息**：`fix: create tiled LumeGS targets at the output resolution`
+`ApplySharpening()`（`gs3d_gaussian_splatting.frag:93-115`）的 4 个邻居固定采样
+`uGSTex0`，而 `centerColor` 是 4 帧混合结果。两者来自不同 jitter 相位 →
+在边缘会产生亮度/色度错位（彩边、过冲），sharpening 系数 0.75 时更明显。
+预览帧（`jitterFrameRendered != 4`）center 与邻居都来自 `uGSTex0`，反而一致。
 
----
+**修复方向（任选，先做最保守的）**：
 
-## 4. 遗留问题与下一步排查（按优先级）
+1. combine 帧跳过 sharpening（或把 `sharpCoef` 乘 0 验证）；
+2. 用同一 jitter 相位计算邻居（4 个 target 各算一次再混合）；
+3. 先用 `renderSharpeningCoefficient=0` 做 A/B，确认问题是否消失。
 
-### 4.1 问题 A：2x 默认颜色偏怪、精细度略差于 1x
+#### A-2（调参）covariance / sharpening 高于默认
 
-**预期内的部分**（不是 bug）：
-
-- 2x = 半分辨率 target（640x1299）+ 4 帧 jitter + upscale + sharpening 合成，
-  与 1x 直接采样 `uGSTex0` 路径不同；
-- 精细度必然下降，颜色经过 jitter 合成与 sharpen 会偏移。
-
-**可疑的调参项**（app 侧覆盖了点，`render_main.cpp:1077`）：
-
-| 参数 | 默认 | app 当前值 | 影响 |
+| 参数 | 默认 | app 当前 | 影响 |
 | --- | --- | --- | --- |
-| `renderSharpeningCoefficient` | 0.25 | **0.75** | 强化过度会让边缘过冲、观感偏亮偏「脏」 |
-| `renderCovarianceStddev` | 2.0 | **2.25** | 覆盖率变大，叠层更厚，颜色更糊 |
-| `convertGsColorSrgb` | true | true | 与 swapchain 是否 sRGB 相关，错了会整体偏色 |
+| `renderSharpeningCoefficient` | 0.25 | **0.75** | 过冲、边缘偏亮/偏脏 |
+| `renderCovarianceStddev` | 2.0 | **2.25** | splat 更大、叠层更厚、颜色更糊更亮 |
+| `convertGsColorSrgb` | true | true | 1x/2x 一致，不是差异来源 |
 
-**下一步实验**（一次只改一个）：把 sharpen 降回 0.25（或 0）→ 对比截图；
-covariance 降回 2.0 → 再对比；两者都正常后，再判断剩余差异是 jitter 相位还是 color space。
+#### A-3（设计）运动时只有 5-tap 模糊，静止才 4 帧混合
 
-### 4.2 问题 B：Doll → LOD 回切后整体发白（最高优先级）
+- 拖动/运动时：preview 帧 → `jitterFrameRendered=1` → 单张半分辨率 target 的
+  5-tap 模糊上采样 → 必然比 1x 软。
+- 静止 ~4 帧后：`jitterFrameRendered=4` → 4 相位重建，细节应接近 1x。
+- 判断标准：**静止截图**对比 1x；如果静止仍明显差，问题在 A-1/A-2，
+  而不是 jitter 上采样本身。
 
-**现象**：LOD → Doll（正常）→ 再切回 LOD，能出画但整屏偏白。
-
-**已排除**：不是「重入后没内容」——那是 `90054941` 修过的 `poolInitialized_` 问题，
-现在 pool/SOG/tile 都正常。
-
-**当前假设**（按可能性排序）：
-
-1. **色彩空间双转换**：回切时 `RemoveGsRenderTargets` + `CreateGsRenderTargets` 重建，
-   新 `GsRenderData` 的 `convertGsColorSrgb` / `enableXegUpscale` 未必继承 app 配置
-   （`EnsureGsConfiguration` 只创建一次），导致 linear→sRGB 被做两次 → 发白。
-   位置：`gs_loading.cpp:209 CreateGsStatusUbo`、`render_node_gs_render.cpp:902 UpdateRenderStatusUbo`。
-2. **renderStatus UBO 竞态**：`CreateGsStatusUbo` 写初值、`UpdateRenderStatusUbo`
-   每帧用 push constant 覆盖，重建首帧可能拿到 `renderScaleFactor=0xFFFFFFFF`
-   或 `DRSScale` 不匹配的值 → upscale 系数与 target 不符 → 过曝。
-3. **jitter 状态未复位**：`jitterRendered_` 持续自增，回切后 target 已清空但相位/帧计数没重置，
-   4 帧 jitter 叠加采样 → 泛白。
-4. **深度/累积状态**：`gsEnableDepthPass` 或 GS 累积缓冲在重入时未清。
-
-**判别实验（关键，先做这个）**：
+#### 判别实验（按顺序）
 
 ```text
-把 gsScaleFactor 临时改回 1（1x），做同样的 Doll → LOD 回切：
-  - 1x 也发白  → 与 2x/jitter 无关，是重入时 material/UBO/color 状态；
-  - 1x 正常    → 锁定 2x composite（jitter/upscale/sharpen）状态未复位。
+1) sharpening=0.75 -> 0，静止截图对比 1x；
+2) covariance=2.25 -> 2.0，再对比；
+3) 若仍偏色，临时让 combine 帧直接输出 sampleColor（跳过 sharpen）再对比；
+4) 记录静止帧的 renderStatus：jitterFrameRendered / renderScaleFactor /
+   DRSScale / convertColorSrgb / sharpeningCoeff。
 ```
 
-然后在「首次进 LOD」和「回切进 LOD」两处各打一次同样的日志做对比：
-`scale / drs / xeg / srgb / sharp / jitter`（用 `CORE_LOG_E` + `%d`，
-HiLog 会丢长格式，见 §6）。
+### 4.2 问题 B：Doll → LOD 回切后整屏偏白（最高优先级）
 
-### 4.3 问题 C：切到 Doll 后第一次滑动卡约 1s
+**结论：已确认——重入后 composite mesh 没有被重新挂到新 pool entity，
+画面只剩 LOD 的浅色 clear color（0.62/0.72/0.82，mean ≈ 199.7）。**
 
-**假设**：
+#### 已确认（2026-11-08 设备日志）
 
-1. 首次 `GetPsoData` / `BindPipeline` 触发 PSO 创建与 shader 变体编译（2x 分支变体不同）；
-2. 换模型时 `RemoveGsRenderTargets` + 重建 material/descriptor set 的一次性成本；
-3. 换入 Doll 后第一次相机变化才触发「需要重画」路径，把上面的初始化成本集中到这一帧。
+冷启动默认 Doll → 切 City，可复现（约 1/3 概率），白屏截图 mean = 199.7。
+同一次对比中，白屏与正常路径的关键差异：
 
-**判别实验**：在 `RenderNodeGsRender::Execute` 的分阶段（`UpdateRenderStatusUbo` /
-`BindPipeline` / `Dispatch` / `RecordGaussianDraw`）打时间戳，看这 1s 落在哪一段；
-同时把 `gsScaleFactor` 改回 1x 复测一次——若 1x 同样慢，则与 2x 无关，是切模型的通用成本。
+```text
+# 白屏
+GS diag uninit: ... matValid=1 rt0=1 ubo=1 prims=1
+GS diag host: ent=INVALID ... matValid=0 rt0=0 ubo=0 prims=0
+GS diag pool: preFlip loadRd matValid=1 rt0=1 ubo=1 mat=1 mesh=1 tiled=1 poolEnt=29
+GS diag pool: postFlip matValid=1 rt0=1 ubo=1 mat=1 ...
+GS diag host: adopt ent=29 ... matValid=1 rt0=1 ubo=1 prims=1
+GS diag mk: ent=29 matValid=1 rt0=1 ubo=1 mat=1 mesh=1 res=1280,2598 recreate=0
+GS diag mk: SKIP ent=29 ...
 
----
+# 正常
+GS diag pool: preFlip loadRd matValid=0 rt0=0 ubo=0 mat=0 mesh=1 tiled=1 poolEnt=29
+GS diag host: adopt ent=29 ... matValid=0 rt0=0 ubo=0 prims=1
+GS diag mk: ent=29 matValid=0 rt0=0 ubo=0 mat=0 mesh=1 res=1280,2598 recreate=0
+GS diag mk: DONE ent=29 matValid=1 rt0=1 ubo=1 mat=1 mesh=1
+```
 
-## 5. 架构速查（谁负责什么）
+即：`InitializePool()` 通过 `GetSafeLoadingGsRenderData()` 浅拷贝把 Doll 的
+`isMaterialValid=1` / targets / material 带进 loading side；flip 后 host 是新 pool
+entity 29，但旧 host（Doll entity 16）已销毁，新 host 上没有 `RenderMeshComponent`。
+`CreateGsRenderTargets()` 只看 `isMaterialValid` 直接早退（SKIP），composite quad
+无人承载，只剩 clear color。
 
-| 层 | 位置 | 职责 |
+注意：日志里的 `mesh=1` 是 `gsMesh` **资源**引用，不代表 host entity 上的
+`RenderMeshComponent` 存在，不能作为早退依据。
+
+#### 修复（`gs_loading.cpp`，本次提交）
+
+```cpp
+if (renderData->isMaterialValid && !resolutionRecreate) {
+    // 只有 mesh component 真的挂在当前 host 上才允许早退
+    if (loadCtx.renderMeshManager_ && loadCtx.renderMeshManager_->HasComponent(targetEntity)) {
+        return;
+    }
+    renderData->isMaterialValid = false; // 重建 material / targets / mesh
+}
+```
+
+#### 设备验证
+
+- 冷启动 Doll → City：**8/8** 正常，mean=120.2；其中 6 次命中
+  `GS diag mk: REBUILD host mesh missing ent=29`，随后 `DONE`。
+- City ↔ Doll 连续往返：**8/8** 正常，mean=120.2。
+- 修复前同一脚本复现：第 2 次冷启动即白屏 mean=199.7。
+- 临时日志：`C:\Users\lambda\AppData\Local\Temp\opencode\lumegs_white.log`、
+  `first_fix_1..8.log`（本机临时目录，不入库）。
+
+#### B-1 代码链路
+
+```text
+Doll -> LOD:
+  LoadGsLodScene()
+    DestroyGsLodTiles()
+      tileSys.Uninitialize()      // 销毁旧 poolEntity_
+      tileSys.Initialize()        // 之后 InitializePool 会创建新 poolEntity_
+    ...                          // 此时 Doll 的 GsComponent 还活着
+  DestroyGsRenderPath()          // 销毁 Doll 节点 -> GsSystem 异步 RemoveGsObject
+```
+
+- `RemoveGsObject()` 在 primitives 清空时销毁 material、清空 targets、把
+  `renderTargetHostEntity_` 置空（`gs_system.cpp:1103-1119`）。
+- 重入时 `InitializePool()` 先 `CloneGsRenderData()`（浅拷贝，含
+  `isMaterialValid=true`、Doll 的 targets/material 引用），再 `FlipValidGsRenderData()`。
+- `GsSystem::Update()` 随后把 `renderTargetHostEntity_` 设为新的 pool primitive，
+  调用 `CreateGsRenderTargets(..., renderResolutionRecreate=false)`
+  （`gs_system.cpp:876-897`）。
+- 若此时 `isMaterialValid` 仍为 true，`CreateGsRenderTargets()` **直接早退**
+  （`gs_loading.cpp:376-380`），不会在新 host entity 上创建 `RenderMeshComponent`，
+  也不会重建 material/mesh。
+- 旧 host entity（旧 poolEntity_）已被 `Uninitialize()` 销毁 → composite quad
+  没有任何存活实体承载 → 只剩 clear color。
+
+Doll 首次加载正常，是因为它走 `isMaterialValid=false` 的首次创建路径；
+首次 LOD 正常，也是因为初始数据是干净的。
+
+#### B-2 为什么值得优先验证
+
+- 现象「整屏偏白」与 LOD clear color（0.62/0.72/0.82）在数值上完全吻合
+  （`render_main.cpp:1424-1428`）。
+- 之前的 2x 白屏 mean ≈ 194 也是同一个背景色；本次修复只解决了 target 尺寸，
+  没有解决「host entity 换了但 mesh 没重建」。
+- 该问题与 2x/jitter 无关，1x 回切理论上也会触发。
+
+#### B-3 判别实验
+
+```text
+1) 回切后看 GS diag：
+   - renderTargetHostEntity_ 是否指向新 pool entity；
+   - CreateGsRenderTargets 是否打印早退（加一行 CORE_LOG_E "skip material valid"）；
+   - RenderMeshComponent 是否存在于 host entity。
+2) 回切后临时把 isMaterialValid 强制置 false（或在 InitializePool 里 reset），
+   观察是否立刻恢复正常画面。
+3) 1x（gsScaleFactor=1）做同样的 Doll -> LOD 回切：
+   - 1x 也白 -> 确认是重入/mesh 生命周期问题；
+   - 1x 正常 -> 再查 2x composite/UBO 状态。
+```
+
+#### B-4 建议修复
+
+最小且稳妥：让 `CreateGsRenderTargets()` 的早退条件也检查 host entity：
+
+```cpp
+// 伪代码
+if (renderData->isMaterialValid && !resolutionRecreate &&
+    renderData->materialHostEntity == targetEntity &&
+    renderData->gaussianRenderTarget0 && renderData->gaussianRenderTargetStatusUbo) {
+    return;
+}
+```
+
+`GsRenderData` 增加 `CORE_NS::Entity materialHostEntity {};`，创建成功后记录。
+或在 `GsTilingSystem::InitializePool()` / `RegisterPoolPrimitive()` 里显式把
+loading side 的 `isMaterialValid=false`（pool entity 已换，mesh 必须重建），
+代价是重入时多重建一次 material/target，可接受。
+
+同时建议检查：`Uninitialize()` 是否应通知 GsSystem 清掉
+`renderTargetHostEntity_`，避免持有已销毁 entity 的悬空 id。
+
+### 4.3 问题 C：切到 Doll 后 5s 内开始滑动会「不跟手」（机制已定位）
+
+**结论：切换后存在一个约 1–2s 的重负载窗口（切换帧 + 首帧上传/排序 + 强制渲染帧）。
+在这个窗口内触摸事件被延迟；等待约 5s 让一次性工作结束后，输入恢复跟手。**
+
+设备实测（2026-11-08，`GS diag frame` / `GS diag touch`）：
+
+| 阶段 | 观测 |
+| --- | --- |
+| 切换帧（点 Doll 后） | `total ≈ 540–770ms`；其中 legacy `doll.glb` **同步解码 ≈0.5s**，tile teardown/池销毁也在同一帧 |
+| `model renderable` 后首帧 | `total ≈ 140ms`（`tick ≈ 80–100ms`，`render ≈ 50–70ms`） |
+| 之后若干帧 | 偶发 `render ≈ 200–350ms`（legacy 首次上传/排序/PSO） |
+| 强制渲染 | 原 `g_forceRenderFrames = 30`，主线程持续出帧约 0.8–1.5s |
+| 触摸延迟 | 切换后 0.8s 注入 drag，首个 MOVE 延迟 **759ms**；等待 6s 后再 drag，最大 gap **95ms** |
+| 正常拖拽帧 | 约 20–30ms/帧 |
+
+关键点：
+
+- `LoadSplatModel()` 在 UI/render 线程同步解码 426k gaussians（≈0.5s）。
+- `DestroyGsLodTiles()` 的 `Uninitialize()` 会 `DrainInFlightLoaders()` 并销毁池，
+  也在切换帧内完成。
+- `LoadSplatModel()` 会创建 legacy `RenderNodeGaussianSplatting` RNG；**Doll 目前仍依赖它出画**。
+  尝试在 LumeGS 模式关闭 legacy RNG 后，Doll 变黑；即使补了 host mesh 重建，
+  LumeGS-only Doll 仍不出画（渲染节点没有可见 composite），需单独排查，不能直接删 legacy。
+- `g_forceRenderFrames = 30` 把一次性工作后的 warmup 拉长；期间主线程持续渲染，
+  触摸事件被饿死。改为 8 后，干净场景首个 MOVE 延迟从 759ms 降到约 **91–147ms**
+  （个别 legacy 200–350ms 帧仍可能到约 230ms）。
+
+已做（本次提交）：
+
+- `g_forceRenderFrames` 30 → 8（模型切换后、`model renderable` 两处）。
+- 问题 B 的 host mesh 重建 + GsSystem re-adopt，顺带修复 host entity id 复用导致的
+  composite mesh 丢失。
+- **单条 SplatData 缓存（移动语义，零拷贝）**：`ReleaseSplatModel()` 把当前 CPU 数据
+  移入 `g_cachedSplatData`；再次切回同一文件时 `LoadSplatModel()` 直接移出。
+  默认流程 Doll → City → Doll 的第二次切换不再同步解码。
+
+实测结果（City → Doll）：
+
+| 指标 | 修复前 | 修复后 |
 | --- | --- | --- |
-| host（应用侧） | `LumeApp/entry/src/main/cpp/render_main.cpp` | 模型/相机/预算切换、LOD 场景状态机（`RebuildTileSelection` → `ProcessPendingTileCreates` → `ProcessVisibleGsLodTiles` → `ProcessPreloadGsLodTiles`）、GS 配置实体（`EnsureGsConfiguration`）|
-| LumeGS 引擎侧 | `lume/LumeGS/` | `GsSystem`（渲染目标/缩放/primitive 参数）、`GsTilingSystem`（pool/tile/residency）、`gs_loading`（target/material/UBO 创建）、`RenderNodeGsRender`（排序、绘制、composite） |
-| host 传给引擎的入参 | `render_main.cpp:1128` / `:1170` | `gs->gsPath`、`computeLods=false`；**当前不再设置 `gsScaleFactor`**（默认 2x） |
+| `doll.glb` 解码 | 487–637ms（同步） | **0ms（cache）** |
+| 切换帧 `total` | 540–770ms | **<100ms（未触发慢帧日志）** |
+| `model renderable` 首帧 | 140–150ms | 149ms（legacy 首次上传/排序） |
+| 0.8s 首滑 touch gap | 759ms | **98–103ms** |
+| 连续 City↔Doll 3 轮 | — | 3/3 Doll 正常（mean 71.9） |
 
-**`gsScaleFactor` 语义**：渲染目标的降采样倍数。2 → target 为输出分辨率的 1/2，
-composite 阶段再 upscale 回来（4 帧 jitter + sharpen）。`SetGsScaleFactor()` 实际只生效一次，
-所以「Doll 设 2x、LOD 想单独 1x」这条路走不通——这也是之前必须用编译宏的原因。
+仍待做（只影响首次加载未缓存的模型，或进一步压缩 149ms）：
 
-**相关默认值**（`gs_configuration_component.h`）：`enableXegUpscale=false`、
-`xegUpscaleFactor=1.0`、`convertGsColorSrgb=true`、`renderCovarianceStddev=2.0`、
-`renderSharpeningCoefficient=0.25`、`lsgsMaxLodRenderCount=1000000`、`lsgsLodBias=1.8`。
+1. 把 legacy 解码/上传移到 worker（覆盖首次切换非缓存模型的情况）；
+2. 或让 LumeGS Doll 真正出画，去掉 legacy 双路径；
+3. 如仍嫌 149ms 首帧重，可保留 legacy RNG/GPU 资源跨 LOD 复用；
+4. 切换期间显示 loading 仅作为 UX 兜底，不算修复。
+
+#### LumeGS-only Doll 的额外发现
+
+为了去掉 legacy 双路径，尝试在 LumeGS 模式不创建 legacy RNG：
+
+- 冷启动 Doll：LumeGS-only 正常出画（mean 58.0）；
+- City → Doll 回切：即使 `GS diag lume` 显示
+  `isTiled=0 / pool=0 / loaded=1 / rt0 与 cache 一致 / mat=1 mesh=1`，
+  且 mesh 已重建到新 host，画面仍为黑（mean 23.0）。
+- 结论：LumeGS Doll 的回切 composite 还有更深的状态问题（疑似材质/描述符绑定或
+  数据上传侧），当前不能删除 legacy；本次先保留 legacy 并用缓存消除解码停顿。
+
+#### 关联日志（定位期，已移除）
+
+- `GS diag frame: dt/total/tick/render/doRender/force/view`（`DrawFrame`）
+- `GS diag touch: gap/type`（`DispatchTouchEvent`，仅 MOVE/UP 且 gap ≥ 33ms）
+- `GS diag rt: re-adopt mesh host A -> B`（GsSystem，host entity 复用）
+- `GS diag mk: SKIP/REBUILD/DONE`（`CreateGsRenderTargets`）
+- `GS diag lume: state/tiled/isTiled/pool/loaded/rt0/cache/mat/mesh`（状态变化时）
+- `GS diag: exec skip` / `GS diag cam:`（render node 早退原因）
+- `Splat cache/decode: N gaussians, T ms`（单条 SplatData 缓存命中/解码耗时）
 
 ---
 
-## 6. 构建 / 部署 / 验证（照抄即可）
+## 5. 关键代码锚点
+
+| 位置 | 说明 |
+| --- | --- |
+| `lume/LumeGS/src/systems/gs_system.cpp:866-897` | 目标重建 + tiling 分支 + `SetGsScaleFactor` |
+| `lume/LumeGS/src/systems/gs_system.cpp:1103-1119` | 删除最后一个 primitive 时清 material/targets/host |
+| `lume/LumeGS/src/systems/gs_system.cpp:1260-1290` | 配置覆盖（covariance/sharpening/XEG/DRS） |
+| `lume/LumeGS/src/systems/gs_tiling_system.cpp:1891-1949` | `InitializePool`（clone + pool + flip） |
+| `lume/LumeGS/src/systems/gs_tiling_system.cpp:1860-1889` | `RegisterPoolPrimitive`（pool AABB + flip） |
+| `lume/LumeGS/src/systems/gs_tiling_system.cpp:1255-1319` | `Uninitialize` 销毁 pool entity |
+| `lume/LumeGS/src/util/gs_loading.cpp:353-391` | `CreateGsRenderTargets`（早退 + mesh/material） |
+| `lume/LumeGS/src/util/gs_loading.cpp:166-232` | target 尺寸、status UBO 创建 |
+| `lume/LumeGS/src/render/render_node_gs_render.cpp:902-933` | `UpdateRenderStatusUbo` push constant |
+| `lume/LumeGS/src/render/render_node_gs_render.cpp:2033-2101` | preview/accum 帧选择与 jitter 递增 |
+| `lume/LumeGS/src/render/render_node_gs_render.cpp:2372-2405` | `SetGsColorAttachment` 4 target 轮转 |
+| `lume/LumeGS/src/render/render_data_store_default_gs.cpp:610-624` | `SetGsScaleFactor` 一次性 / `GetRenderScaleFactor` |
+| `lume/LumeGS/src/render/render_data_store_default_gs.cpp:498-534` | `FlipValidGsRenderData` 双缓冲 |
+| `lume/LumeGS/src/render/render_data_store_default_gs.cpp:1253-1318` | `CloneGsRenderData` 浅拷贝 |
+| `lume/LumeGS/assets/app/shaders/shader/gs3d_gaussian_splatting.frag:53-115,145-184` | 2x combine / sharpening / sRGB |
+| `LumeApp/entry/src/main/cpp/render_main.cpp:1511-1599` | `DestroyGsLodTiles` / `LoadGsLodScene` |
+| `LumeApp/entry/src/main/cpp/render_main.cpp:2070-2109` | 模型切换顺序 |
+| `LumeApp/entry/src/main/cpp/render_main.cpp:1058-1084` | `EnsureGsConfiguration`（app 调参） |
+
+---
+
+## 6. 构建 / 部署 / 验证
 
 ```powershell
-# 改过 GS GLSL / ROFS 时先从仓库根重编 shader（本轮的改动不涉及 shader，可跳过）
+# 改过 GS GLSL / ROFS 时先从仓库根重编 shader（本轮只改 C++ 可跳过）
 python LumeApp/tools/gs_assets/compile_gs_shaders.py
 python LumeApp/tools/gs_assets/pack_gs_rofs.py
 
@@ -219,38 +422,101 @@ hdc file recv /data/local/tmp/a.jpeg C:\Users\lambda\AppData\Local\Temp\a.jpeg
 python -c "from PIL import Image,ImageStat; im=Image.open(r'C:\...\a.jpeg').convert('L'); s=ImageStat.Stat(im); print('mean',round(s.mean[0],1))"
 ```
 
-判读基线：正常地形 ≈ 110–125；纯天空/白屏 ≈ 190+。
+判读基线：正常地形 ≈ 110–125；纯背景/白屏 ≈ 190+（LOD clear color 0.62/0.72/0.82）。
 
 ---
 
-## 7. 不要重踩的坑（本轮新增）
+## 7. 不要重踩的坑
 
-1. **不要再用「旧 host + 旧 LumeGS 混编」做 A/B 二分**。本轮做过 4 组矩阵
-   （旧/新 host × 旧/新 LumeGS），2x **全部白屏**，但根因并不在 host/迁移，而在
-   运行时 target 尺寸；混编引入的接口/宏不一致反而制造了假象。
-   定位这类问题直接加 `target 尺寸 / renderStatus 数值` 一次性日志，比二分快一个数量级。
-2. `CreateGsRenderImages` **内部自己会除 `gsScaleFactor`**，任何调用方传进来的必须是
-   「原始输出分辨率」；传已缩放尺寸就是双重缩放。
-3. `renderStatusUbo` 一定要零初始化再逐字段赋值（未初始化字段会改变 shader 分支）。
-4. 诊断日志一律 `CORE_LOG_E` + 简单 `%d`，长格式会被 HiLog 丢掉。
-5. 临时 `Gs diag` 日志验证完要清掉（本轮已清理，勿再提交）。
+1. `CreateGsRenderImages` **内部自己会除 `gsScaleFactor`**；调用方必须传原始输出分辨率。
+2. `renderStatusUbo` 必须零初始化再逐字段赋值（未初始化字段会改变 shader 分支）。
+3. `CreateGsRenderTargets` 的 `isMaterialValid` 早退不校验 host entity / mesh 是否存在
+   ——重入场景务必检查。
+4. `CloneGsRenderData` 是浅拷贝，会复制 material/targets/isMaterialValid，不要假设重入是干净的。
+5. 诊断日志一律 `CORE_LOG_E` + 简单 `%d`，长格式会被 HiLog 丢掉。
+6. 临时 `Gs diag` 日志验证完要清掉，勿提交。
 
 ---
 
 ## 8. 下一步建议顺序
 
-1. 把工作区这 4 个文件提交（2x 白屏修复是独立成果，先落库）；
-2. 做 §4.2 的 1x/2x 回切对比实验 → 定位「回切发白」；
-3. 再做 §4.3 的分段耗时日志 → 定位「首次滑动 1s」；
-4. 最后回到 §4.1 的调参（sharpen/covariance），把 2x 观感拉齐 1x；
-5. 收尾：补 `docs/knowledge/lumegs-tiling-host-lessons.md` 的「未完成」列表（本轮 2x 结论需并入）。
+1. ~~**问题 B**：验证「回切后 composite mesh 是否挂在新的 pool entity 上」~~ ✅
+   已确认并修复（`HasComponent` 校验），设备 8/8 + 8/8 通过。
+2. ~~**问题 C**：复现「切 Doll 后 5s 内滑动卡顿」~~ ✅ 已基本解决：
+   `g_forceRenderFrames` 30→8 + SplatData 零拷贝缓存；City→Doll 切换帧 <100ms，
+   0.8s 首滑 gap 98–103ms。首次加载未缓存模型仍会同步解码（~0.5s），
+   如需覆盖可再做 worker 异步解码。
+3. **问题 A**：先关 sharpening（0 或 0.25）做 A/B；再修 combine 帧邻居纹理不一致。
+4. 三项都验证后，删除 `TEMP-DIAG` 日志，补 `lumegs-tiling-host-lessons.md` 的结论与未完成项。
 
 ---
 
-## 9. 给新 session 的开场提示
+## 9. 定位期临时诊断日志（已在提交前移除）
+
+> 以下日志名称仅作复现参考；当前代码已移除 `TEMP-DIAG` 输出，
+> 需要再次定位时可按名称重新加回。基础日志 `GS diag sys` / `GS diag: draw` /
+> `GS diag: handles INVALID` 仍然保留（定位前已存在）。
+
+### 9.1 重入 / material / mesh（问题 B）
+
+| 日志 | 位置 | 判读 |
+| --- | --- | --- |
+| `GS diag mk: ent=... matValid=... rt0=... ubo=... mat=... mesh=... res=... recreate=...` | `gs_loading.cpp:CreateGsRenderTargets` | 每次创建入口状态 |
+| `GS diag mk: SKIP ent=...` | 同上 | **出现即命中假设**：`isMaterialValid` 早退，未给新 host 建 mesh |
+| `GS diag mk: DONE ent=...` | 同上 | mesh 已挂到该 host entity |
+| `GS diag host: ent=... matValid=...` / `adopt ent=...` | `gs_system.cpp:Update` | host entity 切换与当前 material/target 状态 |
+| `GS diag rt: rebuild ...` | 同上 | 目标重建原因（尺寸/空 target） |
+| `GS diag pool: preFlip/postFlip ...` | `gs_tiling_system.cpp:InitializePool` | loading side 从 Doll 继承了什么、flip 后 active 是什么 |
+| `GS diag uninit: poolEnt=... matValid=... rt0=...` | `gs_tiling_system.cpp:Uninitialize` | 拆 pool 前的状态 |
+| `GS slow CreateGraphicsState / targets/UBO` | `gs_loading.cpp:SetupGsMaterial` | 切模型时的一次性 GPU 资源成本 |
+
+判读：回切 LOD 时若出现 `GS diag mk: SKIP ent=<new>`，且之前的 `DONE ent=<old>` 是 Doll 的
+host entity，则确认「composite mesh 没挂到新 pool entity」。
+
+### 9.2 首次滑动 1s（问题 C）
+
+| 日志 | 位置 | 判读 |
+| --- | --- | --- |
+| `GS slow GetPsoData: N ms shader=... flags=...` | `render_node_gs_render.cpp:GetPsoData` | PSO/变体编译 |
+| `GS slow PreExecuteFrame: N ms` | `PreExecuteFrame` | 帧前 CPU 总成本 |
+| `GS slow UpdateCameraUBO: N ms` | 同上 | camera UBO 映射 |
+| `GS slow RecreateDescriptorSets: N ms` | 同上 | descriptor 重建 |
+| `GS slow tiled sort/precompute: N ms active=... jitter=...` | `ExecuteFrame` tiled 块 | tile sort/precompute 首次成本 |
+| `GS slow GaussianRenderPass: N ms jitter=... tiled=... preview=...` | `ExecuteFrame` | GS 渲染 pass（含首次 BindPipeline） |
+| `GS slow UpdateRenderStatusUbo / ExecuteFrame: N ms` | 同上 | 其余成本 |
+
+判读：1s 落在 `GetPsoData` / `CreateGraphicsState` / `GaussianRenderPass` → PSO 编译；
+落在 `PreExecuteFrame` → descriptor/UBO；落在 `tiled sort/precompute` → 首次排序/预计算。
+阈值：GetPsoData/资源 20ms，UBO/status 10ms，整帧 20ms。
+
+### 9.3 复现步骤（设备）
 
 ```text
-读 docs/knowledge/lumegs-2x-composite-status.md 和 docs/knowledge/lumegs-tiling-host-lessons.md，
-继续处理 2x 渲染的遗留问题：优先 4.2「Doll→LOD 回切后发白」，再做 4.3「首次滑动 1s」。
-工作区有 4 个未提交文件（2x 白屏修复），先确认基线再改动。
+启动 → 等 LOD 稳定（静止 4 帧，jitter=4）→ 切 Doll → 再切回 LOD（观察偏白）
+→ 切到 Doll 后第一次拖动（观察 1s 卡顿）
+每次操作后：
+hdc shell "hilog -x" > C:\Users\lambda\AppData\Local\Temp\opencode\lumegs.log
+rg -n 'GS diag|GS slow|GS LOD|GS path' C:\Users\lambda\AppData\Local\Temp\opencode\lumegs.log
+```
+
+本机自动化复现脚本（临时目录，不入库）：
+
+| 脚本 | 作用 |
+| --- | --- |
+| `C:\Users\lambda\AppData\Local\Temp\opencode\repro_first_city.ps1` | 循环冷启动 → 默认 Doll → 切 City，截图 mean > 175 判定白屏 |
+| `...\repro_first_city_fixcheck.ps1` | 同上，并保存每次 `first_fix_N.log` |
+| `...\repro_city_white.ps1` | City ↔ Doll 连续往返 |
+| `...\image_mean.py` / `...\parse_layout.py` | 截图均值 / uitest layout 解析 |
+
+---
+
+## 10. 给新 session 的开场提示
+
+```text
+读 docs/knowledge/lumegs-2x-composite-status.md 和 docs/knowledge/lumegs-tiling-host-lessons.md。
+基线 commit 是 c9c5485c，工作区应为干净。
+继续处理 LumeGS 2x 的三个遗留问题，优先级：
+  1) Doll -> LOD 回切后整屏偏白（怀疑 isMaterialValid 早退导致 composite mesh 未挂到新 pool entity）；
+  2) 切到 Doll 后第一次滑动卡 1s（怀疑 PSO/首帧初始化被延迟）；
+  3) 2x 颜色偏怪/细节略差（先验证 combine 帧 sharpening 邻居取错纹理 + 调参）。
 ```

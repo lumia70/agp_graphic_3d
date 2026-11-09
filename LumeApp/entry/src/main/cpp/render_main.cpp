@@ -147,6 +147,13 @@ napi_env g_napiEnv = nullptr;
 NativeResourceManager* g_resMan = nullptr;
 std::string g_filesDir;  // app sandbox writable directory
 
+// One-entry cache for single-model files. The common demo flow is
+// Doll (default) -> City LOD -> Doll; re-decoding 400k+ gaussians on the
+// render thread made the switch frame ~0.5s and starved touch input.
+static std::string g_cachedSplatPath;
+static SplatData g_cachedSplatData;
+static std::string g_splatDataInUsePath;
+
 // ---------------------------------------------------------------------------
 // Orbit Camera for 3DGS scene exploration
 // Free-tumble arcball: orientation accumulated as world-space basis vectors
@@ -1183,7 +1190,9 @@ static void PollGsRenderPath()
     const bool renderable = gs->isLoaded && gs->isPrimitiveValid;
     if (renderable && !g_gsWasRenderable) {
         g_gsWasRenderable = true;
-        g_forceRenderFrames = 30;
+        // Keep the warmup short so touch input is not starved by forced frames
+        // after a model switch (30 frames delayed the first drag by ~0.7s).
+        g_forceRenderFrames = 8;
         LOGI("GS path: model renderable, scheduling frames");
     } else if (!renderable) {
         g_gsWasRenderable = false;
@@ -1400,6 +1409,16 @@ static void ReleaseSplatModel()
     ++g_gaussianSplatGeneration;
     g_gaussianShData = nullptr;
     g_gaussianDataReady = false;
+
+    // Keep the decoded CPU data for the next switch instead of discarding it.
+    // The legacy GPU node is gone, but re-decoding 400k+ gaussians on the
+    // render thread made every City -> Doll switch stall for ~0.5s.
+    if (!g_splatDataInUsePath.empty() && !g_lume.splatData.gaussians.empty()) {
+        g_cachedSplatPath = g_splatDataInUsePath;
+        g_cachedSplatData = std::move(g_lume.splatData);
+    }
+    g_splatDataInUsePath.clear();
+
     g_lume.splatData = SplatData {};
     g_lume.splatLoaded = false;
 }
@@ -1939,7 +1958,14 @@ void LoadSplatModel()
     LOGI("Loading splat model: %{public}s", path.c_str());
 
     bool loaded = false;
-    if (strstr(cfg.file, ".glb") != nullptr) {
+    const auto decodeStart = std::chrono::high_resolution_clock::now();
+    const bool fromCache = !g_cachedSplatPath.empty() && g_cachedSplatPath == path &&
+                           !g_cachedSplatData.gaussians.empty();
+    if (fromCache) {
+        g_lume.splatData = std::move(g_cachedSplatData);
+        g_cachedSplatData = SplatData {};
+        loaded = true;
+    } else if (strstr(cfg.file, ".glb") != nullptr) {
         loaded = LoadUwaSplatGlb(path.c_str(), g_lume.splatData);
     } else if (strstr(cfg.file, ".sog") != nullptr) {
         // SH rest costs 48 floats per gaussian; only decode it when the model
@@ -1956,6 +1982,12 @@ void LoadSplatModel()
         LOGE("Failed to load splat model: %{public}s", path.c_str());
         return;
     }
+
+    g_splatDataInUsePath = path;
+    const auto decodeMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::high_resolution_clock::now() - decodeStart).count();
+    LOGI("Splat %{public}s: %{public}u gaussians, %{public}u ms", fromCache ? "cache" : "decode",
+        g_lume.splatData.gaussianCount, (uint32_t)decodeMs);
 
     g_lume.splatLoaded = true;
     LOGI("Splat loaded: %{public}u gaussians, bounds=(%{public}.2f,%{public}.2f,%{public}.2f)-(%{public}.2f,%{public}.2f,%{public}.2f)",
@@ -2104,7 +2136,9 @@ void DrawFrame()
             }
             LoadSplatModel();
         }
-        g_forceRenderFrames = 30;
+        // Keep the warmup short; 30 frames kept the main thread busy long
+        // enough to delay the first touch after a switch.
+        g_forceRenderFrames = 8;
     }
     g_pendingModelIndex = -1;
 

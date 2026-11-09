@@ -896,6 +896,21 @@ bool GsSystem::Update(bool frameRenderingQueued, uint64_t time, uint64_t delta)
         GS::CreateGsRenderTargets(renderData, renderTargetHostEntity_, loadCtx, renderResolutionFromCC_);
     }
 
+    // A model switch can destroy and recreate the host entity with the same id.
+    // The cloned render data then still reports valid material/targets, but the
+    // new host has no RenderMeshComponent, so the composite quad never reaches
+    // the screen (LumeGS renders into targets that are never sampled).
+    if (EntityUtil::IsValid(renderTargetHostEntity_) && renderData &&
+        dataStoreGs_->GetGsScaleFactor() != 0xFFFFFFFFu && loadCtx.renderMeshManager_ &&
+        !loadCtx.renderMeshManager_->HasComponent(renderTargetHostEntity_) &&
+        !dataStoreGs_->GetGsPrimitives().empty()) {
+        const Entity actualHost = dataStoreGs_->GetGsPrimitives().front().splatEntity;
+        if (actualHost != renderTargetHostEntity_) {
+            renderTargetHostEntity_ = actualHost;
+        }
+        GS::CreateGsRenderTargets(renderData, renderTargetHostEntity_, loadCtx, renderResolutionFromCC_, false);
+    }
+
     // update existing primitive parameters
     for (auto& prim : dataStoreGs_->GetGsPrimitives()) {
         if (auto worldMatrixHandle = wmcm_.Read(prim.splatEntity)) {
