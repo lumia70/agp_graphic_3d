@@ -889,7 +889,11 @@ bool GsSystem::Update(bool frameRenderingQueued, uint64_t time, uint64_t delta)
 #else
         dataStoreGs_->SetGsScaleFactor(2U);
 #endif
-        GS::CreateGsRenderTargets(renderData, renderTargetHostEntity_, loadCtx, previousResolution_);
+        // CreateGsRenderImages applies gsScaleFactor itself. Passing the
+        // already-scaled previousResolution_ here scaled the tiled LOD targets
+        // twice (640x1299 -> 320x650) while the render node kept drawing at
+        // 640x1299, so the 2x composite sampled a mismatched target.
+        GS::CreateGsRenderTargets(renderData, renderTargetHostEntity_, loadCtx, renderResolutionFromCC_);
     }
 
     // update existing primitive parameters

@@ -210,11 +210,14 @@ void CreateGsStatusUbo(GS::GsRenderData* renderData, const GS::GsLoadContext& lo
 {
     RENDER_NS::IGpuResourceManager& gpuResourceMgr = loadCtx.renderContext_->GetDevice().GetGpuResourceManager();
 
-    GsRenderStatusUbo renderStatusUbo;
+    GsRenderStatusUbo renderStatusUbo {};
     renderStatusUbo.jitterFrameRendered = 0;
     renderStatusUbo.frameIdx = 0;
     renderStatusUbo.renderScaleFactor = loadCtx.dataStoreGs_->GetRenderScaleFactor();
     renderStatusUbo.DRSScale = loadCtx.dataStoreGs_->GetDRSScale();
+    // Uninitialized in the original code: a garbage non-zero value makes the
+    // 2x composite shader take the XEG/uGSTex1 path even when XEG is disabled.
+    renderStatusUbo.enableXegUpscale = renderData->enableXegUpscale ? 1u : 0u;
 
     renderStatusUbo.sharpeningCoeff =
         static_cast<const GS::RenderDataStoreDefaultGS*>(loadCtx.dataStoreGs_.get())->GetRenderSharpeningCoefficient();

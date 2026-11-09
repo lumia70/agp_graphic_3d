@@ -1128,7 +1128,6 @@ static void InitGsRenderPath(const char* modelFile)
         const BASE_NS::string uri = BASE_NS::string("file://") + g_filesDir.c_str() + "/assets/" + modelFile;
         gs->gsPath = uri;
         gs->computeLods = false;
-        gs->gsScaleFactor = 1;  // full resolution: the legacy path was full-res
         LOGI("GS path: loading '%{public}s'", uri.c_str());
     }
     // The GS node is inserted into the camera scene RNG (see
@@ -1171,7 +1170,6 @@ static void PollGsRenderPath()
                 BASE_NS::string("file://") + g_filesDir.c_str() + "/assets/" + g_gsModelFile.c_str();
             gs->gsPath = uri;
             gs->computeLods = false;
-            gs->gsScaleFactor = 1;
             LOGI("GS path: switching to '%{public}s'", uri.c_str());
         }
     }

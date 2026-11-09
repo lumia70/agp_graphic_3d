@@ -707,8 +707,6 @@ target_compile_options(LumeGS PRIVATE
 )
 
 # LumeApp: keep tiled LOD at full resolution (the legacy pipeline was full-res).
-target_compile_definitions(LumeGS PRIVATE LUMEAPP_GS_TILING_FULL_RES=1)
-
 target_link_libraries(LumeGS PUBLIC
     LumeEngine
     LumeBase
