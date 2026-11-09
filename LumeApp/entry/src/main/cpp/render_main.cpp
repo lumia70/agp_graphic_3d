@@ -162,6 +162,8 @@ static std::string g_splatDataInUsePath;
 static uint32_t g_splatDecodeGeneration = 0;
 static bool g_splatDecodeQueued = false;
 
+
+
 // ---------------------------------------------------------------------------
 // Orbit Camera for 3DGS scene exploration
 // Free-tumble arcball: orientation accumulated as world-space basis vectors
@@ -1069,6 +1071,7 @@ static float g_gsLodLastView[16] {};
 static float g_gsLodLastProj[16] {};
 static uint32_t g_gsLodLastBudget = 0;
 static size_t g_gsLodLastResident = static_cast<size_t>(-1);
+static bool g_gsLodSettleNeeded = false;
 
 static bool EnsureGsConfiguration()
 {
@@ -1939,9 +1942,21 @@ static void UpdateGsLodTiles()
                             residencyChanged || unresolvedVisible || unresolvedPreload;
     if (needRender) {
         // Same trigger as the system host: a field change (or an unresolved tile)
-        // requests exactly the next frame.
+        // requests exactly the next frame. Do not shorten a longer settle window
+        // requested by the touch-release handler.
+        g_gsLodSettleNeeded = true;
         g_lume.ecs->RequestRender();
-        g_forceRenderFrames = 3;
+        if (g_forceRenderFrames < 3u) {
+            g_forceRenderFrames = 3u;
+        }
+    } else if (g_gsLodSettleNeeded && g_forceRenderFrames == 0u) {
+        // Streaming is idle. Render a final burst so the 4-phase jitter can
+        // finish and the 2x composite switches from the blur path to the
+        // subpixel combine. Doing this after (not during) a drag keeps input
+        // responsive.
+        g_gsLodSettleNeeded = false;
+        g_forceRenderFrames = 24u;
+        g_lume.ecs->RequestRender();
     }
 
     if (selectionChanged || visibleChanged) {
@@ -2333,7 +2348,12 @@ void DrawFrame()
         }
     }
 
-    // TickFrame updates internal time and drives all ECS systems.
+    // TickFrame updates internal time and drives all ECS systems. A forced frame
+    // must also be requested from the engine; otherwise TickFrame can report no
+    // work and the 4-frame jitter accumulation never completes (2x stays soft).
+    if (g_forceRenderFrames > 0) {
+        g_lume.ecs->RequestRender();
+    }
     CORE_NS::IEcs* ecsArr[] = { g_lume.ecs.get() };
     bool needsRender = g_lume.engine->TickFrame(
         BASE_NS::array_view<CORE_NS::IEcs*>(ecsArr, 1u));
@@ -2342,6 +2362,7 @@ void DrawFrame()
     // This keeps the GPU idle (and the device cool) between interactions.
     bool viewChanged = (std::memcmp(g_lastRenderedView, g_gaussianCameraData.view,
                             sizeof(g_lastRenderedView)) != 0);
+
     if (g_forceRenderFrames > 0) {
         g_forceRenderFrames--;
     }
@@ -2521,8 +2542,10 @@ void DispatchTouchEvent(OH_NativeXComponent* component, void* window)
         break;
     }
     case OH_NATIVEXCOMPONENT_MOVE: {
-        // Keep rendering for a couple frames after the last touch event
-        g_forceRenderFrames = 3;
+        // During the drag the camera change itself requests a frame; keep the
+        // forced window small so the UI thread stays free for touch delivery.
+        // The longer settle burst is scheduled on UP below.
+        g_forceRenderFrames = 1;
         if (touchEvent.numPoints >= 2 && g_orbitCam.pinching) {
             // Pinch zoom
             float x1 = touchEvent.touchPoints[0].x;
@@ -2578,6 +2601,9 @@ void DispatchTouchEvent(OH_NativeXComponent* component, void* window)
     case OH_NATIVEXCOMPONENT_CANCEL:
         g_orbitCam.dragging = false;
         g_orbitCam.pinching = false;
+        // Settle after the finger lifts, not while the drag is active. LOD needs
+        // enough frames for sort + precompute + 4 jitter phases.
+        g_forceRenderFrames = g_gsLodActive ? 24u : 6u;
         // Double-tap: toggle between the far framing and the model centre
         {
             struct timespec ts;

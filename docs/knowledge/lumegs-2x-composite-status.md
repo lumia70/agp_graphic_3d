@@ -2,7 +2,7 @@
 
 > 更新时间：2026-11-09
 > 基线 commit：`c9c5485c`（fix: lod not render well on 2x gsScaleFactor pipeline）
-> 工作区状态：基线 `48175b56`（2x 白屏/B 回切/Doll 缓存）；当前工作区含异步解码（未提交）
+> 工作区状态：基线 `3dc3764e`（2x 白屏/B 回切/Doll 缓存/异步解码）；当前工作区含 2x jitter 修复（未提交）
 > 关联文档：[LumeGS 接入现状](lumegs-integration-status.md)、[tiling host 渐进加载与首帧经验](lumegs-tiling-host-lessons.md)
 
 ---
@@ -16,7 +16,7 @@
 | 2x 默认分辨率（系统侧同款默认值） | ✅ 白屏根因已修复并提交（`c9c5485c`），可出画（截图 mean ≈ 117.5） |
 | Doll → City 冷启动白屏 | ✅ 根因已确认并修复（§4.2），设备 8/8 冷启动 + 8/8 回切通过（未提交） |
 | 切 Doll 后 5s 内滑动卡顿 | ✅ 已解决：SplatData 单条缓存 + `g_forceRenderFrames` 30→8 + 首次加载 worker 异步解码；切换帧 <100ms（§4.3） |
-| 2x 画质 | ❌ 遗留（§4.1） |
+| 2x 画质 | 🟡 主要问题已修复：jitter 累积被 `needsRender`/force=3 截断；修复后 City edge 10.7→13.16（1x 14.3），残留轻微 softness/亮度差（§4.1） |
 | 设备安装版本 | ✅ 已安装当前工作区构建（含 B 修复 + 临时日志） |
 
 三个遗留问题（用户 2026-11-08 反馈）：
@@ -117,55 +117,71 @@ render node 仍按 640x1299 绘制，composite 采样 320x650 → 全白。
 
 ### 4.1 问题 A：2x 颜色偏怪、精细度略差于 1x
 
-**结论：部分是 2x 设计必然，但有一个代码级可疑点。**
+**已确认主因：4 帧 jitter 累积被 app 的渲染门控截断，2x composite 停在
+5-tap 模糊路径，而不是 4 帧子像素重建。**
 
-#### A-1（代码级，优先验证）combine 帧的 sharpening 邻居取错纹理
+#### 设备 A/B（同一默认视角，静止截图）
 
-`gs3d_gaussian_splatting.frag`：
+1x 对照通过临时 `gs->gsScaleFactor=1` 构建：
 
-```glsl
-// 静态收敛帧：center 是 4 张 target 的子像素混合
-const vec4 sampleColor = GetJitterCombinedSample(texCoords, fullResPixelCoord);
-// 但 ApplySharpening 内部只从 uGSTex0 取 top/bottom/left/right
-const vec4 sharpened = ApplySharpening(sampleColor, texCoords, pixelOffset, sharpCoef);
-```
+| 场景 | 指标 | 1x | 2x 修复前 | 2x 修复后 |
+| --- | --- | --- | --- | --- |
+| City | edge 强度 | 14.3 | **10.7** | **13.16** |
+| City | RGB mean | 116.1,121.3,112.6 | 117.5,122.8,113.6 | 117.5,122.7,113.6 |
+| City | saturation | 50.9 | 50.2 | 50.8 |
+| Doll | 与 1x diff | — | 0.03 | 0.09 |
 
-`ApplySharpening()`（`gs3d_gaussian_splatting.frag:93-115`）的 4 个邻居固定采样
-`uGSTex0`，而 `centerColor` 是 4 帧混合结果。两者来自不同 jitter 相位 →
-在边缘会产生亮度/色度错位（彩边、过冲），sharpening 系数 0.75 时更明显。
-预览帧（`jitterFrameRendered != 4`）center 与邻居都来自 `uGSTex0`，反而一致。
+原因链：
 
-**修复方向（任选，先做最保守的）**：
+- composite 只有在 `jitterFrameRendered == 4` 时才走 4 帧重建，否则走
+  `uGSTex0` 的 5-tap 模糊上采样。
+- 到 4 需要连续 4 个 accum 帧，每帧还可能穿插 tiled precompute。
+- `DrawFrame` 原来只用 `viewChanged || g_forceRenderFrames > 0` 决定是否
+  `RenderFrame`，**忽略 `TickFrame` 返回的 `needsRender`**；触摸又只给
+  `g_forceRenderFrames = 3`。3 帧不足以完成 4 相位（还要 sort/precompute），
+  `keepDirty` 的后续请求也被丢掉 → 停在 j=0..2 → 一直模糊。
+- LOD 状态机的 sort/precompute 还会把 `jitterRendered_` 重置为 0，进一步拉长
+  收敛时间。
 
-1. combine 帧跳过 sharpening（或把 `sharpCoef` 乘 0 验证）；
-2. 用同一 jitter 相位计算邻居（4 个 target 各算一次再混合）；
-3. 先用 `renderSharpeningCoefficient=0` 做 A/B，确认问题是否消失。
+#### 修复（未提交）
 
-#### A-2（调参）covariance / sharpening 高于默认
+第一版把 `needsRender` 纳入 `doRender` 并让触摸强制 8 帧，虽然把 City edge 提到
+13.16，但引入了两个回归：Doll 每次滑动都渲染 8 帧（~25ms/帧）导致输入延迟；
+LOD 在滑动期间连续渲染/选层，出现回弹。最终方案改为**只在手指抬起后 settle**：
 
-| 参数 | 默认 | app 当前 | 影响 |
-| --- | --- | --- | --- |
-| `renderSharpeningCoefficient` | 0.25 | **0.75** | 过冲、边缘偏亮/偏脏 |
-| `renderCovarianceStddev` | 2.0 | **2.25** | splat 更大、叠层更厚、颜色更糊更亮 |
-| `convertGsColorSrgb` | true | true | 1x/2x 一致，不是差异来源 |
+- `render_main.cpp`：
+  - `g_forceRenderFrames > 0` 时调用 `ecs->RequestRender()`，保证强制帧执行；
+  - MOVE：`g_forceRenderFrames = 1`（相机变化本身会出一帧，拖动期间不长时间占用 UI 线程）；
+  - UP/CANCEL：LOD 设置 24 帧、Doll 设置 6 帧，用于 sort + precompute + 4 jitter 相位；
+  - LOD 状态机 `needRender` 时记录 `g_gsLodSettleNeeded`，并在 streaming 空闲且
+    force 归零时补一次 24 帧 settle burst（避免初始加载/选层把 jitter 重置后停在模糊路径）；
+  - LOD 状态机的 `force=3` 改为只增不减，避免覆盖 UP 的 settle。
+- `doRender` 恢复原门控（`viewChanged || force>0`），不再把任意 `needsRender`
+  都当作持续渲染请求。
+- 结果：City 2x edge **13.15**（1x 14.3，差约 8%），Doll 1x/2x diff 0.09；
+  Doll 拖动 touch gap 回到 33–55ms；City 相机日志中只有触摸期间（age 0–4ms）
+  的变化，没有非触摸回弹。
 
-#### A-3（设计）运动时只有 5-tap 模糊，静止才 4 帧混合
+#### 回归记录（第一版引入，已修正）
 
-- 拖动/运动时：preview 帧 → `jitterFrameRendered=1` → 单张半分辨率 target 的
-  5-tap 模糊上采样 → 必然比 1x 软。
-- 静止 ~4 帧后：`jitterFrameRendered=4` → 4 相位重建，细节应接近 1x。
-- 判断标准：**静止截图**对比 1x；如果静止仍明显差，问题在 A-1/A-2，
-  而不是 jitter 上采样本身。
+| 现象 | 原因 | 处理 |
+| --- | --- | --- |
+| Doll 每次滑动都延迟 | 每个 MOVE 强制 8 帧，每帧 ~25ms，UI 线程持续繁忙 | MOVE 改为 force=1，settle 放到 UP |
+| LOD 滑动中多次回弹 | 滑动期间连续 `needsRender` 渲染 + 选层/sort 抖动 | 恢复原门控，只在 UP/streaming 空闲后 settle |
 
-#### 判别实验（按顺序）
+#### 残留（可选）
 
-```text
-1) sharpening=0.75 -> 0，静止截图对比 1x；
-2) covariance=2.25 -> 2.0，再对比；
-3) 若仍偏色，临时让 combine 帧直接输出 sampleColor（跳过 sharpen）再对比；
-4) 记录静止帧的 renderStatus：jitterFrameRendered / renderScaleFactor /
-   DRSScale / convertColorSrgb / sharpeningCoeff。
-```
+1. City 2x 仍比 1x 略软、略亮（RGB +1.4，sat -0.1），可能是半分辨率上采样
+   的固有差异。
+2. combine 帧的 `ApplySharpening` 邻居仍只取 `uGSTex0`
+   （`gs3d_gaussian_splatting.frag:93-115`），与 4 帧 center 相位不一致，
+   可能造成轻微彩边/过冲；可改成 4 target 一致采样或 combine 帧跳过 sharpening。
+3. app 仍是 `sharpening=0.75` / `covariance=2.25`（默认 0.25/2.0），可做最后
+   调参 A/B。
+
+#### 关联日志（定位期，已移除）
+
+- `GS jitter: j/preview/accum/cam/sort/pre/scene/resInit/loaded/vp/sv/du`
 
 ### 4.2 问题 B：Doll → LOD 回切后整屏偏白（最高优先级）
 
@@ -356,7 +372,9 @@ loading side 的 `isMaterialValid=false`（pool entity 已换，mesh 必须重�
 
 1. LumeGS Doll 回切 composite 黑屏（见下），去掉 legacy 双路径；
 2. `model renderable` 后 legacy 首次上传约 149ms；
-3. 解码期间的 loading/交互保留（UX）。
+3. 解码期间的 loading/交互保留（UX）；
+4. 首次进入 City 的 0.5–1s 内，streaming/选层/sort 仍会占用主线程，
+   左右转动视角有轻微卡顿；后续可考虑预加载、分帧或降低首次选层频率。
 
 #### LumeGS-only Doll 的额外发现
 
@@ -455,7 +473,10 @@ python -c "from PIL import Image,ImageStat; im=Image.open(r'C:\...\a.jpeg').conv
    `g_forceRenderFrames` 30→8 + SplatData 零拷贝缓存 + 首次加载 worker 异步解码；
    City→Doll 切换帧 <100ms，0.8s 首滑 gap 98–103ms。剩余仅解码期间的 loading/交互保留
    与 legacy 首次上传 ~149ms。
-3. **问题 A**：先关 sharpening（0 或 0.25）做 A/B；再修 combine 帧邻居纹理不一致。
+3. ~~**问题 A**：先关 sharpening（0 或 0.25）做 A/B；再修 combine 帧邻居纹理不一致。~~
+   ✅ 主因已修复（jitter 累积被 `needsRender`/force=3 截断）；City 2x edge
+   10.7→13.16（1x 14.3）。残留约 8% 边缘差与轻微亮度差，可选修 combine
+   sharpening 邻居或调参。
 4. 三项都验证后，删除 `TEMP-DIAG` 日志，补 `lumegs-tiling-host-lessons.md` 的结论与未完成项。
 
 ---
