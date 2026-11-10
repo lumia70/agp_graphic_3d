@@ -1,2 +1,10 @@
 # hvigor / DevEco build caches created at the repo root when building LumeApp
 /.hvigor/
+
+# LumeGS generated ROFS embed (large, changes on every shader pack)
+LumeApp/entry/.generated/
+LumeApp/entry/.cxx/
+LumeApp/entry/src/main/cpp/generated/
+
+__pycache__/
+*.pyc

@@ -626,6 +626,14 @@ target_link_libraries(LumeRender PUBLIC
 
 # ---------- LumeGS (official Gaussian splatting plugin, shared library) ----------
 set(LUME_GS_DIR ${ENGINE_ROOT}/LumeGS)
+# The ROFS embed is generated (and git-ignored) to keep the large blob out of
+# the source tree. Fail with an actionable message instead of a missing source.
+if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../../../.generated/gs_rofs_embed.cpp")
+    message(FATAL_ERROR
+        "Missing LumeGS ROFS embed. From the repo root run:\n"
+        "  python LumeApp/tools/gs_assets/compile_gs_shaders.py\n"
+        "  python LumeApp/tools/gs_assets/pack_gs_rofs.py")
+endif()
 add_library(LumeGS SHARED
     ${LUME_GS_DIR}/src/component_dll.cpp
     ${LUME_GS_DIR}/src/components/gs_component.cpp
@@ -667,7 +675,7 @@ add_library(LumeGS SHARED
     ${LUME_GS_DIR}/src/webp/image_loader_webp_imagekit.cpp
     ${LUME_GS_DIR}/version.cpp
     ${ENGINE_ROOT}/LumeEngine/api/core/property_tools/property_data.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/generated/gs_rofs_embed.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../.generated/gs_rofs_embed.cpp
 )
 
 target_include_directories(LumeGS

@@ -1,1 +1,3 @@
 lume/LumeEngine/test/fuzztest/** !text !filter !merge !diff
+LumeApp/entry/.generated/** -diff -text
+LumeApp/entry/src/main/cpp/generated/** -diff -text

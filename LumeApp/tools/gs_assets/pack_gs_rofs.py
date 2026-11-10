@@ -101,8 +101,10 @@ def main():
     repo = os.path.abspath(args.repo)
     spv_dir = os.path.abspath(args.spv) if args.spv else os.path.join(
         repo, "LumeApp", "entry", ".cxx", "gs_assets")
+    # Keep generated blobs out of the tracked source tree (and out of the
+    # opencode snapshot): the embed is large and changes on every pack.
     out_dir = os.path.abspath(args.out) if args.out else os.path.join(
-        repo, "LumeApp", "entry", "src", "main", "cpp", "generated")
+        repo, "LumeApp", "entry", ".generated")
     os.makedirs(out_dir, exist_ok=True)
 
     files = collect(repo, spv_dir, args.empty)
