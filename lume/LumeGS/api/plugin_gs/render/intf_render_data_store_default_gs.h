@@ -360,6 +360,11 @@ struct GsRenderData {
     // the number of all GS elements, LOD0 + LOD1
     uint32_t GetTotalGsCount() const
     {
+        // Tiled mode stores all splats in the shared tile pool; the SH compute
+        // walks the pool range instead of the per-object CPU array.
+        if (isTiled && tilePool) {
+            return tilePool->splatCapacity;
+        }
         return (uint32_t)gaussianPositions.size();
     }
 

@@ -1,5 +1,5 @@
-/*
- * Lume 3D engine rendering demo — full engine init via XComponent.
+﻿/*
+ * Lume 3D engine rendering demo â€” full engine init via XComponent.
  *
  * Phase 3: Initialize the Lume engine with Vulkan backend, create ECS,
  * load a 3D Gaussian Splatting model, set up camera + light, and render via
@@ -122,7 +122,7 @@ struct LumeState {
     uint64_t height = 0;
     bool ready = false;
 
-    // Engine objects — ordered by destruction dependency (reverse init order).
+    // Engine objects â€” ordered by destruction dependency (reverse init order).
     CORE_NS::IEcs::Ptr ecs;
     CORE3D_NS::IGraphicsContext::Ptr graphicsContext;
     RENDER_NS::IRenderContext::Ptr renderContext;
@@ -167,13 +167,15 @@ static bool g_splatDecodeQueued = false;
 // ---------------------------------------------------------------------------
 // Orbit Camera for 3DGS scene exploration
 // Free-tumble arcball: orientation accumulated as world-space basis vectors
-// (right/up/back) with Rodrigues rotations — no gimbal lock, no pitch clamp.
+// (right/up/back) with Rodrigues rotations â€” no gimbal lock, no pitch clamp.
 // ---------------------------------------------------------------------------
 struct OrbitCamera {
     // Camera basis in world space (orthonormal)
     float rightX = 1.f, rightY = 0.f, rightZ = 0.f;
     float upX = 0.f, upY = 1.f, upZ = 0.f;
     float backX = 0.f, backY = 0.f, backZ = 1.f;
+    // World-up hint used to keep yaw free of roll (scene cameraInfo.lookUp).
+    float upHintX = 0.f, upHintY = 1.f, upHintZ = 0.f;
 
     float fovYDeg = 60.0f;  // vertical field of view (per-model)
     float shDeg1 = 0.0f;    // SH degree-1 weight (per-model)
@@ -228,17 +230,43 @@ struct OrbitCamera {
         vx = nx; vy = ny; vz = nz;
     }
 
-    // Tumble: rotate around camera up (yaw feel) and camera right (pitch feel)
+    // Tumble: yaw around the world-up hint (turntable, no roll) and pitch
+    // around camera right, then re-derive right/up so repeated rotations do
+    // not accumulate a tilted horizon.
     void Tumble(float yawDelta, float pitchDelta) {
         if (yawDelta != 0.f) {
-            // rotate right & back around up
-            RotateVec(rightX, rightY, rightZ, upX, upY, upZ, yawDelta);
-            RotateVec(backX, backY, backZ, upX, upY, upZ, yawDelta);
+            // rotate right & back around the world-up hint, not the possibly
+            // pitched camera up; yawing around camera up is what caused the
+            // tilted horizon after looking up/down.
+            RotateVec(rightX, rightY, rightZ, upHintX, upHintY, upHintZ, yawDelta);
+            RotateVec(backX, backY, backZ, upHintX, upHintY, upHintZ, yawDelta);
         }
         if (pitchDelta != 0.f) {
             // rotate up & back around right
             RotateVec(upX, upY, upZ, rightX, rightY, rightZ, pitchDelta);
             RotateVec(backX, backY, backZ, rightX, rightY, rightZ, pitchDelta);
+        }
+
+        // Re-orthonormalize against the up hint. right = normalize(upHint x back),
+        // up = normalize(back x right). If the view is (nearly) parallel to the
+        // hint, keep the current right/up to avoid a degenerate basis.
+        const float rxh = upHintY * backZ - upHintZ * backY;
+        const float ryh = upHintZ * backX - upHintX * backZ;
+        const float rzh = upHintX * backY - upHintY * backX;
+        const float rlh = std::sqrt(rxh * rxh + ryh * ryh + rzh * rzh);
+        if (rlh > 1e-4f) {
+            rightX = rxh / rlh;
+            rightY = ryh / rlh;
+            rightZ = rzh / rlh;
+        }
+        const float ux = backY * rightZ - backZ * rightY;
+        const float uy = backZ * rightX - backX * rightZ;
+        const float uz = backX * rightY - backY * rightX;
+        const float ul = std::sqrt(ux * ux + uy * uy + uz * uz);
+        if (ul > 1e-4f) {
+            upX = ux / ul;
+            upY = uy / ul;
+            upZ = uz / ul;
         }
     }
 
@@ -247,7 +275,7 @@ struct OrbitCamera {
         const float ex = targetX + backX * distance;
         const float ey = targetY + backY * distance;
         const float ez = targetZ + backZ * distance;
-        // Column-major view matrix (world→view): rows = right, up, back
+        // Column-major view matrix (worldâ†’view): rows = right, up, back
         // (view space: camera at origin looking down -Z, so in-front points have z < 0)
         out[ 0]=rightX;  out[ 1]=upX;   out[ 2]=backX;  out[ 3]=0.f;
         out[ 4]=rightY;  out[ 5]=upY;   out[ 6]=backY;  out[ 7]=0.f;
@@ -345,12 +373,91 @@ struct OrbitCamera {
 };
 OrbitCamera g_orbitCam;
 
+// Build an orthonormal camera basis from the scene cameraInfo. `lookUp` is
+// used as the up hint (orthogonalized against the view direction), so a scene
+// with a non-world-up metadata camera does not get a rolled view.
+static void SetOrbitBasisFromLookAt(const float camPos[3], const float camLookAt[3], const float camLookUp[3])
+{
+    float bx = camPos[0] - camLookAt[0];
+    float by = camPos[1] - camLookAt[1];
+    float bz = camPos[2] - camLookAt[2];
+    float len = std::sqrt(bx * bx + by * by + bz * bz);
+    if (len < 1e-3f) {
+        bx = 0.0f;
+        by = 0.0f;
+        bz = 1.0f;
+        len = 1.0f;
+    }
+    bx /= len;
+    by /= len;
+    bz /= len;
+
+    float ux = camLookUp[0];
+    float uy = camLookUp[1];
+    float uz = camLookUp[2];
+    float ul = std::sqrt(ux * ux + uy * uy + uz * uz);
+    if (ul < 1e-4f) {
+        ux = 0.0f;
+        uy = 1.0f;
+        uz = 0.0f;
+        ul = 1.0f;
+    }
+    ux /= ul;
+    uy /= ul;
+    uz /= ul;
+
+    // Keep the metadata up as the yaw hint so rotating in place does not roll.
+    g_orbitCam.upHintX = ux;
+    g_orbitCam.upHintY = uy;
+    g_orbitCam.upHintZ = uz;
+
+    // right = normalize(lookUp x back)
+    float rx = uy * bz - uz * by;
+    float ry = uz * bx - ux * bz;
+    float rz = ux * by - uy * bx;
+    float rl = std::sqrt(rx * rx + ry * ry + rz * rz);
+    if (rl < 1e-4f) {
+        rx = 1.0f;
+        ry = 0.0f;
+        rz = 0.0f;
+        rl = 1.0f;
+    }
+    rx /= rl;
+    ry /= rl;
+    rz /= rl;
+
+    // up = normalize(back x right)
+    ux = by * rz - bz * ry;
+    uy = bz * rx - bx * rz;
+    uz = bx * ry - by * rx;
+    ul = std::sqrt(ux * ux + uy * uy + uz * uz);
+    if (ul < 1e-4f) {
+        ux = 0.0f;
+        uy = 1.0f;
+        uz = 0.0f;
+    } else {
+        ux /= ul;
+        uy /= ul;
+        uz /= ul;
+    }
+
+    g_orbitCam.backX = bx;
+    g_orbitCam.backY = by;
+    g_orbitCam.backZ = bz;
+    g_orbitCam.rightX = rx;
+    g_orbitCam.rightY = ry;
+    g_orbitCam.rightZ = rz;
+    g_orbitCam.upX = ux;
+    g_orbitCam.upY = uy;
+    g_orbitCam.upZ = uz;
+}
+
 // Render-on-demand state: only render when the view changed or shortly after interaction.
 static uint32_t g_forceRenderFrames = 30;  // render this many frames after startup/touch
 static float g_lastRenderedView[16] = {};
 
 // ---------------------------------------------------------------------------
-// Rawfile extraction — copy HAP rawfile assets to app sandbox for file:// access
+// Rawfile extraction â€” copy HAP rawfile assets to app sandbox for file:// access
 // ---------------------------------------------------------------------------
 
 static void MkdirRecursive(const std::string& path)
@@ -399,11 +506,11 @@ static bool ExtractRawDir(NativeResourceManager* resMgr, const std::string& rawD
                 }
             } else {
                 OH_ResourceManager_CloseRawFile(file);
-                // Size 0 might be a directory — try recursion
+                // Size 0 might be a directory â€” try recursion
                 ExtractRawDir(resMgr, rawPath, destPath);
             }
         } else {
-            // Not a file — try as subdirectory
+            // Not a file â€” try as subdirectory
             ExtractRawDir(resMgr, rawPath, destPath);
         }
     }
@@ -550,7 +657,7 @@ bool InitEngine()
     fm.RegisterPath("rofsRndr", renderUri, false);
     fm.RegisterPath("rofs3D", tdUri, false);
 
-    // Root protocol paths — 3d:// and render:// point to the root of 3d/render asset dirs
+    // Root protocol paths â€” 3d:// and render:// point to the root of 3d/render asset dirs
     fm.RegisterPath("3d", tdUri, false);
     fm.RegisterPath("render", renderUri, false);
 
@@ -580,11 +687,11 @@ bool InitEngine()
     LOGI("All shader paths registered (file:// backed)");
 
     // CRITICAL: Must call LoadPlugins on the PluginRegistry to trigger
-    // GatherStaticPlugins → RegisterPlugin → registerInterfaces.
+    // GatherStaticPlugins â†’ RegisterPlugin â†’ registerInterfaces.
     LOGI("Loading plugins via PluginRegistry...");
     CORE_NS::GetPluginRegister().LoadPlugins({});
     auto loadedPlugins = CORE_NS::GetPluginRegister().GetPlugins();
-    LOGI("PluginRegistry::LoadPlugins done — %{public}zu plugins loaded", loadedPlugins.size());
+    LOGI("PluginRegistry::LoadPlugins done â€” %{public}zu plugins loaded", loadedPlugins.size());
     for (size_t i = 0; i < loadedPlugins.size(); ++i) {
         if (loadedPlugins[i]) {
             LOGI("  Plugin[%{public}zu]: %{public}s", i, loadedPlugins[i]->name);
@@ -633,7 +740,7 @@ bool InitRenderContext()
     renderCI.applicationInfo.name = "LumeApp";
     renderCI.deviceCreateInfo.backendType = RENDER_NS::DeviceBackendType::VULKAN;
 
-    // CRITICAL: RenderContext::Init() registers rendershaders → rofsRndr://shaders/, etc.
+    // CRITICAL: RenderContext::Init() registers rendershaders â†’ rofsRndr://shaders/, etc.
     // Since RENDER_EMBEDDED_ASSETS_ENABLED=0, rofsRndr filesystem doesn't exist.
     // Register rofsRndr as a path alias to our file:// render shader directory BEFORE Init().
     {
@@ -641,7 +748,7 @@ bool InitRenderContext()
         const std::string shaderBase = g_filesDir + "/shaders";
         const BASE_NS::string renderUri = BASE_NS::string("file://") + shaderBase.c_str() + "/render/";
         fm.RegisterPath("rofsRndr", renderUri, false);
-        LOGI("Registered rofsRndr → %{public}s (before RenderContext::Init)", renderUri.c_str());
+        LOGI("Registered rofsRndr â†’ %{public}s (before RenderContext::Init)", renderUri.c_str());
     }
 
     auto result = g_lume.renderContext->Init(renderCI);
@@ -654,7 +761,7 @@ bool InitRenderContext()
     g_lume.device = &g_lume.renderContext->GetDevice();
     g_lume.renderer = &g_lume.renderContext->GetRenderer();
 
-    // Create swapchain handle — only use CreateSwapchainHandle, not CreateSwapchain
+    // Create swapchain handle â€” only use CreateSwapchainHandle, not CreateSwapchain
     RENDER_NS::SwapchainCreateInfo swapCI {};
     swapCI.window.window = reinterpret_cast<uintptr_t>(g_lume.nativeWindow);
     swapCI.swapchainFlags =
@@ -687,7 +794,7 @@ bool InitGraphicsContext()
 
     CORE3D_NS::IGraphicsContext::CreateInfo gfxCI {};
 
-    // CRITICAL: GraphicsContext::Init() registers 3dshaders → rofs3D://shaders/, etc.
+    // CRITICAL: GraphicsContext::Init() registers 3dshaders â†’ rofs3D://shaders/, etc.
     // In normal OpenHarmony builds, rofs3D is an embedded ROFS filesystem in the .so.
     // Since CORE3D_EMBEDDED_ASSETS_ENABLED=0, we need to register rofs3D as a path
     // pointing to our file:// shader directory BEFORE Init() runs.
@@ -696,7 +803,7 @@ bool InitGraphicsContext()
         const std::string shaderBase = g_filesDir + "/shaders";
         const BASE_NS::string tdUri = BASE_NS::string("file://") + shaderBase.c_str() + "/3d/";
         fm.RegisterPath("rofs3D", tdUri, false);
-        LOGI("Registered rofs3D → %{public}s (before GraphicsContext::Init)", tdUri.c_str());
+        LOGI("Registered rofs3D â†’ %{public}s (before GraphicsContext::Init)", tdUri.c_str());
     }
 
     g_lume.graphicsContext->Init(gfxCI);
@@ -789,7 +896,7 @@ void SetupCameraAndLight()
 
     // Create a camera looking at the origin from a reasonable distance.
     const BASE_NS::Math::Vec3 cameraPos { 0.0f, 1.0f, 3.0f };
-    const BASE_NS::Math::Quat cameraRot {}; // identity — we use LookAt below
+    const BASE_NS::Math::Quat cameraRot {}; // identity â€” we use LookAt below
     const float zNear = 0.1f;
     const float zFar = 100.0f;
     const float fovDeg = 60.0f;
@@ -848,7 +955,7 @@ void SetupCameraAndLight()
 
         LOGI("RenderConfigurationComponent added to camera entity (CREATE_RNGS_BIT enabled by default)");
     } else {
-        LOGE("IRenderConfigurationComponentManager not found — rendering will be black");
+        LOGE("IRenderConfigurationComponentManager not found â€” rendering will be black");
     }
 
     LOGI("Camera created and positioned at (0, 1, 3) looking at origin");
@@ -1095,6 +1202,8 @@ static bool EnsureGsConfiguration()
             cfg->convertGsColorSrgb = true;
             cfg->renderCovarianceStddev = 2.25f;
             cfg->renderSharpeningCoefficient = 0.75f;
+            // Phase A: tiled SH needs the 64 B non-packed tile layout.
+            cfg->enableTilePackedData = false;
         }
         LOGI("GS path: configuration entity created");
     }
@@ -1294,37 +1403,15 @@ void LoadLodScene(const DemoModelConfig& cfg)
     g_orbitCam.shDeg1 = cfg.shDeg1;
     g_orbitCam.shDeg23 = cfg.shDeg23;
 
-    // Camera from the scene metadata: eye = cameraInfo.position, target = lookAt.
-    float bx = scene.camPos[0] - scene.camLookAt[0];
-    float by = scene.camPos[1] - scene.camLookAt[1];
-    float bz = scene.camPos[2] - scene.camLookAt[2];
-    float len = std::sqrt(bx * bx + by * by + bz * bz);
+    // Camera from the scene metadata: eye = cameraInfo.position, target = lookAt,
+    // up = cameraInfo.lookUp (orthogonalized).
+    float len = std::sqrt((scene.camPos[0] - scene.camLookAt[0]) * (scene.camPos[0] - scene.camLookAt[0]) +
+                          (scene.camPos[1] - scene.camLookAt[1]) * (scene.camPos[1] - scene.camLookAt[1]) +
+                          (scene.camPos[2] - scene.camLookAt[2]) * (scene.camPos[2] - scene.camLookAt[2]));
     if (len < 1e-3f) {
-        bx = 0.0f;
-        by = 0.0f;
-        bz = 1.0f;
         len = 1.0f;
     }
-    g_orbitCam.backX = bx / len;
-    g_orbitCam.backY = by / len;
-    g_orbitCam.backZ = bz / len;
-    // right = normalize(up x back), up = back x right
-    float rx = 1.0f * g_orbitCam.backZ - 0.0f * g_orbitCam.backY;
-    float ry = 0.0f * g_orbitCam.backX - 0.0f * g_orbitCam.backZ;
-    float rz = 0.0f * g_orbitCam.backY - 1.0f * g_orbitCam.backX;
-    float rl = std::sqrt(rx * rx + ry * ry + rz * rz);
-    if (rl < 1e-4f) {
-        rx = 1.0f;
-        ry = 0.0f;
-        rz = 0.0f;
-        rl = 1.0f;
-    }
-    g_orbitCam.rightX = rx / rl;
-    g_orbitCam.rightY = ry / rl;
-    g_orbitCam.rightZ = rz / rl;
-    g_orbitCam.upX = g_orbitCam.backY * g_orbitCam.rightZ - g_orbitCam.backZ * g_orbitCam.rightY;
-    g_orbitCam.upY = g_orbitCam.backZ * g_orbitCam.rightX - g_orbitCam.backX * g_orbitCam.rightZ;
-    g_orbitCam.upZ = g_orbitCam.backX * g_orbitCam.rightY - g_orbitCam.backY * g_orbitCam.rightX;
+    SetOrbitBasisFromLookAt(scene.camPos, scene.camLookAt, scene.camLookUp);
 
     // First-person pose: the pivot is the eye itself (the view direction is
     // still towards lookAt). Switching to orbit later backs off by `len`.
@@ -1465,36 +1552,13 @@ static void ApplyGsLodCamera(const lod::Scene& scene, const DemoModelConfig& cfg
     g_orbitCam.shDeg1 = cfg.shDeg1;
     g_orbitCam.shDeg23 = cfg.shDeg23;
 
-    float bx = scene.camPos[0] - scene.camLookAt[0];
-    float by = scene.camPos[1] - scene.camLookAt[1];
-    float bz = scene.camPos[2] - scene.camLookAt[2];
-    float len = std::sqrt(bx * bx + by * by + bz * bz);
+    float len = std::sqrt((scene.camPos[0] - scene.camLookAt[0]) * (scene.camPos[0] - scene.camLookAt[0]) +
+                          (scene.camPos[1] - scene.camLookAt[1]) * (scene.camPos[1] - scene.camLookAt[1]) +
+                          (scene.camPos[2] - scene.camLookAt[2]) * (scene.camPos[2] - scene.camLookAt[2]));
     if (len < 1e-3f) {
-        bx = 0.0f;
-        by = 0.0f;
-        bz = 1.0f;
         len = 1.0f;
     }
-    g_orbitCam.backX = bx / len;
-    g_orbitCam.backY = by / len;
-    g_orbitCam.backZ = bz / len;
-    // right = normalize(up x back), up = back x right
-    float rx = 1.0f * g_orbitCam.backZ - 0.0f * g_orbitCam.backY;
-    float ry = 0.0f * g_orbitCam.backX - 0.0f * g_orbitCam.backZ;
-    float rz = 0.0f * g_orbitCam.backY - 1.0f * g_orbitCam.backX;
-    float rl = std::sqrt(rx * rx + ry * ry + rz * rz);
-    if (rl < 1e-4f) {
-        rx = 1.0f;
-        ry = 0.0f;
-        rz = 0.0f;
-        rl = 1.0f;
-    }
-    g_orbitCam.rightX = rx / rl;
-    g_orbitCam.rightY = ry / rl;
-    g_orbitCam.rightZ = rz / rl;
-    g_orbitCam.upX = g_orbitCam.backY * g_orbitCam.rightZ - g_orbitCam.backZ * g_orbitCam.rightY;
-    g_orbitCam.upY = g_orbitCam.backZ * g_orbitCam.rightX - g_orbitCam.backX * g_orbitCam.rightZ;
-    g_orbitCam.upZ = g_orbitCam.backX * g_orbitCam.rightY - g_orbitCam.backY * g_orbitCam.rightX;
+    SetOrbitBasisFromLookAt(scene.camPos, scene.camLookAt, scene.camLookUp);
 
     // First-person pose: the pivot is the eye itself (the view direction is
     // still towards lookAt). Switching to orbit later backs off by `len`.
@@ -2138,6 +2202,10 @@ static void ApplySplatModelData(const SplatDecodeTask& task)
         g_orbitCam.upX = 0.f; g_orbitCam.upY = 1.f; g_orbitCam.upZ = 0.f;
         g_orbitCam.backX = 0.f; g_orbitCam.backY = 0.f; g_orbitCam.backZ = 1.f;
     }
+    // Yaw around the same up hint as the configured view; prevents roll.
+    g_orbitCam.upHintX = g_orbitCam.upX;
+    g_orbitCam.upHintY = g_orbitCam.upY;
+    g_orbitCam.upHintZ = g_orbitCam.upZ;
 
     // Orbit around the subject. A recorded target is only used when the caller
     // asked for one explicitly (all-zero target means "use the centroid").
@@ -2473,7 +2541,7 @@ void OnSurfaceCreated(OH_NativeXComponent* component, void* window)
         // RenderSystem's meshGeneration_ counter absorbs the mesh creation and the generation
         // check never detects it as new, leaving meshModifiedEvents_ permanently empty.
         DrawFrame();
-        LOGI("First tick completed — RenderSystem initialized, now loading model");
+        LOGI("First tick completed â€” RenderSystem initialized, now loading model");
 
 
         // Load 3DGS splat data (if available)
@@ -2588,7 +2656,7 @@ void DispatchTouchEvent(OH_NativeXComponent* component, void* window)
             g_orbitCam.lastX = mx;
             g_orbitCam.lastY = my;
         } else if (touchEvent.numPoints == 1 && g_orbitCam.dragging) {
-            // Free tumble — no angle limits
+            // Free tumble â€” no angle limits
             float dx = x - g_orbitCam.lastX;
             float dy = y - g_orbitCam.lastY;
             g_orbitCam.Tumble(-dx * sensitivity, -dy * sensitivity);
@@ -2647,7 +2715,7 @@ void DispatchTouchEvent(OH_NativeXComponent* component, void* window)
 }
 
 // ---------------------------------------------------------------------------
-// NAPI module — register XComponent callbacks + drawFrame export
+// NAPI module â€” register XComponent callbacks + drawFrame export
 // ---------------------------------------------------------------------------
 
 static napi_value NapiInitResourceManager(napi_env env, napi_callback_info info)

@@ -104,6 +104,31 @@ struct CachedSogData {
     DataFormat dataFormat { DataFormat::SOG_PACKED };  // add for glb，default SOG
     std::shared_ptr<void> glbModel { nullptr };
     uint32_t glbAttributeDatasBytes { 0 };
+
+    // UWA 1.0 compressed SH (EGSC). The SH rest is an ASTC-packed texture;
+    // these fields mirror the single-file ParseASTCData metadata.
+    uint32_t codecVersion { 0 };
+    uint32_t compressedShWidth { 0 };
+    uint32_t compressedShHeight { 0 };
+    uint32_t compressedShAstcBlock { 0 };
+    uint32_t attribute2DSingleWidth { 0 };
+    uint32_t attribute2DSingleHeight { 0 };
+    uint32_t attribute2DTexNum { 0 };
+    float shDcMins { -1.0f };
+    float shDcMaxs { 1.0f };
+    float shRestMins_R[16] { -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f,
+        -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f };
+    float shRestMaxs_R[16] { 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f,
+        1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f };
+    float shRestMins_G[16] { -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f,
+        -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f };
+    float shRestMaxs_G[16] { 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f,
+        1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f };
+    float shRestMins_B[16] { -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f,
+        -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f };
+    float shRestMaxs_B[16] { 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f,
+        1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f };
+    bool hasCompressedSh { false };
 };
 
 /** Parse meta.json bytes into a SogMeta struct. */
@@ -125,7 +150,7 @@ bool ExtractSplatsFromCache(const CachedSogData& cache, const size_t offset, siz
 /** Extract a splat range directly into a raw byte buffer */
 bool ExtractSplatsToBuffer(const CachedSogData& cache, const size_t offset, size_t count, uint8_t* dst,
     const size_t dstBytes, GsPrimitive& primitive, const std::atomic_bool& cancelled, const bool skipAabb = false,
-    bool useTilePacked = false);
+    bool useTilePacked = false, GS::GsHarmonicsData* shDst = nullptr, size_t shDstCount = 0u);
 
 /** Parse a .sog file from in-memory bytes (convenience wrapper: decode + extract). */
 bool ParseGSSog(const uint8_t* fileData, size_t size, GS::GsObjectLoadData& loadData, GS::GsPrimitive& primitive,

@@ -45,6 +45,7 @@ struct Scene {
     uint32_t cacheCount = 5000000;
     float camPos[3] = { 0, 0, 0 };
     float camLookAt[3] = { 0, 0, -1 };
+    float camLookUp[3] = { 0, 1, 0 };
     std::vector<std::string> files;
     std::vector<Leaf> leaves;
     float boundsMin[3] = { 1e30f, 1e30f, 1e30f };
@@ -207,11 +208,15 @@ inline bool Scene::Load(const std::string& sceneDir)
     if (camInfo) {
         const sog::Json* pos = camInfo->get("position");
         const sog::Json* look = camInfo->get("lookAt");
+        const sog::Json* up = camInfo->get("lookUp");
         for (int i = 0; i < 3 && pos && (size_t)i < pos->items.size(); i++) {
             camPos[i] = (float)pos->items[i].number;
         }
         for (int i = 0; i < 3 && look && (size_t)i < look->items.size(); i++) {
             camLookAt[i] = (float)look->items[i].number;
+        }
+        for (int i = 0; i < 3 && up && (size_t)i < up->items.size(); i++) {
+            camLookUp[i] = (float)up->items[i].number;
         }
     }
 
@@ -253,9 +258,9 @@ inline bool Scene::Load(const std::string& sceneDir)
         LOGI("  LOD%{public}d: %{public}zu gaussians (dist < %.0f)", level, totalGaussians[level],
             Scene::distances[level]);
     }
-    LOGI("  budget %{public}u gaussians, cache %{public}u, camera (%.1f,%.1f,%.1f) -> (%.1f,%.1f,%.1f)",
+    LOGI("  budget %{public}u gaussians, cache %{public}u, camera (%.1f,%.1f,%.1f) -> (%.1f,%.1f,%.1f) up (%.1f,%.1f,%.1f)",
         maxRenderCount, cacheCount, camPos[0], camPos[1], camPos[2], camLookAt[0], camLookAt[1],
-        camLookAt[2]);
+        camLookAt[2], camLookUp[0], camLookUp[1], camLookUp[2]);
     return true;
 }
 

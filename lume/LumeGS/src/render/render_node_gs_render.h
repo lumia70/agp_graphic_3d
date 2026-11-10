@@ -537,6 +537,7 @@ private:
     bool shDirtyFlag_ { false };
     uint32_t shComputationOffset_ { 0u };
     uint32_t shFramesRequired_ { 1u };
+    uint32_t lastShPoolVersion_ { 0u };
     uint32_t shFramesRendered_ { 0u };
     uint32_t currentRadixPass_ { 0 };
 

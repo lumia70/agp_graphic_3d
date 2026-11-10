@@ -493,6 +493,8 @@ struct TileLoadResult {
     BASE_NS::Math::Vec3 aabbMin {};
     BASE_NS::Math::Vec3 aabbMax {};
     uint32_t count { 0 };
+    uint32_t shDegree { 0 };
+    bool shSupported { true };
     bool success { false };
     std::atomic_bool cancel { false };
     std::atomic_bool deferred { false };
@@ -567,6 +569,8 @@ struct TileLoadTaskContext {
     SogCache* cache { nullptr };
     uint8_t* dst { nullptr };
     size_t dstAvailable { 0u };
+    GS::GsHarmonicsData* shDst { nullptr };
+    size_t shDstAvailable { 0u };
     bool decodeOnly { false };
     bool useTilePack { false };
     void (*notifyFn)(void*) { nullptr };
@@ -605,7 +609,9 @@ bool DecodeTileCache(const TileLoadTaskContext& ctx)
     }
 
     if (IsSogUri(ctx.uri)) {
-        if (!GS::DecodeSogFile(buf.data(), buf.size(), *ctx.cacheEntry, *ctx.imgMgr, false)) {
+        // Phase A: tile caches must decode SHN as well; otherwise shDegree is 0
+        // and the tiled SH compute has no coefficients to work with.
+        if (!GS::DecodeSogFile(buf.data(), buf.size(), *ctx.cacheEntry, *ctx.imgMgr, true)) {
             failCacheEntry();
             return false;
         }
@@ -662,14 +668,16 @@ bool ExtractTileDirectToPool(const TileLoadTaskContext& ctx, GsPrimitive& tempPr
     tempPrim.gsPath = ctx.uri;
 
     if (ctx.cacheEntry->dataFormat == GS::CachedSogData::DataFormat::SOG_PACKED) {
-        if (!GS::ExtractSplatsToBuffer(
-            *ctx.cacheEntry, ctx.offset, ctx.count, ctx.dst, ctx.dstAvailable, tempPrim, ctx.res->cancel, true,
-            ctx.useTilePack)) {
+        if (!GS::ExtractSplatsToBuffer(*ctx.cacheEntry, ctx.offset, ctx.count, ctx.dst, ctx.dstAvailable, tempPrim,
+            ctx.res->cancel, true, ctx.useTilePack, ctx.shDst, ctx.shDstAvailable)) {
             return false;
         }
     } else if (ctx.cacheEntry->dataFormat == GS::CachedSogData::DataFormat::GLB_EXPANDED) {
         if (!GS::ExtractGlbSplatsToBuffer(*ctx.cacheEntry, ctx.res->cancel,
-            { ctx.offset, ctx.count, ctx.dst, ctx.dstAvailable, true, ctx.useTilePack }, tempPrim)) {
+            { ctx.offset, ctx.count, ctx.dst, ctx.dstAvailable, true, ctx.useTilePack,
+                reinterpret_cast<uint8_t*>(ctx.shDst),
+                ctx.shDstAvailable * sizeof(GS::GsHarmonicsData) },
+            tempPrim)) {
             return false;
         }
     }
@@ -677,6 +685,8 @@ bool ExtractTileDirectToPool(const TileLoadTaskContext& ctx, GsPrimitive& tempPr
     ctx.res->aabbMin = tempPrim.aabbMin;
     ctx.res->aabbMax = tempPrim.aabbMax;
     ctx.res->count = ctx.count;
+    ctx.res->shDegree = tempPrim.shDegree;
+    ctx.res->shSupported = !ctx.cacheEntry->hasCompressedSh;
     ctx.res->success = true;
     return true;
 }
@@ -921,6 +931,8 @@ private:
 
     RENDER_NS::RenderHandleReference splatPoolMappedHandle_;
     uint8_t* splatPoolMappedPtr_ { nullptr };
+    RENDER_NS::RenderHandleReference shPoolMappedHandle_;
+    uint8_t* shPoolMappedPtr_ { nullptr };
 
     mutable std::mutex gsConfigCacheMutex_;
     BASE_NS::shared_ptr<GS::GsConfigurationComponent> cachedGsConfig_;
@@ -1838,7 +1850,8 @@ void GsTilingSystem::ApplyInitialPoolConfig()
     splatsPerTile_ = 1u;
 
     const uint64_t bytesPerSplat = sizeof(GsObjectLoadData::GsSplatData) + 2u * (sizeof(uint32_t) * 2u) +
-                                   sizeof(Math::UVec4) + sizeof(uint32_t) + sizeof(float);
+                                   sizeof(Math::UVec4) + sizeof(uint32_t) + sizeof(float) +
+                                   sizeof(GS::GsHarmonicsData);
     const uint64_t splatCapacity64 = gpuPoolBytesBudget_.load(std::memory_order_relaxed) / bytesPerSplat;
     CORE_LOG_I("LSGS: ApplyInitialPoolConfig, lastAppliedQualityLevel_ %u, gpuPoolBytesBudget_ %" PRIu64 ", "
                 "splatCapacity64 %" PRIu64 ", bytesPerSplat %" PRIu64,
@@ -1849,6 +1862,10 @@ void GsTilingSystem::ApplyInitialPoolConfig()
     splatPoolCapacity_ = splatCapacity64 > std::numeric_limits<uint32_t>::max()
                              ? std::numeric_limits<uint32_t>::max()
                              : static_cast<uint32_t>(splatCapacity64);
+    // Phase A: keep the tiled SH compute bounded. The host budget is 1M; 1.5M
+    // covers visible + preload without walking the whole 700 MB budget.
+    constexpr uint32_t kTiledShCapacityCap = 1500000u;
+    splatPoolCapacity_ = Math::min(splatPoolCapacity_, kTiledShCapacityCap);
     splatPoolCapacity_ = Math::max(splatPoolCapacity_, 1024u);
     sortPoolCapacity_ = Math::min(kInitialSortCapacity, splatPoolCapacity_);
     nextSplatOffset_ = 0u;
@@ -1863,10 +1880,26 @@ void GsTilingSystem::RegisterPoolPrimitive(RenderDataStoreDefaultGS& internalDs)
     GsPrimitive poolPrim;
     poolPrim.splatEntity = poolEntity_;
     poolPrim.numGs = 0u;
-    poolPrim.gsBufferSize = 0u;
     poolPrim.isValid = true;
     poolPrim.active = true;
-    poolPrim.codecVersion = 1u;
+    // Phase A: the shared tile pool carries 3rd-order SH in its own buffer.
+    // codecVersion 0 makes RequireSH() true; the pool range is walked by the
+    // tiled SH compute path.
+    poolPrim.codecVersion = 0u;
+    // Phase A: SOG tiled scene uses 3rd-order SH. Set it before the primitive
+    // reaches the render data store; the post-load update can be lost on flip.
+    // (GLB SH needs a separate gate in Phase B.)
+    // Phase A: SOG tiled scene uses 3rd-order SH. Set it before the primitive
+    // reaches the render data store; the post-load update can be lost on flip.
+    // (GLB SH needs a separate gate in Phase B.)
+    poolPrim.shDegree = 3u;
+    poolPrim.startShOffset = 0u;
+    if (const GsTilePool* pool = dataStoreGs_->GetTilePool(); pool != nullptr && pool->splatCapacity != 0u) {
+        poolPrim.gsBufferSize = pool->splatCapacity;
+    } else {
+        // Pool capacity may not be visible yet; the member is authoritative.
+        poolPrim.gsBufferSize = splatPoolCapacity_;
+    }
     poolPrim.cropBoxProperties.cropBoxChanged = false;
     // The tiled pool is a container for world-space tiles; its own AABB must
     // cover the whole scene, otherwise the render node culls the entire pool
@@ -1942,6 +1975,12 @@ void GsTilingSystem::InitializePool()
     GsLoadContext ctx;
     InitializeLoadContext(*loadRd, ctx);
     CreateGsRenderDataBuffers(loadRd, 0u, 0u, 0u, ctx);
+    if (loadRd->tilePool) {
+        loadRd->gsHarmonicsDataRef = loadRd->tilePool->shPoolBuffer;
+    }
+    if (currentRd && currentRd->tilePool) {
+        currentRd->gsHarmonicsDataRef = currentRd->tilePool->shPoolBuffer;
+    }
     RegisterPoolPrimitive(*internalDs);
     EnsureSplatPoolMapped();
 
@@ -2208,11 +2247,33 @@ uint8_t* GsTilingSystem::EnsureSplatPoolMapped()
     splatPoolMappedHandle_ = pool->splatPoolBuffer;
     splatPoolMappedPtr_ = static_cast<uint8_t*>(mapped);
 
+    // Phase A: SH pool is CPU-written by the tile workers, so map it as well.
+    if (RENDER_NS::RenderHandleUtil::IsValid(pool->shPoolBuffer.GetHandle())) {
+        if (!shPoolMappedPtr_ || shPoolMappedHandle_.GetHandle() != pool->shPoolBuffer.GetHandle()) {
+            if (shPoolMappedPtr_ && RENDER_NS::RenderHandleUtil::IsValid(shPoolMappedHandle_.GetHandle())) {
+                gpuMgr.UnmapBuffer(shPoolMappedHandle_);
+            }
+            shPoolMappedPtr_ = nullptr;
+            shPoolMappedHandle_ = {};
+            void* shMapped = gpuMgr.MapBufferMemory(pool->shPoolBuffer);
+            if (shMapped) {
+                shPoolMappedHandle_ = pool->shPoolBuffer;
+                shPoolMappedPtr_ = static_cast<uint8_t*>(shMapped);
+            }
+        }
+    }
+
     return splatPoolMappedPtr_;
 }
 
 void GsTilingSystem::UnmapSplatPool()
 {
+    if (renderContext_ && RENDER_NS::RenderHandleUtil::IsValid(shPoolMappedHandle_.GetHandle())) {
+        renderContext_->GetDevice().GetGpuResourceManager().UnmapBuffer(shPoolMappedHandle_);
+    }
+    shPoolMappedPtr_ = nullptr;
+    shPoolMappedHandle_ = {};
+
     if (!splatPoolMappedPtr_) {
         splatPoolMappedHandle_ = {};
         return;
@@ -2306,6 +2367,17 @@ void GsTilingSystem::DispatchTileTask(PendingLoad& pending, bool decodeOnly)
             ctx.dst = splatPoolMappedPtr_ + dstOffset;
             ctx.dstAvailable = static_cast<size_t>(poolBytes - dstOffset);
             ctx.useTilePack = useTilePack;
+        }
+
+        GsTilePool* pool = dataStoreGs_ ? dataStoreGs_->GetTilePool() : nullptr;
+        if (pool && shPoolMappedPtr_ && RENDER_NS::RenderHandleUtil::IsValid(pool->shPoolBuffer.GetHandle())) {
+            const uint64_t shStride = sizeof(GS::GsHarmonicsData);
+            const uint64_t shOffset = static_cast<uint64_t>(pending.poolOffset) * shStride;
+            const uint64_t shBytes = static_cast<uint64_t>(splatPoolCapacity_) * shStride;
+            if (shOffset < shBytes) {
+                ctx.shDst = reinterpret_cast<GS::GsHarmonicsData*>(shPoolMappedPtr_ + shOffset);
+                ctx.shDstAvailable = static_cast<size_t>((shBytes - shOffset) / sizeof(GS::GsHarmonicsData));
+            }
         }
     }
 
@@ -2845,6 +2917,26 @@ void GsTilingSystem::CommitFinalizedPendingLoads(
             }
             UpdatePoolTileMetadata(pending, poolPrim->tileGrid.tiles[static_cast<size_t>(pending.slot)], isVisible);
         }
+        if (poolPrim && (!pending.result->shSupported || pending.result->shDegree > poolPrim->shDegree ||
+                            poolPrim->gsBufferSize != pool.splatCapacity)) {
+            bool changed = false;
+            if (!pending.result->shSupported && poolPrim->shDegree != 0u) {
+                poolPrim->shDegree = 0u;
+                changed = true;
+            } else if (pending.result->shDegree > poolPrim->shDegree) {
+                poolPrim->shDegree = pending.result->shDegree;
+                changed = true;
+            }
+            if (poolPrim->gsBufferSize != pool.splatCapacity) {
+                poolPrim->gsBufferSize = pool.splatCapacity;
+                changed = true;
+            }
+            if (changed) {
+                pool.resourceVersion++;
+                CORE_LOG_I("GsTilingSystem: tiled SH degree -> %u (range %u)", poolPrim->shDegree,
+                    poolPrim->gsBufferSize);
+            }
+        }
         AddTileEntry(pending, isVisible);
         if (isVisible) {
             pool.resourceVersion++;
@@ -3106,6 +3198,16 @@ BASE_NS::vector<GsTilingSystem::PreparedSubmission> GsTilingSystem::PrepareSubmi
             if (!isPoolReady()) {
                 EnqueueTileRequest(cand.entity);
                 continue;
+            }
+        }
+
+        // The tile commit can update a primitive that is lost on a render-data
+        // flip. Re-apply the detected SH degree and pool range to the active
+        // pool primitive every frame, before the dynamic UBO is uploaded.
+        if (GsPrimitive* poolPrim = FindPoolPrimitive(); poolPrim != nullptr) {
+            if (const GsTilePool* pool = dataStoreGs_->GetTilePool(); pool != nullptr &&
+                poolPrim->gsBufferSize != pool->splatCapacity) {
+                poolPrim->gsBufferSize = pool->splatCapacity;
             }
         }
 

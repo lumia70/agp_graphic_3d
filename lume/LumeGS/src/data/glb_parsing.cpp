@@ -169,7 +169,60 @@ bool DecodeGlbFile(const uint8_t* fileData, size_t size, CachedSogData& cache, c
     cache.hasScales = true;
     cache.hasSh0 = true;
 
-    cache.shDegree = 0;
+    cache.shDegree = basicInfo->GetMetaAs<uint32_t>(SpatialTag::SH_DEGREE).value_or(0);
+
+    // UWA 1.0 EGSC stores the SH rest as an ASTC-packed texture, not as float
+    // coefficients. Parse its metadata here; the tiled render path must bind
+    // the ASTC texture (Phase B) instead of the 96 B float SH buffer.
+    if (cache.shDegree > 0u) {
+        std::shared_ptr<const SpatialMeta> attrMeta;
+        if (model->GetMeta(SpatialTag::SPHERICAL_HARMONICS_DEGREE_1_AND_HIGHER, attrMeta) ==
+            SpatialErrorCode::SUCCESS) {
+            const std::string texNumKey = "attribute2DTexNum";
+            const uint32_t texNum = attrMeta->GetMetaAs<uint32_t>(texNumKey).value_or(0);
+            const uint32_t codecId =
+                attrMeta->GetMetaAs<uint32_t>(SpatialTag::PACKING_MAP_TEXTURE_CODEC_ID).value_or(0);
+            cache.compressedShWidth = attrMeta->GetMetaAs<uint32_t>(SpatialTag::PACKING_MAP_WIDTH).value_or(0);
+            cache.compressedShHeight = attrMeta->GetMetaAs<uint32_t>(SpatialTag::PACKING_MAP_HEIGHT).value_or(0);
+            cache.attribute2DSingleWidth = attrMeta->GetMetaAs<uint32_t>(SpatialTag::REGION_WIDTH).value_or(0);
+            cache.attribute2DSingleHeight = attrMeta->GetMetaAs<uint32_t>(SpatialTag::REGION_HEIGHT).value_or(0);
+            cache.attribute2DTexNum = texNum;
+            cache.codecVersion = 2u;
+            cache.hasCompressedSh = (texNum > 0u && codecId > 0u && codecId <= 3u);
+
+            const auto shNMaxs = attrMeta->GetMetaAs<std::vector<float>>(SpatialTag::QUANTIZATION_MAX_VALUE);
+            const auto shNMins = attrMeta->GetMetaAs<std::vector<float>>(SpatialTag::QUANTIZATION_MIN_VALUE);
+            if (shNMaxs.has_value() && shNMins.has_value()) {
+                const size_t n = BASE_NS::Math::clamp(
+                    shNMaxs.value().size() > 45 ? 15 : shNMaxs.value().size() / 3, size_t(0), size_t(16));
+                for (size_t ii = 0; ii < n; ii++) {
+                    cache.shRestMins_R[ii] = shNMins.value()[3 * ii];
+                    cache.shRestMins_G[ii] = shNMins.value()[3 * ii + 1];
+                    cache.shRestMins_B[ii] = shNMins.value()[3 * ii + 2];
+                    cache.shRestMaxs_R[ii] = shNMaxs.value()[3 * ii];
+                    cache.shRestMaxs_G[ii] = shNMaxs.value()[3 * ii + 1];
+                    cache.shRestMaxs_B[ii] = shNMaxs.value()[3 * ii + 2];
+                }
+            }
+            std::shared_ptr<const SpatialMeta> sh0Meta;
+            if (model->GetMeta(SpatialTag::SPHERICAL_HARMONICS_DEGREE_0_COEFFICIENT_0, sh0Meta) ==
+                SpatialErrorCode::SUCCESS) {
+                const auto dcMaxs = sh0Meta->GetMetaAs<std::vector<float>>(SpatialTag::QUANTIZATION_MAX_VALUE);
+                const auto dcMins = sh0Meta->GetMetaAs<std::vector<float>>(SpatialTag::QUANTIZATION_MIN_VALUE);
+                if (dcMaxs.has_value() && !dcMaxs->empty()) {
+                    cache.shDcMaxs = *std::max_element(dcMaxs->begin(), dcMaxs->end());
+                }
+                if (dcMins.has_value() && !dcMins->empty()) {
+                    cache.shDcMins = *std::min_element(dcMins->begin(), dcMins->end());
+                }
+            }
+        }
+    }
+
+    CORE_LOG_I("DecodeGlbFile: gsCount=%u shDegree=%u codec=%u compressedSh=%d texNum=%u map=%ux%u region=%ux%u",
+        gsCount, cache.shDegree, cache.codecVersion, cache.hasCompressedSh ? 1 : 0, cache.attribute2DTexNum,
+        cache.compressedShWidth, cache.compressedShHeight, cache.attribute2DSingleWidth,
+        cache.attribute2DSingleHeight);
     return true;
 }
 
@@ -179,6 +232,9 @@ struct GlbBlockInfo {
     size_t blockSize { 0 };
     size_t splatSize { 0 };
     size_t gsCount { 0 };
+    uint32_t shDegree { 0 };
+    uint32_t numHarmonics { 0 };
+    GS::GsHarmonicsData* shPtr { nullptr };
     size_t reqStartInBlock { 0 };
     size_t reqEndInBlock { 0 };
     uint8_t* dstPtr {nullptr};
@@ -235,6 +291,20 @@ bool InitExtractInfo(const CachedSogData& cache, const TileExtractBuffer& tileBu
     }
     blockInfo.startBlock = tileBuffer.offset / blockInfo.blockSize;
     blockInfo.endBlock = (tileBuffer.offset + tileBuffer.count + blockInfo.blockSize - 1) / blockInfo.blockSize;
+
+    // Compressed EGSC SH is an ASTC texture, not float SHN; keep it DC until
+    // the tiled ASTC path is wired (Phase B).
+    blockInfo.shDegree = cache.hasCompressedSh ? 0u : cache.shDegree;
+    if (blockInfo.shDegree > 0u) {
+        blockInfo.numHarmonics =
+            3u * ((blockInfo.shDegree + 1u) * (blockInfo.shDegree + 1u) - 1u); // 9/24/45
+        const size_t shBytes = tileBuffer.count * sizeof(GS::GsHarmonicsData);
+        if (!tileBuffer.shDst || tileBuffer.shDstBytes < shBytes) {
+            CORE_LOG_E("InitExtractInfo SH dst too small: %zu < %zu", tileBuffer.shDstBytes, shBytes);
+            return false;
+        }
+        blockInfo.shPtr = reinterpret_cast<GS::GsHarmonicsData*>(tileBuffer.shDst);
+    }
     return true;
 }
 
@@ -260,7 +330,7 @@ void GetBlockInfo(const TileExtractBuffer& tileBuffer, const size_t blockIdx, Gl
 bool GetBlockData(const std::vector<const float*>& attributes, const std::atomic_bool& cancelled,
     const TileExtractBuffer& tileBuffer, GlbBlockInfo& blockInfo)
 {
-    if (attributes.size() != 5u || blockInfo.dstPtr == nullptr) {
+    if (attributes.size() < 5u || blockInfo.dstPtr == nullptr) {
         return false;
     }
     const auto& positionArr = attributes[0];
@@ -268,6 +338,7 @@ bool GetBlockData(const std::vector<const float*>& attributes, const std::atomic
     const auto& sh0Arr = attributes[2u];
     const auto& opacityArr = attributes[3u];
     const auto& rotationArr = attributes[4u];
+    const float* shNArr = attributes.size() >= 6u ? attributes[5u] : nullptr;
     for (size_t jj = blockInfo.reqStartInBlock; jj < blockInfo.reqEndInBlock; jj++) {
         if (cancelled.load()) {
             return false;
@@ -302,6 +373,21 @@ bool GetBlockData(const std::vector<const float*>& attributes, const std::atomic
             dstSplat->covBColorPacked.w = BitCast<float>(colorPacked);
             dstSplat->positionOpacity = { position.x, position.y, position.z, opacity };
         }
+
+        if (shNArr != nullptr && blockInfo.shPtr != nullptr && blockInfo.numHarmonics > 0u) {
+            GS::GsHarmonicsData hs;
+            hs.shCoefficients[0] = PackHalf2x16(sh0Arr[3u * jj], sh0Arr[3u * jj + 1u]);
+            hs.shCoefficients[1] = PackHalf2x16(sh0Arr[3u * jj + 2u], shNArr[jj * blockInfo.numHarmonics]);
+            size_t shIdx = jj * blockInfo.numHarmonics + 1u;
+            for (size_t kk = 2u; kk < blockInfo.numHarmonics / 2u + 2u; kk++, shIdx += 2u) {
+                if (kk * 2u - 3u > blockInfo.numHarmonics) {
+                    hs.shCoefficients[kk] = PackHalf2x16(shNArr[shIdx], 0.0f);
+                } else {
+                    hs.shCoefficients[kk] = PackHalf2x16(shNArr[shIdx], shNArr[shIdx + 1u]);
+                }
+            }
+            *blockInfo.shPtr++ = hs;
+        }
         blockInfo.dstPtr += blockInfo.splatSize;
     }
     return true;
@@ -313,6 +399,9 @@ bool FetchBlockData(const std::shared_ptr<SpatialModel>& model, const std::share
     std::vector<std::string> attributeNames = { SpatialTag::POSITION, SpatialTag::SCALE,
         SpatialTag::SPHERICAL_HARMONICS_DEGREE_0_COEFFICIENT_0, SpatialTag::OPACITY,
         SpatialTag::ROTATION };
+    if (blockInfo.shDegree > 0u) {
+        attributeNames.push_back(SpatialTag::SPHERICAL_HARMONICS_DEGREE_1_AND_HIGHER);
+    }
     for (size_t blockIdx = blockInfo.startBlock; blockIdx < blockInfo.endBlock; blockIdx++) {
         if (cancelled.load()) {
             return false;
@@ -341,6 +430,8 @@ bool FetchBlockData(const std::shared_ptr<SpatialModel>& model, const std::share
                 countPerData = 3u;
             } else if (i == 4u) {
                 countPerData = 4u;
+            } else if (i == 5u) {
+                countPerData = blockInfo.numHarmonics;
             }
             if (pointCount < blockInfo.reqEndInBlock * countPerData) {
                 CORE_LOG_E("Attribute %zu pointCount %zu < reqEndInBlock %zu", i, pointCount, blockInfo.reqEndInBlock);
@@ -382,7 +473,7 @@ bool ExtractGlbSplatsToBuffer(const CachedSogData& cache, const std::atomic_bool
         return false;
     }
     primitive.numGs += blockInfo.writtenCount;
-    primitive.shDegree = cache.shDegree;
+    primitive.shDegree = cache.hasCompressedSh ? 0u : cache.shDegree;
     if (!tileBuffer.skipAabb) {
         primitive.aabbMin = Math::min(primitive.aabbMin, blockInfo.aabbMin);
         primitive.aabbMax = Math::max(primitive.aabbMax, blockInfo.aabbMax);

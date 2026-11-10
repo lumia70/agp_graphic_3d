@@ -1685,6 +1685,56 @@ void GS::CreateGsRenderDataBuffers(GS::GsRenderData* renderData, const size_t to
             pool.allocatedSplatCapacity = pool.splatCapacity;
         }
 
+        // Spherical harmonics pool (Phase A: 3rd order, 96 B per splat).
+        {
+            const uint32_t shStride = sizeof(GS::GsHarmonicsData);
+            const uint64_t shBytes64 = static_cast<uint64_t>(pool.splatCapacity) * shStride;
+            bool needShPool = !RENDER_NS::RenderHandleUtil::IsValid(pool.shPoolBuffer.GetHandle());
+            if (!needShPool) {
+                const auto shDesc = gpuResourceMgr.GetBufferDescriptor(pool.shPoolBuffer);
+                needShPool = static_cast<uint64_t>(shDesc.byteSize) < shBytes64;
+            }
+            if (needShPool) {
+                uint32_t shByteSize = 0u;
+                if (!checkedByteSize(shBytes64, "shPool", shByteSize)) {
+                    return;
+                }
+                GpuBufferDesc shDesc;
+                shDesc.memoryPropertyFlags = MemoryPropertyFlagBits::CORE_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                             MemoryPropertyFlagBits::CORE_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+                shDesc.engineCreationFlags =
+                    EngineBufferCreationFlagBits::CORE_ENGINE_BUFFER_CREATION_DYNAMIC_BARRIERS |
+                    EngineBufferCreationFlagBits::CORE_ENGINE_BUFFER_CREATION_MAP_OUTSIDE_RENDERER |
+                    EngineBufferCreationFlagBits::CORE_ENGINE_BUFFER_CREATION_CREATE_IMMEDIATE;
+                shDesc.usageFlags = BufferUsageFlagBits::CORE_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                                    BufferUsageFlagBits::CORE_BUFFER_USAGE_TRANSFER_DST_BIT |
+                                    BufferUsageFlagBits::CORE_BUFFER_USAGE_TRANSFER_SRC_BIT;
+                shDesc.byteSize = shByteSize;
+
+                const RENDER_NS::RenderHandleReference oldShPoolBuffer = pool.shPoolBuffer;
+                pool.shPoolBuffer = gpuResourceMgr.Create("GS3DTileShPool_" + poolNameSuffix, shDesc);
+                if (RENDER_NS::RenderHandleUtil::IsValid(oldShPoolBuffer.GetHandle()) &&
+                    oldShPoolBuffer.GetHandle() != pool.shPoolBuffer.GetHandle()) {
+                    const auto oldDesc = gpuResourceMgr.GetBufferDescriptor(oldShPoolBuffer);
+                    void* oldMapped = gpuResourceMgr.MapBufferMemory(oldShPoolBuffer);
+                    void* newMapped = gpuResourceMgr.MapBufferMemory(pool.shPoolBuffer);
+                    if (oldMapped && newMapped) {
+                        const uint64_t copyBytes = Math::min(static_cast<uint64_t>(oldDesc.byteSize), shBytes64);
+                        BASE_NS::CloneData(newMapped, static_cast<size_t>(copyBytes), oldMapped,
+                            static_cast<size_t>(copyBytes));
+                    }
+                    if (newMapped) {
+                        gpuResourceMgr.UnmapBuffer(pool.shPoolBuffer);
+                    }
+                    if (oldMapped) {
+                        gpuResourceMgr.UnmapBuffer(oldShPoolBuffer);
+                    }
+                }
+            }
+            renderData->gsHarmonicsDataRef = pool.shPoolBuffer;
+            renderData->gsHarmonicsDataRefByteSize = getvalid(static_cast<uint32_t>(shBytes64));
+        }
+
         const bool needSortPool = !RENDER_NS::RenderHandleUtil::IsValid(pool.sortIndexPool0.GetHandle()) ||
                                   !RENDER_NS::RenderHandleUtil::IsValid(pool.sortIndexPool1.GetHandle()) ||
                                   !RENDER_NS::RenderHandleUtil::IsValid(pool.sortCountPoolBuffer.GetHandle()) ||

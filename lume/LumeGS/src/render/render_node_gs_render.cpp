@@ -1,4 +1,4 @@
-/*
+﻿/*
  * Copyright (c) 2025 Huawei Device Co., Ltd.
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -769,7 +769,10 @@ bool RenderNodeGsRender::UpdateDynamicDataUBO(RENDER_NS::IRenderCommandList& cmd
     auto& gsPrimitives = dataStore_->GetGsPrimitives();
     const GS::GsRenderData* renderData = dataStore_->GetGsRenderData();
 
-    if (!renderData || !renderData->areResourcesLoaded) {
+    // Tiled data lives in the shared pool; areResourcesLoaded tracks the
+    // single-file upload and can stay false. Keep the dynamic UBO (pool
+    // start/end/shDegree) updated for the tiled path.
+    if (!renderData || (!renderData->areResourcesLoaded && !(renderData->isTiled && renderData->tilePool))) {
         return false;
     }
 
@@ -1796,8 +1799,8 @@ void RenderNodeGsRender::ExecuteFrame(RENDER_NS::IRenderCommandList& cmdList)
         }
     }
 
-    // NOTE: this means we don't currently support SHs for LSGS, but can fix in the future!
-    const bool canComputeSh = !renderData->isTiled && hasSphericalHarmonics && shInputsSupported &&
+    // Phase A: tiled mode now supports SH through the shared tile pool buffer.
+    const bool canComputeSh = hasSphericalHarmonics && shInputsSupported &&
                               RENDER_NS::RenderHandleUtil::IsValid(gsRenderShaders_.computeSphericalHarmonics);
 
     if (!canComputeSh) {
@@ -1863,7 +1866,11 @@ void RenderNodeGsRender::ExecuteFrame(RENDER_NS::IRenderCommandList& cmdList)
         }
     }
 
-    const bool shInvalidated = canComputeSh && frameInputsChanged;
+    const uint32_t shPoolVersion =
+        (renderData->isTiled && renderData->tilePool) ? renderData->tilePool->resourceVersion : 0u;
+    const bool tilePoolChanged = renderData->isTiled && shPoolVersion != lastShPoolVersion_;
+    lastShPoolVersion_ = shPoolVersion;
+    const bool shInvalidated = canComputeSh && (frameInputsChanged || tilePoolChanged);
     if (shInvalidated) {
         shDirtyFlag_ = true;
         shFramesRendered_ = 0u;
@@ -1960,8 +1967,12 @@ void RenderNodeGsRender::ExecuteFrame(RENDER_NS::IRenderCommandList& cmdList)
         lastSeenPoolVersion_ = currentPoolVersion;
 
         const bool jitterFrameNeeded = !useRenderIfDirty_ || jitterRendered_ < 4u;
+        // SH compute updates the pool splat colors; the tiled precompute must
+        // also run while SH work is pending, otherwise the cache keeps the
+        // pre-SH colors and SH3 looks identical to SH0.
         const bool tiledWorkNeeded = gpuSortInProgress_ || mergedSortInitializing_ || mergedPrecomputeInProgress_ ||
-                                     frameInputsChanged || cpuSortFinished || jitterFrameNeeded || poolVersionChanged;
+                                     frameInputsChanged || cpuSortFinished || jitterFrameNeeded || poolVersionChanged ||
+                                     shWorkPending || shInvalidated;
 
         const bool tileSetMayHaveChanged = frameInputsChanged || cpuSortFinished || gpuSortInProgress_ ||
                                            mergedSortInitializing_ || poolVersionChanged;
@@ -2906,6 +2917,7 @@ void RenderNodeGsRender::ExecuteComputeSphericalHarmonics(RENDER_NS::IRenderComm
         return;
     }
 #endif
+
     RENDER_DEBUG_MARKER_COL_SCOPE(cmdList, "ExecuteComputeSphericalHarmonics", Math::Vec4(1.0f, 0.0f, 1.0f, 1.0f));
 
     auto& shBinders = bindersGsRender_.computeSphericalHarmonics;
@@ -2939,14 +2951,21 @@ void RenderNodeGsRender::ExecuteComputeSphericalHarmonics(RENDER_NS::IRenderComm
     shFramesRequired_ =
         computeAll ? 1u : static_cast<uint32_t>(Math::ceilToInt((float)numGsTotal / (float)numShPerFrame));
 
+
     {
 
         auto camHandle = cameraUniformBufferHandle_;
 
 
-        shBinders.set0->BindBuffer(0u, gsHandlesCache_.gsSplatData.GetHandle(), 0);
+        const auto splatHandle = (renderData->isTiled && renderData->tilePool)
+                                     ? renderData->tilePool->splatPoolBuffer
+                                     : gsHandlesCache_.gsSplatData;
+        const auto harmonicsHandle = (renderData->isTiled && renderData->tilePool)
+                                         ? renderData->tilePool->shPoolBuffer
+                                         : gsHandlesCache_.gsHarmonicsDataRef;
+        shBinders.set0->BindBuffer(0u, splatHandle.GetHandle(), 0);
         shBinders.set0->BindBuffer(1u, camHandle.GetHandle(), 0);
-        shBinders.set0->BindBuffer(2u, gsHandlesCache_.gsHarmonicsDataRef.GetHandle(), 0);
+        shBinders.set0->BindBuffer(2u, harmonicsHandle.GetHandle(), 0);
         shBinders.set0->BindBuffer(3u, gsDynamicDataUniformBufferHandle_.GetHandle(), 0);
 
         // ASTC
@@ -2989,6 +3008,17 @@ void RenderNodeGsRender::ExecuteComputeSphericalHarmonics(RENDER_NS::IRenderComm
             numWorkGroups = (numShPerFrame + (GS_PROCESS_DATA_TGS - 1)) / GS_PROCESS_DATA_TGS;
         }
         cmdList.Dispatch(numWorkGroups, 1u, 1u);
+    }
+
+    // The tiled precompute reads the pool splat data immediately after this
+    // pass; make the SH color writes visible to it.
+    if constexpr (USE_CUSTOM_BARRIERS) {
+        constexpr GeneralBarrier src { AccessFlagBits::CORE_ACCESS_MEMORY_WRITE_BIT,
+            PipelineStageFlagBits::CORE_PIPELINE_STAGE_COMPUTE_SHADER_BIT };
+        constexpr GeneralBarrier dst { AccessFlagBits::CORE_ACCESS_MEMORY_READ_BIT,
+            PipelineStageFlagBits::CORE_PIPELINE_STAGE_COMPUTE_SHADER_BIT };
+        cmdList.CustomMemoryBarrier(src, dst);
+        cmdList.AddCustomBarrierPoint();
     }
 
     if (!computeAll) {

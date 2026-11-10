@@ -1037,7 +1037,7 @@ bool ExtractSplatsFromCache(const CachedSogData& cache, const size_t offset, siz
 
 bool ExtractSplatsToBuffer(const CachedSogData& cache, const size_t offset, size_t count, uint8_t* dst,
     const size_t dstBytes, GsPrimitive& primitive, const std::atomic_bool& cancelled, const bool skipAabb,
-    bool useTilePacked)
+    bool useTilePacked, GS::GsHarmonicsData* shDst, size_t shDstCount)
 {
     CORE_CPU_PERF_SCOPE("LUMEGS", "ExtractSplatsToBuffer", "", 0xFF00FF);
 
@@ -1054,6 +1054,10 @@ bool ExtractSplatsToBuffer(const CachedSogData& cache, const size_t offset, size
     if (dst == nullptr || dstBytes < required) {
         return false;
     }
+    if (shDst != nullptr && shDstCount < loadNum) {
+        CORE_LOG_E("SOG ExtractSplats: SH buffer too small (%zu < %u)", shDstCount, loadNum);
+        return false;
+    }
 
     SogExtractContext ctx(cache);
     if (!InitSogExtractContext(ctx)) {
@@ -1066,7 +1070,7 @@ bool ExtractSplatsToBuffer(const CachedSogData& cache, const size_t offset, size
     }
 
     SogExtractState scratch;
-    if (!ExtractSogChunk(ctx, start, end, dst, nullptr, nullptr, scratch, cancelled, skipAabb)) {
+    if (!ExtractSogChunk(ctx, start, end, dst, nullptr, shDst, scratch, cancelled, skipAabb)) {
         return false;
     }
 
