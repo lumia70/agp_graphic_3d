@@ -1289,6 +1289,35 @@ void GS::SetDefaultASTC(
     }
 }
 
+bool GS::CreateTiledAstcImage(const CachedSogData& cache, uint32_t slot, GsRenderData* renderData,
+    RENDER_NS::IGpuResourceManager& gpuResourceMgr, RENDER_NS::IRenderContext* renderContext)
+{
+    if (!cache.hasCompressedSh || !cache.glbModel || !renderData || !renderContext) {
+        return false;
+    }
+    if (slot + cache.attribute2DTexNum > GS_MAX_NUM_GS_TEXTURES) {
+        return false;
+    }
+    auto model = std::static_pointer_cast<SpatialModel>(cache.glbModel);
+    if (!model) {
+        return false;
+    }
+    GsPrimitive primitive;
+    primitive.shDegree = cache.shDegree;
+    primitive.codecVersion = cache.codecVersion;
+    primitive.textIdOffset = slot;
+    primitive.attribute2DTexNum = cache.attribute2DTexNum;
+    if (!CreateASTCImage(model, primitive, renderData, gpuResourceMgr, renderContext)) {
+        CORE_LOG_E("CreateTiledAstcImage: CreateASTCImage failed");
+        return false;
+    }
+    if (primitive.codecVersion == 0u) {
+        CORE_LOG_E("CreateTiledAstcImage: ASTC unsupported on this device");
+        return false;
+    }
+    return true;
+}
+
 void GS::CreateGsRenderDataBuffers(GS::GsRenderData* renderData, const size_t totalNumberOfSplats,
     const size_t totalNumberIndexable, const size_t totalSplatsNeedSh, GS::GsLoadContext loadCtx)
 {
@@ -1733,6 +1762,45 @@ void GS::CreateGsRenderDataBuffers(GS::GsRenderData* renderData, const size_t to
             }
             renderData->gsHarmonicsDataRef = pool.shPoolBuffer;
             renderData->gsHarmonicsDataRefByteSize = getvalid(static_cast<uint32_t>(shBytes64));
+        }
+
+        // Per-ASTC-slot compressed SH metadata (one entry per source file).
+        {
+            const size_t slotCount = GS_MAX_NUM_GS_TEXTURES;
+            if (pool.shSlotMetas.size() < slotCount) {
+                pool.shSlotMetas.resize(slotCount);
+            }
+            const uint64_t metaBytes64 = static_cast<uint64_t>(slotCount) * sizeof(GS::GsShSlotMetadata);
+            bool needMetaBuffer = !RENDER_NS::RenderHandleUtil::IsValid(pool.shSlotMetaBuffer.GetHandle());
+            if (!needMetaBuffer) {
+                const auto metaDesc = gpuResourceMgr.GetBufferDescriptor(pool.shSlotMetaBuffer);
+                needMetaBuffer = static_cast<uint64_t>(metaDesc.byteSize) < metaBytes64;
+            }
+            if (needMetaBuffer) {
+                uint32_t metaByteSize = 0u;
+                if (!checkedByteSize(metaBytes64, "shSlotMeta", metaByteSize)) {
+                    return;
+                }
+                GpuBufferDesc metaDesc;
+                metaDesc.memoryPropertyFlags = MemoryPropertyFlagBits::CORE_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                              MemoryPropertyFlagBits::CORE_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+                metaDesc.engineCreationFlags =
+                    EngineBufferCreationFlagBits::CORE_ENGINE_BUFFER_CREATION_DYNAMIC_BARRIERS |
+                    EngineBufferCreationFlagBits::CORE_ENGINE_BUFFER_CREATION_MAP_OUTSIDE_RENDERER |
+                    EngineBufferCreationFlagBits::CORE_ENGINE_BUFFER_CREATION_CREATE_IMMEDIATE;
+                metaDesc.usageFlags = BufferUsageFlagBits::CORE_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                                      BufferUsageFlagBits::CORE_BUFFER_USAGE_TRANSFER_DST_BIT;
+                metaDesc.byteSize = metaByteSize;
+                pool.shSlotMetaBuffer = gpuResourceMgr.Create("GS3DTileShSlotMeta_" + poolNameSuffix, metaDesc);
+            }
+            if (RENDER_NS::RenderHandleUtil::IsValid(pool.shSlotMetaBuffer.GetHandle())) {
+                void* mapped = gpuResourceMgr.MapBufferMemory(pool.shSlotMetaBuffer);
+                if (mapped != nullptr) {
+                    BASE_NS::CloneData(mapped, static_cast<size_t>(metaBytes64), pool.shSlotMetas.data(),
+                        static_cast<size_t>(metaBytes64));
+                    gpuResourceMgr.UnmapBuffer(pool.shSlotMetaBuffer);
+                }
+            }
         }
 
         const bool needSortPool = !RENDER_NS::RenderHandleUtil::IsValid(pool.sortIndexPool0.GetHandle()) ||

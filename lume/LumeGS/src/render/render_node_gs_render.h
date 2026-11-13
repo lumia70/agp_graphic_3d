@@ -203,6 +203,7 @@ public:
         CompBinders animationPass;
         CompBinders precomputeProjection;
         CompBinders computeSphericalHarmonics;
+        CompBinders computeSphericalHarmonicsGlb;
         CompBinders updateRenderStatusUbo;
     };
 
@@ -289,6 +290,7 @@ private:
         RENDER_NS::RenderHandle precomputeProjectionFg;
         RENDER_NS::RenderHandle precomputeProjectionPackFg;
         RENDER_NS::RenderHandle computeSphericalHarmonics;
+        RENDER_NS::RenderHandle computeSphericalHarmonicsGlb;
         RENDER_NS::RenderHandle computeSphericalHarmonicsPack;
         RENDER_NS::RenderHandle updateRenderStatusUbo;
     } gsRenderShaders_;
@@ -332,6 +334,7 @@ private:
         RENDER_NS::RenderHandleReference tileSortCountPoolBuffer;
         RENDER_NS::RenderHandleReference tileMetaBuffer;
         RENDER_NS::RenderHandleReference tileIndirectDrawBuffer;
+        RENDER_NS::RenderHandleReference shSlotMetaBuffer;
 
         bool IsValid(const bool useGpuSort) const
         {
@@ -379,6 +382,7 @@ private:
             tileSortCountPoolBuffer = {};
             tileMetaBuffer = {};
             tileIndirectDrawBuffer = {};
+            shSlotMetaBuffer = {};
         }
     } gsHandlesCache_;
 

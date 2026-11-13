@@ -235,6 +235,10 @@ struct GlbBlockInfo {
     uint32_t shDegree { 0 };
     uint32_t numHarmonics { 0 };
     GS::GsHarmonicsData* shPtr { nullptr };
+    bool compressedSh { false };
+    uint32_t astcSlot { 0u };
+    float shDcMins { -1.0f };
+    float shDcMaxs { 1.0f };
     size_t reqStartInBlock { 0 };
     size_t reqEndInBlock { 0 };
     uint8_t* dstPtr {nullptr};
@@ -295,6 +299,10 @@ bool InitExtractInfo(const CachedSogData& cache, const TileExtractBuffer& tileBu
     // Compressed EGSC SH is an ASTC texture, not float SHN; keep it DC until
     // the tiled ASTC path is wired (Phase B).
     blockInfo.shDegree = cache.hasCompressedSh ? 0u : cache.shDegree;
+    blockInfo.compressedSh = cache.hasCompressedSh;
+    blockInfo.astcSlot = tileBuffer.astcSlot;
+    blockInfo.shDcMins = cache.shDcMins;
+    blockInfo.shDcMaxs = cache.shDcMaxs;
     if (blockInfo.shDegree > 0u) {
         blockInfo.numHarmonics =
             3u * ((blockInfo.shDegree + 1u) * (blockInfo.shDegree + 1u) - 1u); // 9/24/45
@@ -327,8 +335,8 @@ void GetBlockInfo(const TileExtractBuffer& tileBuffer, const size_t blockIdx, Gl
     blockInfo.reqEndInBlock = reqEndInBlock;
 }
 
-bool GetBlockData(const std::vector<const float*>& attributes, const std::atomic_bool& cancelled,
-    const TileExtractBuffer& tileBuffer, GlbBlockInfo& blockInfo)
+bool GetBlockData(const std::vector<const float*>& attributes, const uint32_t* shUv,
+    const std::atomic_bool& cancelled, const TileExtractBuffer& tileBuffer, GlbBlockInfo& blockInfo)
 {
     if (attributes.size() < 5u || blockInfo.dstPtr == nullptr) {
         return false;
@@ -372,6 +380,12 @@ bool GetBlockData(const std::vector<const float*>& attributes, const std::atomic
             PrecomputeCovariancesSog(scaleExp, rotNorm, dstSplat->covAScale, dstSplat->covBColorPacked);
             dstSplat->covBColorPacked.w = BitCast<float>(colorPacked);
             dstSplat->positionOpacity = { position.x, position.y, position.z, opacity };
+            if (blockInfo.compressedSh && shUv != nullptr) {
+                dstSplat->astcOffsetColor = { shUv[2u * jj], shUv[2u * jj + 1u],
+                    PackGSDcWithMinMax(Math::Vec3(sh0Arr[3u * jj], sh0Arr[3u * jj + 1u], sh0Arr[3u * jj + 2u]),
+                        blockInfo.shDcMins, blockInfo.shDcMaxs),
+                    blockInfo.astcSlot };
+            }
         }
 
         if (shNArr != nullptr && blockInfo.shPtr != nullptr && blockInfo.numHarmonics > 0u) {
@@ -440,7 +454,31 @@ bool FetchBlockData(const std::shared_ptr<SpatialModel>& model, const std::share
             attributes[i] = pointPtr;
         }
 
-        if (!GetBlockData(attributes, cancelled, tileBuffer, blockInfo)) {
+        const uint32_t* shUv = nullptr;
+        if (blockInfo.compressedSh) {
+            auto uvDesc = SpatialCodecFactory::CreateMeta(SpatialTag::UWAGS);
+            if (uvDesc == nullptr) {
+                return false;
+            }
+            uvDesc->AddMeta(SpatialTag::BLOCK_INDEX, static_cast<uint32_t>(blockIdx));
+            uvDesc->AddMeta(SpatialTag::BLOCK_POINTS_NUM, static_cast<uint32_t>(blockInfo.blockSize));
+            uvDesc->AddMeta(SpatialTag::UV, static_cast<uint32_t>(1));
+            std::shared_ptr<const ModelAttribute> uvAttr;
+            if (model->GetAttribute(SpatialTag::SPHERICAL_HARMONICS_DEGREE_1_AND_HIGHER, *uvDesc, uvAttr) !=
+                    SpatialErrorCode::SUCCESS ||
+                uvAttr == nullptr) {
+                CORE_LOG_E("Failed to fetch compressed SH UV");
+                return false;
+            }
+            auto [uvPtr, uvCount] = uvAttr->GetAs<uint32_t>();
+            if (uvPtr == nullptr || uvCount < blockInfo.reqEndInBlock * 2u) {
+                CORE_LOG_E("Compressed SH UV count too small");
+                return false;
+            }
+            shUv = uvPtr;
+        }
+
+        if (!GetBlockData(attributes, shUv, cancelled, tileBuffer, blockInfo)) {
             return false;
         }
         blockInfo.writtenCount += (blockInfo.reqEndInBlock - blockInfo.reqStartInBlock);
@@ -473,7 +511,27 @@ bool ExtractGlbSplatsToBuffer(const CachedSogData& cache, const std::atomic_bool
         return false;
     }
     primitive.numGs += blockInfo.writtenCount;
-    primitive.shDegree = cache.hasCompressedSh ? 0u : cache.shDegree;
+    primitive.shDegree = cache.shDegree;
+    primitive.codecVersion = cache.hasCompressedSh ? cache.codecVersion : 0u;
+    if (cache.hasCompressedSh) {
+        primitive.compressedShWidth = cache.compressedShWidth;
+        primitive.compressedShHeight = cache.compressedShHeight;
+        primitive.compressedShAstcBlock = cache.compressedShAstcBlock;
+        primitive.attribute2DSingleWidth = cache.attribute2DSingleWidth;
+        primitive.attribute2DSingleHeight = cache.attribute2DSingleHeight;
+        primitive.attribute2DTexNum = GS_MAX_NUM_GS_TEXTURES;
+        primitive.textIdOffset = 0u;
+        primitive.shDcMins = cache.shDcMins;
+        primitive.shDcMaxs = cache.shDcMaxs;
+        for (size_t ii = 0; ii < 16u; ii++) {
+            primitive.shRestMins_R[ii] = cache.shRestMins_R[ii];
+            primitive.shRestMins_G[ii] = cache.shRestMins_G[ii];
+            primitive.shRestMins_B[ii] = cache.shRestMins_B[ii];
+            primitive.shRestMaxs_R[ii] = cache.shRestMaxs_R[ii];
+            primitive.shRestMaxs_G[ii] = cache.shRestMaxs_G[ii];
+            primitive.shRestMaxs_B[ii] = cache.shRestMaxs_B[ii];
+        }
+    }
     if (!tileBuffer.skipAabb) {
         primitive.aabbMin = Math::min(primitive.aabbMin, blockInfo.aabbMin);
         primitive.aabbMax = Math::max(primitive.aabbMax, blockInfo.aabbMax);

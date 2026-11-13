@@ -129,6 +129,13 @@ RENDER_NS::RenderHandleReference CreateGSBuffer(RENDER_NS::IGpuResourceManager& 
 void SetDefaultASTC(
     GS::GsRenderData* renderData, RENDER_NS::IGpuResourceManager& gpuResourceMgr, const GS::GsLoadContext loadCtx);
 
+// Create the compressed SH (ASTC) image for a GLB tile cache at a fixed texture
+// slot. Must be called on the render thread; the slot must already be a default
+// ASTC image (SetDefaultASTC).
+struct CachedSogData;
+bool CreateTiledAstcImage(const CachedSogData& cache, uint32_t slot, GsRenderData* renderData,
+    RENDER_NS::IGpuResourceManager& gpuResourceMgr, RENDER_NS::IRenderContext* renderContext);
+
 void CreateGsRenderDataBuffers(GS::GsRenderData* renderData, const size_t totalNumberOfSplats,
     const size_t totalNumberIndexable, const size_t totalSplatsNeedSh, GS::GsLoadContext loadCtx);
 

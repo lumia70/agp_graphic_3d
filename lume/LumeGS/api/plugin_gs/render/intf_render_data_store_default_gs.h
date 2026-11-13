@@ -71,9 +71,52 @@ struct GsTileGrid {
     BASE_NS::vector<GsTileMetadata> tiles; // flattened [x + dims.x*(y + dims.y*z)]
 };
 
+// Per-ASTC-slot compressed SH metadata. Tiles from one source GLB share one
+// texture slot, but different files may use different packing widths/regions
+// and quantization ranges, so this cannot live on the shared pool primitive.
+struct GsShSlotMetadata {
+    GsShSlotMetadata()
+    {
+        dc = BASE_NS::Math::Vec4(-1.0f, 1.0f, 1.0f, 1.0f);
+        rest = BASE_NS::Math::Vec4(-1.0f, 1.0f, 0.0f, 0.0f);
+        for (auto& value : shRestMins_R) {
+            value = BASE_NS::Math::Vec4(-1.0f, -1.0f, -1.0f, -1.0f);
+        }
+        for (auto& value : shRestMins_G) {
+            value = BASE_NS::Math::Vec4(-1.0f, -1.0f, -1.0f, -1.0f);
+        }
+        for (auto& value : shRestMins_B) {
+            value = BASE_NS::Math::Vec4(-1.0f, -1.0f, -1.0f, -1.0f);
+        }
+        for (auto& value : shRestMaxs_R) {
+            value = BASE_NS::Math::Vec4(1.0f, 1.0f, 1.0f, 1.0f);
+        }
+        for (auto& value : shRestMaxs_G) {
+            value = BASE_NS::Math::Vec4(1.0f, 1.0f, 1.0f, 1.0f);
+        }
+        for (auto& value : shRestMaxs_B) {
+            value = BASE_NS::Math::Vec4(1.0f, 1.0f, 1.0f, 1.0f);
+        }
+    }
+
+    // compressedShWidth, compressedShHeight, attribute2DSingleWidth, attribute2DSingleHeight
+    BASE_NS::Math::UVec4 dims { 0U, 0U, 0U, 0U };
+    // shDcMins, shDcMaxs, impMin, impMax
+    BASE_NS::Math::Vec4 dc { -1.0f, 1.0f, 1.0f, 1.0f };
+    // shRestMins, shRestMaxs (legacy V1 scalar range), unused, unused
+    BASE_NS::Math::Vec4 rest { -1.0f, 1.0f, 0.0f, 0.0f };
+    BASE_NS::Math::Vec4 shRestMins_R[4] {};
+    BASE_NS::Math::Vec4 shRestMaxs_R[4] {};
+    BASE_NS::Math::Vec4 shRestMins_G[4] {};
+    BASE_NS::Math::Vec4 shRestMaxs_G[4] {};
+    BASE_NS::Math::Vec4 shRestMins_B[4] {};
+    BASE_NS::Math::Vec4 shRestMaxs_B[4] {};
+};
+
 struct GsTilePool {
     RENDER_NS::RenderHandleReference splatPoolBuffer;
     RENDER_NS::RenderHandleReference shPoolBuffer;
+    RENDER_NS::RenderHandleReference shSlotMetaBuffer;
     RENDER_NS::RenderHandleReference sortIndexPool0;
     RENDER_NS::RenderHandleReference sortIndexPool1;
     RENDER_NS::RenderHandleReference tileMetaBuffer;
@@ -93,6 +136,7 @@ struct GsTilePool {
     uint32_t resourceVersion { 0U };
 
     BASE_NS::vector<int32_t> freeSlots;
+    BASE_NS::vector<GsShSlotMetadata> shSlotMetas;
 };
 
 struct GsHarmonicsData {

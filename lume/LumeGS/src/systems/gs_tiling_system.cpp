@@ -70,6 +70,8 @@ using namespace CORE_NS;
 using namespace RENDER_NS;
 using namespace GS;
 
+static std::atomic<uint32_t> g_tiledMaxShDegree { 0xFFFFFFFFu };
+
 namespace {
 constexpr string_view RENDER_DATA_STORE_DEFAULT_STAGING { "RenderDataStoreDefaultStaging" };
 
@@ -507,6 +509,7 @@ struct PendingLoad {
     uint32_t offset { 0U };
     uint32_t count { 0U };
     int32_t slot { -1 };
+    uint32_t astcSlot { 0u };
     uint32_t poolOffset { 0u };
     uint32_t poolCapacity { 0u };
     bool cancelled { false };
@@ -571,6 +574,7 @@ struct TileLoadTaskContext {
     size_t dstAvailable { 0u };
     GS::GsHarmonicsData* shDst { nullptr };
     size_t shDstAvailable { 0u };
+    uint32_t astcSlot { 0u };
     bool decodeOnly { false };
     bool useTilePack { false };
     void (*notifyFn)(void*) { nullptr };
@@ -676,7 +680,7 @@ bool ExtractTileDirectToPool(const TileLoadTaskContext& ctx, GsPrimitive& tempPr
         if (!GS::ExtractGlbSplatsToBuffer(*ctx.cacheEntry, ctx.res->cancel,
             { ctx.offset, ctx.count, ctx.dst, ctx.dstAvailable, true, ctx.useTilePack,
                 reinterpret_cast<uint8_t*>(ctx.shDst),
-                ctx.shDstAvailable * sizeof(GS::GsHarmonicsData) },
+                ctx.shDstAvailable * sizeof(GS::GsHarmonicsData), ctx.astcSlot },
             tempPrim)) {
             return false;
         }
@@ -686,7 +690,9 @@ bool ExtractTileDirectToPool(const TileLoadTaskContext& ctx, GsPrimitive& tempPr
     ctx.res->aabbMax = tempPrim.aabbMax;
     ctx.res->count = ctx.count;
     ctx.res->shDegree = tempPrim.shDegree;
-    ctx.res->shSupported = !ctx.cacheEntry->hasCompressedSh;
+    // Compressed GLB uses the ASTC path (texture created on the render thread);
+    // both SOG float SH and GLB ASTC SH are "supported" here.
+    ctx.res->shSupported = true;
     ctx.res->success = true;
     return true;
 }
@@ -721,6 +727,30 @@ void ExecuteTileLoadTask(TileLoadTaskContext ctx)
         return;
     }
 }
+
+void FillShSlotMeta(GsShSlotMetadata& meta, const CachedSogData& cache)
+{
+    meta.dims = { cache.compressedShWidth, cache.compressedShHeight, cache.attribute2DSingleWidth,
+        cache.attribute2DSingleHeight };
+    meta.dc = { cache.shDcMins, cache.shDcMaxs, 1.0f, 1.0f };
+    float restMin = std::numeric_limits<float>::max();
+    float restMax = std::numeric_limits<float>::lowest();
+    for (size_t ii = 0; ii < 16u; ii++) {
+        const size_t row = ii / 4u;
+        const size_t col = ii % 4u;
+        meta.shRestMins_R[row][col] = cache.shRestMins_R[ii];
+        meta.shRestMins_G[row][col] = cache.shRestMins_G[ii];
+        meta.shRestMins_B[row][col] = cache.shRestMins_B[ii];
+        meta.shRestMaxs_R[row][col] = cache.shRestMaxs_R[ii];
+        meta.shRestMaxs_G[row][col] = cache.shRestMaxs_G[ii];
+        meta.shRestMaxs_B[row][col] = cache.shRestMaxs_B[ii];
+        restMin = Math::min(restMin, Math::min(cache.shRestMins_R[ii],
+            Math::min(cache.shRestMins_G[ii], cache.shRestMins_B[ii])));
+        restMax = Math::max(restMax, Math::max(cache.shRestMaxs_R[ii],
+            Math::max(cache.shRestMaxs_G[ii], cache.shRestMaxs_B[ii])));
+    }
+    meta.rest = { restMin, restMax, 0.0f, 0.0f };
+}
 } // namespace
 
 class GsTilingSystem final : public IGsTilingSystem, private IEcs::ComponentListener {
@@ -746,6 +776,7 @@ public:
 
     void CreateTile(const CORE_NS::Entity entity, const GS::GsTilingComponent& data) override;
     void SetTileVisible(const CORE_NS::Entity entity, const bool visible) override;
+    void SetMaxShDegree(uint32_t degree) override;
     void DestroyTile(const CORE_NS::Entity entity) override;
     bool IsTileResident(const CORE_NS::Entity entity) const override;
 
@@ -800,6 +831,7 @@ private:
     void InitializeLoadContext(GsRenderData& rd, GsLoadContext& ctx);
     void ApplyInitialPoolConfig();
     void RegisterPoolPrimitive(RenderDataStoreDefaultGS& internalDs);
+    uint32_t GetConfiguredMaxShDegree() const;
     bool PrepareTileSubmission(CORE_NS::Entity entity, const GS::GsTilingComponent& comp, PreparedSubmission& outPrep);
     bool DispatchPreparedSubmission(PreparedSubmission& prep);
     void DispatchTileTask(PendingLoad& pending, bool decodeOnly = false);
@@ -924,6 +956,9 @@ private:
 
     std::mutex sogCacheMutex_;
     SogCache sogCache_ { kDefaultSogCacheBytesBudget };
+    std::unordered_map<std::string, uint32_t> astcSlotByUri_;
+    uint32_t nextAstcSlot_ { 0u };
+    bool astcSlotReady_[GS_MAX_NUM_GS_TEXTURES] {};
     std::atomic<uint64_t> gpuPoolBytesBudget_ { kDefaultGpuPoolBytesBudget };
     uint32_t lastAppliedQualityLevel_ { 0xFFFFFFFFu };
 
@@ -1319,6 +1354,11 @@ void GsTilingSystem::Uninitialize()
     nextSplatOffset_ = 0u;
     splatPoolCapacity_ = 0u;
     maxPoolTiles_ = 0u;
+    astcSlotByUri_.clear();
+    nextAstcSlot_ = 0u;
+    for (bool& ready : astcSlotReady_) {
+        ready = false;
+    }
 
     tileData_.clear();
 
@@ -1379,6 +1419,11 @@ void GsTilingSystem::CreateTile(const CORE_NS::Entity entity, const GS::GsTiling
     }
 
     workerCv_.notify_one();
+}
+
+void GsTilingSystem::SetMaxShDegree(uint32_t degree)
+{
+    g_tiledMaxShDegree.store(Math::min(degree, 3u), std::memory_order_relaxed);
 }
 
 void GsTilingSystem::SetTileVisible(const CORE_NS::Entity entity, const bool visible)
@@ -1626,7 +1671,7 @@ bool GsTilingSystem::TryEvictNonCriticalTile(uint32_t requiredCapacity)
                 continue;
             }
             const auto* comp = FindTileData(entry.entity);
-            if (comp && (comp->visible || comp->preload)) {
+            if (comp && comp->visible) {
                 continue;
             }
             if (respectGrace && now < entry.slot.touchedAtUs + kEvictGracePeriodUs) {
@@ -1717,7 +1762,7 @@ void GsTilingSystem::EvictForBatch(uint32_t neededSlots, uint64_t neededSplatCap
         }
 
         const auto* comp = FindTileData(entry.entity);
-        if (comp && (comp->visible || comp->preload)) {
+        if (comp && comp->visible) {
             continue;
         }
 
@@ -1862,9 +1907,11 @@ void GsTilingSystem::ApplyInitialPoolConfig()
     splatPoolCapacity_ = splatCapacity64 > std::numeric_limits<uint32_t>::max()
                              ? std::numeric_limits<uint32_t>::max()
                              : static_cast<uint32_t>(splatCapacity64);
-    // Phase A: keep the tiled SH compute bounded. The host budget is 1M; 1.5M
-    // covers visible + preload without walking the whole 700 MB budget.
-    constexpr uint32_t kTiledShCapacityCap = 1500000u;
+    // Phase A bounded the pool to 1.5M for SH compute, but 4-level grid scenes
+    // (e.g. syp_uav_0611) need more resident/preload capacity; at 1.5M tiles
+    // were evicted and the center of the view fell back to the clear color.
+    // Keep a 6M ceiling below the 700 MB GPU budget; make this adaptive later.
+    constexpr uint32_t kTiledShCapacityCap = 6000000u;
     splatPoolCapacity_ = Math::min(splatPoolCapacity_, kTiledShCapacityCap);
     splatPoolCapacity_ = Math::max(splatPoolCapacity_, 1024u);
     sortPoolCapacity_ = Math::min(kInitialSortCapacity, splatPoolCapacity_);
@@ -1872,6 +1919,25 @@ void GsTilingSystem::ApplyInitialPoolConfig()
     freeSplatRanges_.clear();
 
     CORE_LOG_I("GsTilingSystem: pool initialized to %u slots, %u splats.", maxPoolTiles_, splatPoolCapacity_);
+}
+
+uint32_t GsTilingSystem::GetConfiguredMaxShDegree() const
+{
+    const uint32_t forced = g_tiledMaxShDegree.load(std::memory_order_relaxed);
+    if (forced <= 3u) {
+        return forced;
+    }
+    uint32_t value = 3u;
+    if (gsConfigManager_ && gsConfigManager_->GetComponentCount() > 0u) {
+        const auto entity = gsConfigManager_->GetEntity(0u);
+        if (CORE_NS::EntityUtil::IsValid(entity)) {
+            const auto handle = gsConfigManager_->Read(entity);
+            if (handle) {
+                value = handle->maxShDegree;
+            }
+        }
+    }
+    return Math::min(value, 3u);
 }
 
 void GsTilingSystem::RegisterPoolPrimitive(RenderDataStoreDefaultGS& internalDs)
@@ -1888,11 +1954,10 @@ void GsTilingSystem::RegisterPoolPrimitive(RenderDataStoreDefaultGS& internalDs)
     poolPrim.codecVersion = 0u;
     // Phase A: SOG tiled scene uses 3rd-order SH. Set it before the primitive
     // reaches the render data store; the post-load update can be lost on flip.
-    // (GLB SH needs a separate gate in Phase B.)
-    // Phase A: SOG tiled scene uses 3rd-order SH. Set it before the primitive
-    // reaches the render data store; the post-load update can be lost on flip.
-    // (GLB SH needs a separate gate in Phase B.)
-    poolPrim.shDegree = 3u;
+    // Per-model SH0/SH3 switch. Set before the primitive reaches the render
+    // data store so shDegree=0 never runs an SH3 compute frame.
+    poolPrim.shDegree = GetConfiguredMaxShDegree();
+    CORE_LOG_I("GsTilingSystem: pool SH degree = %u", poolPrim.shDegree);
     poolPrim.startShOffset = 0u;
     if (const GsTilePool* pool = dataStoreGs_->GetTilePool(); pool != nullptr && pool->splatCapacity != 0u) {
         poolPrim.gsBufferSize = pool->splatCapacity;
@@ -2354,6 +2419,18 @@ void GsTilingSystem::DispatchTileTask(PendingLoad& pending, bool decodeOnly)
     ctx.cacheMtx = &sogCacheMutex_;
     ctx.cache = &sogCache_;
     ctx.decodeOnly = decodeOnly;
+
+    if (IsGlbUri(pending.uri)) {
+        const std::string key(pending.uri.data(), pending.uri.size());
+        auto it = astcSlotByUri_.find(key);
+        if (it == astcSlotByUri_.end() && nextAstcSlot_ < GS_MAX_NUM_GS_TEXTURES) {
+            it = astcSlotByUri_.emplace(key, nextAstcSlot_++).first;
+        }
+        if (it != astcSlotByUri_.end()) {
+            pending.astcSlot = it->second;
+        }
+    }
+    ctx.astcSlot = pending.astcSlot;
 
     if (!decodeOnly && pending.slot >= 0 && splatPoolMappedPtr_) {
         const bool useTilePack = dataStoreGs_ && dataStoreGs_->GetGsRenderData() &&
@@ -2917,14 +2994,51 @@ void GsTilingSystem::CommitFinalizedPendingLoads(
             }
             UpdatePoolTileMetadata(pending, poolPrim->tileGrid.tiles[static_cast<size_t>(pending.slot)], isVisible);
         }
-        if (poolPrim && (!pending.result->shSupported || pending.result->shDegree > poolPrim->shDegree ||
-                            poolPrim->gsBufferSize != pool.splatCapacity)) {
+
+        std::shared_ptr<GS::CachedSogData> cache = pending.cacheEntry;
+        if (!cache && IsGlbUri(pending.uri)) {
+            const std::string key(pending.uri.data(), pending.uri.size());
+            std::lock_guard<std::mutex> lock(sogCacheMutex_);
+            cache = sogCache_.GetOrCreate(key).first;
+        }
+        bool compressedReady = false;
+        GsRenderData* renderData = dataStoreGs_ ? dataStoreGs_->GetGsRenderData() : nullptr;
+        if (poolPrim && cache && cache->hasCompressedSh) {
+            const uint32_t slot = pending.astcSlot;
+            if (slot < GS_MAX_NUM_GS_TEXTURES) {
+                compressedReady = astcSlotReady_[slot];
+                if (!compressedReady && renderContext_ && renderData != nullptr) {
+                    auto& gpuMgr = renderContext_->GetDevice().GetGpuResourceManager();
+                    // ASTC slots are only needed by compressed GLB tiles. Doing
+                    // this for SOG as well broke the 2x LOD composite (possibly
+                    // via the extra 60 texture views), so create lazily here.
+                    if (renderData->gsShASTCDataRefs.size() < GS_MAX_NUM_GS_TEXTURES) {
+                        GS::SetDefaultASTC(renderData, gpuMgr, {});
+                    }
+                    compressedReady = GS::CreateTiledAstcImage(*cache, slot, renderData, gpuMgr, renderContext_);
+                    if (compressedReady) {
+                        astcSlotReady_[slot] = true;
+                        CORE_LOG_I("GsTilingSystem: ASTC slot %u ready", slot);
+                    } else {
+                        CORE_LOG_E("GsTilingSystem: ASTC slot %u creation failed", slot);
+                    }
+                }
+            }
+            if (!compressedReady) {
+                // Fall back to DC instead of running SH compute against an
+                // uninitialized ASTC slot.
+                pending.result->shSupported = false;
+                pending.result->shDegree = 0u;
+            }
+        }
+        const uint32_t configuredShDegree = GetConfiguredMaxShDegree();
+        const uint32_t wantedShDegree = pending.result->shSupported
+                                            ? Math::min(pending.result->shDegree, configuredShDegree)
+                                            : 0u;
+        if (poolPrim && (wantedShDegree != poolPrim->shDegree || poolPrim->gsBufferSize != pool.splatCapacity)) {
             bool changed = false;
-            if (!pending.result->shSupported && poolPrim->shDegree != 0u) {
-                poolPrim->shDegree = 0u;
-                changed = true;
-            } else if (pending.result->shDegree > poolPrim->shDegree) {
-                poolPrim->shDegree = pending.result->shDegree;
+            if (poolPrim->shDegree != wantedShDegree) {
+                poolPrim->shDegree = wantedShDegree;
                 changed = true;
             }
             if (poolPrim->gsBufferSize != pool.splatCapacity) {
@@ -2936,6 +3050,36 @@ void GsTilingSystem::CommitFinalizedPendingLoads(
                 CORE_LOG_I("GsTilingSystem: tiled SH degree -> %u (range %u)", poolPrim->shDegree,
                     poolPrim->gsBufferSize);
             }
+        }
+        if (poolPrim && compressedReady && cache && renderData != nullptr) {
+            const auto& cacheData = *cache;
+            poolPrim->codecVersion = cacheData.codecVersion;
+            // EGSC compressed SH is 3rd order; clamp to the model's configured
+            // degree (0 = DC-only, 3 = full SH3).
+            poolPrim->shDegree = Math::min(GetConfiguredMaxShDegree(), 3u);
+            poolPrim->attribute2DTexNum = GS_MAX_NUM_GS_TEXTURES;
+            poolPrim->textIdOffset = 0u;
+            // .w is reused as the per-file texture slot for tiled compressed SH;
+            // keep the V2 importance divisor neutral.
+            poolPrim->impMin = 1.0f;
+            poolPrim->impMax = 1.0f;
+            // Per-file packing sizes and quantization ranges live in the
+            // slot metadata buffer; the shared pool primitive must not
+            // overwrite them with the last committed file.
+            if (pool.shSlotMetas.size() < GS_MAX_NUM_GS_TEXTURES) {
+                pool.shSlotMetas.resize(GS_MAX_NUM_GS_TEXTURES);
+            }
+            FillShSlotMeta(pool.shSlotMetas[pending.astcSlot], cacheData);
+            if (RENDER_NS::RenderHandleUtil::IsValid(pool.shSlotMetaBuffer.GetHandle()) && renderContext_) {
+                auto& gpuMgr = renderContext_->GetDevice().GetGpuResourceManager();
+                void* mapped = gpuMgr.MapBufferMemory(pool.shSlotMetaBuffer);
+                if (mapped != nullptr) {
+                    BASE_NS::CloneData(mapped, pool.shSlotMetas.size() * sizeof(GsShSlotMetadata),
+                        pool.shSlotMetas.data(), pool.shSlotMetas.size() * sizeof(GsShSlotMetadata));
+                    gpuMgr.UnmapBuffer(pool.shSlotMetaBuffer);
+                }
+            }
+            pool.resourceVersion++;
         }
         AddTileEntry(pending, isVisible);
         if (isVisible) {

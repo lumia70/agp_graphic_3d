@@ -32,6 +32,7 @@ struct TileExtractBuffer {
     bool useTilePacked { false };
     uint8_t* shDst { nullptr };
     size_t shDstBytes { 0 };
+    uint32_t astcSlot { 0u };
 };
 
 /** Decode an entire .glb file into a CachedSogData (meta only, lazy decode). */

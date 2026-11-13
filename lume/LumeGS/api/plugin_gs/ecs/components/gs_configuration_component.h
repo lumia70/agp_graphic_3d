@@ -63,6 +63,10 @@ BEGIN_COMPONENT(IGsConfigurationComponentManager, GsConfigurationComponent)
         "required for good performance on larger scenes.",
         0, 6u)
 
+    /** Maximum spherical harmonics degree used by the tiled/LOD path. 0 = DC-only (SH0), 3 = full SH3. */
+    DEFINE_PROPERTY(uint32_t, maxShDegree,
+        "Maximum spherical harmonics degree for tiled GS. 0 = SH0 (DC-only), 3 = full SH3.", 0, 3u)
+
     /** Enabe the GS real-time editor */
     DEFINE_PROPERTY(bool, enableGsEditor, "Enabe the GS real-time editor", 0, false)
 

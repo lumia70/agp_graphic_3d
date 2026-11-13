@@ -333,6 +333,9 @@ void RenderNodeGsRender::InitNode(IRenderNodeContextManager& renderNodeContextMg
         gsRenderShaders_.computeSphericalHarmonics =
             shaderMgr.GetShaderHandle("gsshaders://computeshader/gs3d_compute_spherical_harmonics.shader");
 
+        gsRenderShaders_.computeSphericalHarmonicsGlb =
+            shaderMgr.GetShaderHandle("gsshaders://computeshader/gs3d_compute_spherical_harmonics_glb.shader");
+
         gsRenderShaders_.computeSphericalHarmonicsPack =
             shaderMgr.GetShaderHandle("gsshaders://computeshader/gs3d_compute_spherical_harmonics_pack.shader");
 
@@ -803,6 +806,14 @@ bool RenderNodeGsRender::UpdateDynamicDataUBO(RENDER_NS::IRenderCommandList& cmd
         }
     }
 
+    if (renderData->isTiled) {
+        for (size_t ii = 0; ii < primitiveCount; ii++) {
+            if (gsPrimitives[ii].codecVersion > 0u) {
+                anyChange = true;
+                break;
+            }
+        }
+    }
     // nothing has changed, don't bother updating
     if (!anyChange) {
         return false;
@@ -1058,6 +1069,8 @@ void RenderNodeGsRender::CalculateRenderPassCounts(DescriptorCounts& dc)
         "gspipelinelayouts://gs3d_precompute_projection.shaderpl", GS_MAX_NUM_GS_OBJECTS, dc);
     SetupPipelineLayout(bindersGsRender_.computeSphericalHarmonics.pl,
         "gspipelinelayouts://gs3d_compute_spherical_harmonics.shaderpl", GS_MAX_NUM_GS_OBJECTS, dc);
+    SetupPipelineLayout(bindersGsRender_.computeSphericalHarmonicsGlb.pl,
+        "gspipelinelayouts://gs3d_compute_spherical_harmonics_glb.shaderpl", GS_MAX_NUM_GS_OBJECTS, dc);
     SetupPipelineLayout(bindersGsRender_.updateRenderStatusUbo.pl,
         "gspipelinelayouts://gs3d_update_render_status_ubo.shaderpl", GS_MAX_NUM_GS_OBJECTS, dc);
     SetupPipelineLayout(gsRenderPipelineLayout_, "gspipelinelayouts://gs3d_gaussian_splatting_render.shaderpl",
@@ -1110,6 +1123,8 @@ void RenderNodeGsRender::CreateRenderPassDescriptorSets(RENDER_NS::INodeContextD
         descriptorSetMgr, bindersGsRender_.precomputeProjection.pl, 0u, bindersGsRender_.precomputeProjection.set0);
     CreateDescriptorSet(descriptorSetMgr, bindersGsRender_.computeSphericalHarmonics.pl, 0u,
         bindersGsRender_.computeSphericalHarmonics.set0);
+    CreateDescriptorSet(descriptorSetMgr, bindersGsRender_.computeSphericalHarmonicsGlb.pl, 0u,
+        bindersGsRender_.computeSphericalHarmonicsGlb.set0);
     CreateDescriptorSet(
         descriptorSetMgr, bindersGsRender_.updateRenderStatusUbo.pl, 0u, bindersGsRender_.updateRenderStatusUbo.set0);
     CreateDescriptorSet(descriptorSetMgr, gsRenderPipelineLayout_, 0u, gsRenderSet0_);
@@ -1538,6 +1553,7 @@ void RenderNodeGsRender::PreExecuteFrame()
             gsHandlesCache_.tileSortCountPoolBuffer = pool.sortCountPoolBuffer;
             gsHandlesCache_.tileMetaBuffer = pool.tileMetaBuffer;
             gsHandlesCache_.tileIndirectDrawBuffer = pool.tileIndirectDrawBuffer;
+            gsHandlesCache_.shSlotMetaBuffer = pool.shSlotMetaBuffer;
 
             if (RENDER_NS::RenderHandleUtil::IsValid(pool.tileDataStorageCacheHandle.GetHandle())) {
                 gsHandlesCache_.dataStorageCacheHandle = pool.tileDataStorageCacheHandle;
@@ -2920,7 +2936,20 @@ void RenderNodeGsRender::ExecuteComputeSphericalHarmonics(RENDER_NS::IRenderComm
 
     RENDER_DEBUG_MARKER_COL_SCOPE(cmdList, "ExecuteComputeSphericalHarmonics", Math::Vec4(1.0f, 0.0f, 1.0f, 1.0f));
 
-    auto& shBinders = bindersGsRender_.computeSphericalHarmonics;
+    bool useGlbPipeline = false;
+    if (renderData->isTiled) {
+        for (const auto& prim : dataStore_->GetGsPrimitives()) {
+            // The tiled GLB pool marks itself with the 60-slot ASTC layout;
+            // SOG uses attribute2DTexNum 0. Do not look at every primitive:
+            // a previous single-file GLB primitive can still be present.
+            if (prim.attribute2DTexNum >= 16u) {
+                useGlbPipeline = true;
+                break;
+            }
+        }
+    }
+    auto& shBinders = useGlbPipeline ? bindersGsRender_.computeSphericalHarmonicsGlb
+                                     : bindersGsRender_.computeSphericalHarmonics;
 
     // introduce a barrier to prevent flickering
     if constexpr (USE_CUSTOM_BARRIERS) {
@@ -2935,7 +2964,9 @@ void RenderNodeGsRender::ExecuteComputeSphericalHarmonics(RENDER_NS::IRenderComm
     }
 
     PsoData psoData;
-    if (renderData->CanUsePackedData()) {
+    if (useGlbPipeline) {
+        psoData = GetPsoData(shBinders.pl, gsRenderShaders_.computeSphericalHarmonicsGlb, 0xFFFFffff);
+    } else if (renderData->CanUsePackedData()) {
         psoData = GetPsoData(shBinders.pl, gsRenderShaders_.computeSphericalHarmonicsPack, 0xFFFFffff);
     } else {
         psoData = GetPsoData(shBinders.pl, gsRenderShaders_.computeSphericalHarmonics, 0xFFFFffff);
@@ -2977,6 +3008,12 @@ void RenderNodeGsRender::ExecuteComputeSphericalHarmonics(RENDER_NS::IRenderComm
 
         shBinders.set0->BindImages(4u, shASTCImages);
         shBinders.set0->BindSampler(5u, gsHandlesCache_.sampler.GetHandle()); // seem not support multi-gs
+        if (useGlbPipeline) {
+            const auto slotMetaHandle = RENDER_NS::RenderHandleUtil::IsValid(gsHandlesCache_.shSlotMetaBuffer.GetHandle())
+                                            ? gsHandlesCache_.shSlotMetaBuffer
+                                            : harmonicsHandle;
+            shBinders.set0->BindBuffer(6u, slotMetaHandle.GetHandle(), 0);
+        }
 
         const auto& set0Handle = shBinders.set0->GetDescriptorSetHandle();
         cmdList.UpdateDescriptorSet(set0Handle, shBinders.set0->GetDescriptorSetLayoutBindingResources());

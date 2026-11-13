@@ -30,6 +30,7 @@ public:
     virtual void SetTileVisible(const CORE_NS::Entity entity, const bool visible) = 0;
     virtual void DestroyTile(const CORE_NS::Entity entity) = 0;
     virtual bool IsTileResident(const CORE_NS::Entity entity) const = 0;
+    virtual void SetMaxShDegree(uint32_t degree) = 0;
 
 protected:
     IGsTilingSystem() = default;
