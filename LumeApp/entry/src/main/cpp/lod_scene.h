@@ -52,7 +52,8 @@ struct Scene {
     float boundsMax[3] = { -1e30f, -1e30f, -1e30f };
     size_t totalGaussians[8] = { 0 };
 
-    bool Load(const std::string& sceneDir);
+    bool Load(const std::string& sceneDir, const char* metaFile = "lod-meta.json",
+        const char* sceneFile = "default.scene.json");
 };
 
 struct Item {
@@ -158,14 +159,19 @@ inline void FlattenTree(const sog::Json& node, int levelCount, std::vector<Leaf>
     }
 }
 
-inline bool Scene::Load(const std::string& sceneDir)
+inline bool Scene::Load(const std::string& sceneDir, const char* metaFile, const char* sceneFile)
 {
     dir = sceneDir;
     std::string sceneText;
     std::string metaText;
-    if (!ReadTextFile(sceneDir + "/default.scene.json", sceneText) ||
-        !ReadTextFile(sceneDir + "/lod-meta.json", metaText)) {
-        LOGE("LOD: missing default.scene.json / lod-meta.json in '%{public}s'", sceneDir.c_str());
+    bool sceneRead = ReadTextFile(sceneDir + "/" + sceneFile, sceneText);
+    if (!sceneRead && std::string(sceneFile) != "default.scene.json") {
+        // A GLB variant may not have its own default.scene.glb.json; the camera
+        // fields are shared, so fall back to the SOG scene file.
+        sceneRead = ReadTextFile(sceneDir + "/default.scene.json", sceneText);
+    }
+    if (!sceneRead || !ReadTextFile(sceneDir + "/" + metaFile, metaText)) {
+        LOGE("LOD: missing %{public}s / %{public}s in '%{public}s'", sceneFile, metaFile, sceneDir.c_str());
         return false;
     }
 

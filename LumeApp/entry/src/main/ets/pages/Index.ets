@@ -8,17 +8,22 @@ struct Index {
   // Order must match kDemoModels[] in render_main.cpp.
   @State modelIndex: number = 3;
   @State firstPerson: boolean = false;
-  @State budgetIndex: number = 1;
+  @State budgetIndex: number = 2;
 
   private static readonly MODELS: string[] = [
-    'fruit_bowl.ply', 'fruit_bowl.sog', 'godzilla.splat', 'doll.glb', 'syp_uav_0611'
+    'fruit_bowl.ply', 'fruit_bowl.sog', 'godzilla.splat', 'doll.glb', 'syp_uav_0611',
+    'dianpu_sog_sh0', 'dianpu_sog_sh3', 'dianpu_glb_sh0', 'dianpu_glb_sh3',
+    'aibandeng_sog_sh0', 'aibandeng_sog_sh3', 'aibandeng_glb_sh0', 'aibandeng_glb_sh3'
   ];
   private static readonly MODEL_LABELS: string[] = [
-    'Model: Bowl PLY', 'Model: Bowl SOG', 'Model: Godzilla', 'Model: Doll', 'Model: City LOD'
+    'Model: Bowl PLY', 'Model: Bowl SOG', 'Model: Godzilla', 'Model: Doll', 'Model: City LOD',
+    'Model: Dianpu SOG SH0', 'Model: Dianpu SOG SH3', 'Model: Dianpu GLB SH0', 'Model: Dianpu GLB SH3',
+    'Model: Aibandeng SOG SH0', 'Model: Aibandeng SOG SH3',
+    'Model: Aibandeng GLB SH0', 'Model: Aibandeng GLB SH3'
   ];
-  private static readonly BUDGETS: number[] = [1500000, 1000000, 600000];
+  private static readonly BUDGETS: number[] = [2000000, 1500000, 1000000, 600000];
   private static readonly BUDGET_LABELS: string[] = [
-    'Splats: 1.5M (sharp)', 'Splats: 1M (balanced)', 'Splats: 600k (fast)'
+    'Splats: 2M (ultra)', 'Splats: 1.5M (sharp)', 'Splats: 1M (balanced)', 'Splats: 600k (fast)'
   ];
 
   aboutToAppear(): void {
@@ -37,7 +42,7 @@ struct Index {
     const name = Index.MODELS[index];
     lumeapp.setModel(name);
     // Large LOD scenes default to first-person roaming, single models orbit.
-    this.firstPerson = name === 'syp_uav_0611';
+    this.firstPerson = name === 'syp_uav_0611' || name.startsWith('dianpu_') || name.startsWith('aibandeng_');
     lumeapp.setCameraMode(this.firstPerson);
     console.info('[LumeApp] switch model to ' + name + ', firstPerson=' + this.firstPerson);
   }
@@ -60,14 +65,18 @@ struct Index {
 
   private static readonly MODEL_OPTIONS: SelectOption[] = [
     { value: 'Model: Bowl PLY' }, { value: 'Model: Bowl SOG' }, { value: 'Model: Godzilla' },
-    { value: 'Model: Doll' }, { value: 'Model: City LOD' }
+    { value: 'Model: Doll' }, { value: 'Model: City LOD' },
+    { value: 'Model: Dianpu SOG SH0' }, { value: 'Model: Dianpu SOG SH3' },
+    { value: 'Model: Dianpu GLB SH0' }, { value: 'Model: Dianpu GLB SH3' },
+    { value: 'Model: Aibandeng SOG SH0' }, { value: 'Model: Aibandeng SOG SH3' },
+    { value: 'Model: Aibandeng GLB SH0' }, { value: 'Model: Aibandeng GLB SH3' }
   ];
   private static readonly CAMERA_OPTIONS: SelectOption[] = [
     { value: 'Camera: First-person' }, { value: 'Camera: Orbit' }
   ];
   private static readonly BUDGET_OPTIONS: SelectOption[] = [
-    { value: 'Splats: 1.5M (sharp)' }, { value: 'Splats: 1M (balanced)' },
-    { value: 'Splats: 600k (fast)' }
+    { value: 'Splats: 2M (ultra)' }, { value: 'Splats: 1.5M (sharp)' },
+    { value: 'Splats: 1M (balanced)' }, { value: 'Splats: 600k (fast)' }
   ];
 
   build() {

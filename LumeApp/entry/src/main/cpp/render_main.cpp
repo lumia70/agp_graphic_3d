@@ -993,6 +993,16 @@ struct DemoModelConfig {
     // Non-null for LOD scenes: directory under <files>/assets/lod holding
     // default.scene.json + lod-meta.json. `file` is empty for these entries.
     const char* scene;
+    // Spherical harmonics degree for this model: 0 = DC-only (SH0), 3 = full SH3.
+    // Tiled scenes use GsConfigurationComponent.maxShDegree; single-file models
+    // use GsComponent.maxShDegreeOverride.
+    uint32_t maxShDegree = 3u;
+    // Stable id for the model dropdown (needed when multiple variants share a scene).
+    const char* id = nullptr;
+    // LOD metadata file inside `scene`; use lod-meta-sog.json for SOG variants.
+    const char* lodMeta = "lod-meta.json";
+    // Scene camera file; GLB variants use a copy whose `url` points at lod-meta.json.
+    const char* sceneJson = "default.scene.json";
 };
 static const DemoModelConfig kDemoModels[] = {
     // Standard 3DGS PLY. The bounds cover a whole room, so the auto-frame lands
@@ -1019,11 +1029,38 @@ static const DemoModelConfig kDemoModels[] = {
     { "doll.glb", 60.0f, 1.0f, 1.0f, false, {}, {}, {}, {}, 42.0f, 250.0f, nullptr },
     // Large scene with per-tile LOD (SOG tiles). Camera and framing come from
     // default.scene.json, so the entry only names the directory.
-    { "", 60.0f, 0.0f, 0.0f, false, {}, {}, {}, {}, 0.0f, 0.0f, "lod/syp_uav_0611" },
+    // maxShDegree: 0 = SH0 / DC-only, 3 = full SH3 for this LOD model.
+    { "", 60.0f, 0.0f, 0.0f, false, {}, {}, {}, {}, 0.0f, 0.0f, "lod/syp_uav_0611", 0u },
+    // Dianpu/adongge: same scene available as SOG and GLB, with 0/3-order SH.
+    { "", 60.0f, 0.0f, 0.0f, false, {}, {}, {}, {}, 0.0f, 0.0f,
+        "lod/0_sh_118_adongge_dianping_adaptive_1024_lod_voxel", 0u, "dianpu_sog_sh0",
+        "lod-meta-sog.json", "default.scene.json" },
+    { "", 60.0f, 0.0f, 0.0f, false, {}, {}, {}, {}, 0.0f, 0.0f,
+        "lod/0_sh_118_adongge_dianping_adaptive_1024_lod_voxel", 0u, "dianpu_glb_sh0",
+        "lod-meta.json", "default.scene.glb.json" },
+    { "", 60.0f, 0.0f, 0.0f, false, {}, {}, {}, {}, 0.0f, 0.0f,
+        "lod/3_sh_118_adongge_dianping_adaptive_1024_lod_voxel", 3u, "dianpu_sog_sh3",
+        "lod-meta-sog.json", "default.scene.json" },
+    { "", 60.0f, 0.0f, 0.0f, false, {}, {}, {}, {}, 0.0f, 0.0f,
+        "lod/3_sh_118_adongge_dianping_adaptive_1024_lod_voxel", 3u, "dianpu_glb_sh3",
+        "lod-meta.json", "default.scene.glb.json" },
+    { "", 60.0f, 0.0f, 0.0f, false, {}, {}, {}, {}, 0.0f, 0.0f,
+        "lod/0_sh_aibandenglaohuoguo_pano_lod_voxel", 0u, "aibandeng_sog_sh0",
+        "lod-meta-sog.json", "default.scene.json" },
+    { "", 60.0f, 0.0f, 0.0f, false, {}, {}, {}, {}, 0.0f, 0.0f,
+        "lod/0_sh_aibandenglaohuoguo_pano_lod_voxel", 0u, "aibandeng_glb_sh0",
+        "lod-meta.json", "default.scene.glb.json" },
+    { "", 60.0f, 0.0f, 0.0f, false, {}, {}, {}, {}, 0.0f, 0.0f,
+        "lod/3_sh_aibandenglaohuoguo_pano_lod_voxel", 3u, "aibandeng_sog_sh3",
+        "lod-meta-sog.json", "default.scene.json" },
+    { "", 60.0f, 0.0f, 0.0f, false, {}, {}, {}, {}, 0.0f, 0.0f,
+        "lod/3_sh_aibandenglaohuoguo_pano_lod_voxel", 3u, "aibandeng_glb_sh3",
+        "lod-meta.json", "default.scene.glb.json" },
 };
 static constexpr int kDemoModelCount = (int)(sizeof(kDemoModels) / sizeof(kDemoModels[0]));
 static int g_modelIndex = 3;  // doll.glb by default (must track kDemoModels order)
 static int g_pendingModelIndex = -1;  // set from ArkTS, applied on the render thread
+static uint32_t g_gsMaxShDegree = kDemoModels[g_modelIndex].maxShDegree;  // current model's SH degree (0 or 3)
 static int g_pendingCameraMode = -1;  // -1 = use the model default, 0 = orbit, 1 = first person
 // LOD splat budget, switchable from ArkTS (dropdown) and remembered across model
 // switches: 1.5M is the densest, 1M is the default (matches the scene's mobile cap).
@@ -1202,6 +1239,8 @@ static bool EnsureGsConfiguration()
             cfg->convertGsColorSrgb = true;
             cfg->renderCovarianceStddev = 2.25f;
             cfg->renderSharpeningCoefficient = 0.75f;
+            // Per-model SH0/SH3 switch for the tiled path.
+            cfg->maxShDegree = g_gsMaxShDegree;
             // Phase A: tiled SH needs the 64 B non-packed tile layout.
             cfg->enableTilePackedData = false;
         }
@@ -1255,6 +1294,7 @@ static void InitGsRenderPath(const char* modelFile)
         const BASE_NS::string uri = BASE_NS::string("file://") + g_filesDir.c_str() + "/assets/" + modelFile;
         gs->gsPath = uri;
         gs->computeLods = false;
+        gs->maxShDegreeOverride = g_gsMaxShDegree;
         LOGI("GS path: loading '%{public}s'", uri.c_str());
     }
     // The GS node is inserted into the camera scene RNG (see
@@ -1297,6 +1337,7 @@ static void PollGsRenderPath()
                 BASE_NS::string("file://") + g_filesDir.c_str() + "/assets/" + g_gsModelFile.c_str();
             gs->gsPath = uri;
             gs->computeLods = false;
+            gs->maxShDegreeOverride = g_gsMaxShDegree;
             LOGI("GS path: switching to '%{public}s'", uri.c_str());
         }
     }
@@ -1437,7 +1478,7 @@ void LoadLodScene(const DemoModelConfig& cfg)
     g_orbitCam.insideView = false;
     // Large scenes are navigated in first person; the mode button can switch.
     g_orbitCam.firstPerson = true;
-    g_orbitCam.fpMoveScale = std::max(0.05f, diag * 0.0008f);
+    g_orbitCam.fpMoveScale = std::max(0.02f, diag * 0.0004f);
     // Returning to orbit mode backs off to the reference framing distance and
     // orbits around the scene's look-at point.
     g_orbitCam.fpBackoff = len;
@@ -1578,7 +1619,7 @@ static void ApplyGsLodCamera(const lod::Scene& scene, const DemoModelConfig& cfg
     g_orbitCam.farDistance = len;
     g_orbitCam.insideView = false;
     g_orbitCam.firstPerson = true;
-    g_orbitCam.fpMoveScale = std::max(0.05f, diag * 0.0008f);
+    g_orbitCam.fpMoveScale = std::max(0.02f, diag * 0.0004f);
     g_orbitCam.fpBackoff = len;
     g_orbitCam.pivotX = scene.camLookAt[0];
     g_orbitCam.pivotY = scene.camLookAt[1];
@@ -1657,7 +1698,7 @@ static bool LoadGsLodScene(const DemoModelConfig& cfg)
     const std::string dir = ResolveLodDir(cfg);
     LOGI("GS LOD scene dir: %{public}s", dir.c_str());
     lod::Scene scene;
-    if (!scene.Load(dir) || scene.leaves.empty()) {
+    if (!scene.Load(dir, cfg.lodMeta, cfg.sceneJson) || scene.leaves.empty()) {
         LOGE("GS LOD: scene load failed");
         return false;
     }
@@ -1770,7 +1811,7 @@ static bool RebuildGsLodSelection()
     lod::Selection ringSel;
     lod::CullVisible(
         g_gsLodScene, g_gaussianCameraData.view, ringProj, g_gaussianCameraData.cameraPos, ringSel);
-    constexpr size_t kRingPreloadMax = 256;
+    constexpr size_t kRingPreloadMax = 64;
     for (const auto& item : ringSel.items) {
         if (g_gsLodRingOrder.size() >= kRingPreloadMax) {
             break;
@@ -2293,6 +2334,11 @@ void DrawFrame()
     if (g_pendingModelIndex >= 0 && g_pendingModelIndex < kDemoModelCount &&
         g_pendingModelIndex != g_modelIndex) {
         g_modelIndex = g_pendingModelIndex;
+        g_gsMaxShDegree = kDemoModels[g_modelIndex].maxShDegree;
+        if (auto* tileSys = CORE_NS::GetSystem<GS::IGsTilingSystem>(*g_lume.ecs)) {
+            tileSys->SetMaxShDegree(g_gsMaxShDegree);
+        }
+        EnsureGsConfiguration();
         const bool wantsLod = kDemoModels[g_modelIndex].scene != nullptr;
         if (wantsLod) {
             // Parse metadata and set up the LumeGS tiling path first. Only hide
@@ -2800,8 +2846,10 @@ static napi_value NapiSetModel(napi_env env, napi_callback_info info)
         if (kDemoModels[i].scene != nullptr) {
             file = SceneBaseName(kDemoModels[i].scene);
         }
-        // Accept either the full file name ("doll.glb") or the short name ("doll").
-        if (name == file || (name.size() >= 3 && file.compare(0, name.size(), name) == 0)) {
+        const std::string id = kDemoModels[i].id ? kDemoModels[i].id : "";
+        // LOD variants sharing one scene need the explicit dropdown id.
+        if ((!id.empty() && name == id) || name == file ||
+            (name.size() >= 3 && file.compare(0, name.size(), name) == 0)) {
             g_pendingModelIndex = i;
             if (g_renderPath == 1 && kDemoModels[i].scene == nullptr) {
                 // LumeGS renders one model at a time; follow the dropdown for
